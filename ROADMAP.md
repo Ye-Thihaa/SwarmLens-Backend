@@ -30,6 +30,29 @@ exactly one `job_done` event across surviving nodes.
 
 ---
 
+## Phase 2 — done
+
+Raft leader election (`raft.py`, wired into `main.py`). Hand-rolled, no
+library. One deviation from the numbers below worth flagging: heartbeat
+interval is 50ms, not the 1s originally specified — 1s heartbeat with a
+150-300ms election timeout is backwards (followers would time out before
+the leader's next heartbeat ever arrives), so heartbeat needed to be well
+under the timeout, not over it. Also found and fixed a real bug during
+testing: the per-RPC httpx timeout must be well under the election
+timeout too, or `asyncio.gather` waiting on a dead peer stalls every
+election round long enough for the other candidate to steal the race —
+a permanent two-node livelock, not just a slow election.
+
+Verified: three nodes converge on one leader (`GET /raft/status`).
+`kill -9` on the leader → new leader elected in 0.28-0.49s across
+repeated trials (budget was ~1s). `recap_sent` (via `POST
+/recap/trigger`, gated on `raft.role == "leader"`) fires exactly once
+cluster-wide even when triggered again after the crash and re-election.
+See `test_raft.py`.
+
+<details>
+<summary>Original spec</summary>
+
 ## Phase 2 — Raft leader election
 
 **Why you need it.** Leases give you at-least-once, safe for idempotent
@@ -81,7 +104,44 @@ If it's eating your schedule, `pysyncobj` (a Raft library) is a
 legitimate substitute — implement election yourself, but say clearly
 in your report which parts are library vs. hand-rolled.
 
+</details>
+
 ---
+
+## Phase 3 — done
+
+Consistent hashing (`hashing.py`, wired into `main.py`'s `/zones`,
+`/zones/local`, `/zones/ring`). Each zone is owned by one node on the
+ring; `GET /zones` proxies each zone to its owner and only falls back to
+this node's own replica (marked `stale: true`) if the owner doesn't
+answer.
+
+One bug found and fixed during testing, not in the original spec below:
+a node's own ring identity must be the URL its peers already reach it at
+(`SELF_URL`, new required env var), not its `NODE_ID`. The spec's
+pseudocode used `gossip.alive_peers() + self` without saying what "self"
+should be — self was originally `NODE_ID` while peers are addressed by
+URL, which are different string spaces, so every node computed a
+*different* ring for the same cluster and `/zones` gave a different
+owner for the same zone depending which node you asked. Confirmed this
+live: `bar`'s owner disagreed between node1 and node2 until `SELF_URL`
+was added, after which `GET /zones/ring` matched byte-for-byte across
+all three nodes.
+
+Verified: three nodes, five zones, `/zones/ring` returns an identical
+zone→owner mapping from all three. `/zones` returns identical scores
+with `stale: false` on every zone (each is either local or a live
+proxy). `kill -9` the node owning a zone → that zone's response flips to
+`stale: true` immediately (the proxy call fails before gossip's 3-strike
+failure detector evicts the peer) while every other zone stays fresh;
+once gossip does evict the dead peer a few seconds later, the ring
+reassigns that zone to a live node and `stale` goes back to `false`.
+`test_hashing.py` is a pure unit test (no running nodes) confirming
+adding a 4th node remaps ~23% of 200 zones, in line with the ~1/4
+expected from the spec.
+
+<details>
+<summary>Original spec</summary>
 
 ## Phase 3 — Consistent hashing for zone ownership
 
@@ -123,6 +183,8 @@ copy with a `stale: true` flag.
 fourth node. Recompute the ring, print the mapping again, count how many
 zones changed owner. With virtual nodes this should be roughly 1/4, not
 all of them — that's the number for your report.
+
+</details>
 
 ---
 

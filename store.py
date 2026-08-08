@@ -142,6 +142,16 @@ class Store:
         cur = await self.db.execute("SELECT COUNT(*) AS n FROM events")
         return (await cur.fetchone())["n"]
 
+    async def event_exists(self, kind: str) -> bool:
+        """Cluster-wide idempotence check: has any node already logged this
+        kind of event? Used for exactly-once actions (e.g. recap_sent)
+        where re-checking the replicated log, not local memory, is what
+        makes the guarantee survive a leader crash and re-election."""
+        cur = await self.db.execute(
+            "SELECT 1 FROM events WHERE kind=? LIMIT 1", (kind,)
+        )
+        return await cur.fetchone() is not None
+
     # ---- job leases: derived from job_claimed / job_done events ----
 
     async def job_state(self, photo_id: str) -> dict:
