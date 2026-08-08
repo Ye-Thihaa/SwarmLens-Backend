@@ -74,6 +74,13 @@ list and manual demo commands: [README.md](README.md).
   checkpoint (`store.get_meta`/`set_meta`) is deliberately *not*
   replicated or authoritative — see the Gotchas section for why that's
   still correct across a Raft leadership change, not just convenient.
+- `dashboard.html` — static chaos + metrics dashboard, served at `GET
+  /dashboard` by every node (`main.py`, `FileResponse`). No build step,
+  no external JS/CSS — polls `GET /health` on all 3 nodes every 1s and
+  drives `/chaos/partition/{i}` and `/chaos/heal`. This is the lighter
+  alternative from Phase 7's "Prometheus/Grafana vs. lighter" fork — see
+  ROADMAP.md's Phase 7 writeup for why, and for a real bug (every button
+  was broken) this caught by actually clicking through it in a browser.
 
 ## Run it
 
@@ -136,14 +143,15 @@ Tests:
 Phases 0-4 done (gossip replication, worker leases, Raft election,
 consistent-hash zone ownership, quorum reads), the AI analysis engine
 (`ai_engine.py`, `POST /analyze`), Phase 5's backend slice (vector clocks
-+ `concurrent_with`), and Phase 6 (cloud archive sync, `cloud_sync.py`)
-described above. See ROADMAP.md for the full phase list. Not started:
-the guest client itself (Dexie.js outbox, localStorage vector clock,
-service worker -- Phase 5's other half), the guest UI and operator
-console wiring, Phase 7 (chaos/metrics dashboard), Phase 8 (load test)
--- the guest UI and operator console repos aren't present in this
-working directory, so that wiring can't happen from here until they're
-attached alongside the backend.
++ `concurrent_with`), Phase 6 (cloud archive sync, `cloud_sync.py`), and
+Phase 7 (chaos + metrics dashboard, `dashboard.html` -- lighter
+alternative to Prometheus/Grafana, see its ROADMAP.md writeup) described
+above. See ROADMAP.md for the full phase list. Not started: the guest
+client itself (Dexie.js outbox, localStorage vector clock, service
+worker -- Phase 5's other half), the guest UI and operator console
+wiring, Phase 8 (load test) -- the guest UI and operator console repos
+aren't present in this working directory, so that wiring can't happen
+from here until they're attached alongside the backend.
 
 ## Gotchas hit so far (don't reintroduce these)
 

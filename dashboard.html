@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SwarmLens chaos + metrics dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --border: #2a2f3a; --text: #e6e8ec;
+    --muted: #8b93a3; --leader: #2ecc71; --follower: #4a90d9; --candidate: #f5a623;
+    --down: #e74c3c; --stale: #f5a623; --fresh: #2ecc71;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, sans-serif;
+    margin: 0; padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .global-controls { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px;
+  }
+  .card.down { opacity: 0.55; }
+  .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .node-name { font-weight: 600; font-size: 15px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+  .dot.up { background: var(--fresh); box-shadow: 0 0 6px var(--fresh); }
+  .dot.down { background: var(--down); }
+  .role-badge {
+    font-size: 11px; padding: 3px 8px; border-radius: 20px; font-weight: 600; text-transform: uppercase;
+  }
+  .role-leader { background: rgba(46,204,113,.15); color: var(--leader); }
+  .role-follower { background: rgba(74,144,217,.15); color: var(--follower); }
+  .role-candidate { background: rgba(245,166,35,.15); color: var(--candidate); }
+  .stat-row { display: flex; justify-content: space-between; font-size: 12.5px; padding: 3px 0; color: var(--muted); }
+  .stat-row b { color: var(--text); font-weight: 500; }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; min-height: 18px; }
+  .chip { background: rgba(231,76,60,.15); color: var(--down); font-size: 11px; padding: 2px 7px; border-radius: 10px; }
+  .btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  button {
+    background: #232833; color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font-size: 12px; cursor: pointer; transition: background .15s;
+  }
+  button:hover { background: #2c3241; }
+  button.danger { border-color: rgba(231,76,60,.4); color: #ff8a7a; }
+  button.danger:hover { background: rgba(231,76,60,.15); }
+  button.primary { border-color: rgba(46,204,113,.4); color: var(--leader); }
+  button.primary:hover { background: rgba(46,204,113,.15); }
+  .last-updated { color: var(--muted); font-size: 11px; margin-top: 20px; }
+</style>
+</head>
+<body>
+  <h1>SwarmLens -- chaos + metrics dashboard</h1>
+  <div class="subtitle">
+    Polls GET /health + GET /raft/status on all 3 nodes every 1s. Chaos buttons drive the existing
+    POST /chaos/partition/{i} and POST /chaos/heal endpoints -- nothing here executes real kill -9;
+    see CLAUDE.md/README.md for why a real process-kill button was deliberately left unbuilt.
+  </div>
+
+  <div class="global-controls">
+    <button class="primary" onclick="healAll()">Heal all (clear every partition)</button>
+  </div>
+
+  <div class="grid" id="grid"></div>
+  <div class="last-updated" id="lastUpdated"></div>
+
+<script>
+// Matches this repo's standard local run (README.md / docker-compose.yml):
+// node1:8001 <-> node2:8002 <-> node3:8003, all-to-all peers.
+const NODES = [
+  { id: "node1", port: 8001, peers: ["node2", "node3"] },
+  { id: "node2", port: 8002, peers: ["node1", "node3"] },
+  { id: "node3", port: 8003, peers: ["node1", "node2"] },
+];
+const byId = Object.fromEntries(NODES.map(n => [n.id, n]));
+// gossip.partitioned (from GET /health) lists raw peer URLs, same as
+// PEERS -- see CLAUDE.md's SELF_URL note for why. Map back to friendly
+// names just for display.
+const urlToId = Object.fromEntries(NODES.map(n => [`http://127.0.0.1:${n.port}`, n.id]));
+
+async function fetchJSON(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+  return r.json();
+}
+
+async function partition(node, peerIndex) {
+  await fetchJSON(`http://localhost:${node.port}/chaos/partition/${peerIndex}`, { method: "POST" });
+  render();
+}
+
+async function isolate(node) {
+  // Fully isolate `node` from the rest of the cluster: partition it in
+  // BOTH directions from every other node, not just its own outgoing
+  // links -- a one-sided partition self-heals within a gossip round or
+  // two (see CLAUDE.md's gotcha on this). 4 calls for a 3-node cluster.
+  const calls = [];
+  node.peers.forEach((peerId, idx) => {
+    calls.push(fetchJSON(`http://localhost:${node.port}/chaos/partition/${idx}`, { method: "POST" }));
+    const peer = byId[peerId];
+    const backIdx = peer.peers.indexOf(node.id);
+    calls.push(fetchJSON(`http://localhost:${peer.port}/chaos/partition/${backIdx}`, { method: "POST" }));
+  });
+  await Promise.allSettled(calls);
+  render();
+}
+
+async function healOne(node) {
+  await fetchJSON(`http://localhost:${node.port}/chaos/heal`, { method: "POST" });
+  render();
+}
+
+async function healAll() {
+  await Promise.allSettled(NODES.map(n =>
+    fetchJSON(`http://localhost:${n.port}/chaos/heal`, { method: "POST" })));
+  render();
+}
+
+function roleClass(role) {
+  return role === "leader" ? "role-leader" : role === "candidate" ? "role-candidate" : "role-follower";
+}
+
+function renderCard(node, health) {
+  const down = health === null;
+  const raft = down ? {} : health.raft;
+  const gossip = down ? {} : health.gossip;
+  const partitioned = down ? [] : (gossip.partitioned || []);
+
+  const peerButtons = node.peers.map((peerId, idx) =>
+    `<button onclick="partition(byId['${node.id}'], ${idx})">Cut -> ${peerId}</button>`
+  ).join("");
+
+  return `
+    <div class="card ${down ? "down" : ""}">
+      <div class="card-head">
+        <div class="node-name"><span class="dot ${down ? "down" : "up"}"></span>${node.id} :${node.port}</div>
+        ${down ? "" : `<span class="role-badge ${roleClass(raft.role)}">${raft.role}</span>`}
+      </div>
+      ${down ? `<div class="stat-row"><b>unreachable</b></div>` : `
+        <div class="stat-row"><span>term</span><b>${raft.term}</b></div>
+        <div class="stat-row"><span>leader</span><b>${raft.leader_id ?? "-"}</b></div>
+        <div class="stat-row"><span>events</span><b>${health.events}</b></div>
+        <div class="stat-row"><span>gossip rounds</span><b>${gossip.rounds}</b></div>
+        <div class="stat-row"><span>pulled / pushed</span><b>${gossip.events_pulled} / ${gossip.events_pushed}</b></div>
+        <div class="stat-row"><span>cloud sync</span><b>${health.cloud_sync.enabled ? (health.cloud_sync.last_error ? "error" : "ok") : "disabled"}</b></div>
+        <div class="chips">${partitioned.map(p => `<span class="chip">cut -> ${urlToId[p] || p}</span>`).join("") || "<span style='color:var(--muted);font-size:11px'>fully connected</span>"}</div>
+      `}
+      <div class="btns">
+        ${peerButtons}
+        <button class="danger" onclick="isolate(byId['${node.id}'])">Isolate this node</button>
+        <button onclick="healOne(byId['${node.id}'])">Heal this node</button>
+      </div>
+    </div>
+  `;
+}
+
+async function render() {
+  const results = await Promise.all(NODES.map(async n => {
+    try { return await fetchJSON(`http://localhost:${n.port}/health`); }
+    catch { return null; }
+  }));
+  document.getElementById("grid").innerHTML = NODES.map((n, i) => renderCard(n, results[i])).join("");
+  document.getElementById("lastUpdated").textContent = `last updated ${new Date().toLocaleTimeString()}`;
+}
+
+render();
+setInterval(render, 1000);
+</script>
+</body>
+</html>

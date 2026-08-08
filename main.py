@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import ai_engine
@@ -491,3 +492,14 @@ async def partition(peer_index: int):
 async def heal():
     gossip.partitioned.clear()
     return {"partitioned_from": []}
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """Static, dependency-free chaos + metrics dashboard (dashboard.html):
+    polls GET /health + raft status on all 3 nodes every 1s, drives the
+    existing /chaos/* endpoints. Served by every node identically -- open
+    it on any one of the three, it talks to all three via CORS (already
+    wide open, see the middleware above). No real kill -9 button: see
+    CLAUDE.md/README.md for why that was deliberately left unbuilt."""
+    return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html"))

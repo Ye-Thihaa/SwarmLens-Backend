@@ -43,6 +43,7 @@ the consistent-hashing ring matches how peers already refer to it.
 | POST | `/recap/trigger` | fire the one-time recap; no-ops unless this node is leader |
 | POST | `/cloud_sync/trigger` | force a cloud archive sync tick now; no-ops unless leader + SUPABASE_URL configured |
 | GET  | `/cloud_sync/status` | enabled/role/last sync count/last error |
+| GET  | `/dashboard` | static chaos + metrics dashboard (dashboard.html), served identically by every node |
 
 ## Verified demo
 
@@ -212,6 +213,30 @@ against it fails softly instead of 500ing; the full backlog syncs in one
 push once it starts listening ("reconnect"); re-triggering with nothing
 new is a true no-op with no duplicates; a new event afterward syncs
 incrementally; and only the Raft leader ever pushes.
+
+## Chaos + metrics dashboard
+
+    curl -X POST localhost:8001/photos ...   # cluster running
+    # open in a browser:
+    http://localhost:8001/dashboard
+
+Self-contained static HTML/CSS/vanilla JS (`dashboard.html`), served
+identically by every node -- open it on any one of the three, it polls
+`GET /health` on all three via `fetch` (CORS is already wide open) every
+1s. Shows role/term/leader/event count/gossip stats/cloud-sync status per
+node, and buttons for `/chaos/partition/{i}` and `/chaos/heal`, plus an
+"Isolate this node" convenience button that fires all 4 directional
+partition calls a *real* bidirectional isolation needs in one click (a
+single-direction partition alone self-heals within a round or two --
+see CLAUDE.md).
+
+This is the lighter alternative to a full Prometheus/Grafana setup --
+see the Phase 7 writeup in ROADMAP.md for why, and for a real bug this
+caught by actually clicking through the UI in a browser rather than only
+curling the endpoints it drives. No real `kill -9` button: see
+ROADMAP.md's Phase 7 writeup for why that's a genuinely different risk
+(an HTTP endpoint that kills an OS process, on a backend with no auth at
+all) rather than scope creep.
 
 ## Next
 
