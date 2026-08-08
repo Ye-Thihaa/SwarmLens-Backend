@@ -400,6 +400,24 @@ instead of `client/`'s Dexie/service-worker one).
   + insert" section in `append_local`. If you add another code path that
   writes local events, it must go through `append_local`, not reimplement
   its own seq assignment.
+- **A system-wide loopback-intercepting proxy breaks Raft's 50ms
+  heartbeat/150-300ms election timeout outright, and `trust_env=False`
+  can't fix it.** Confirmed on a dev machine with Windows' system proxy
+  enabled (`HKCU:\...\Internet Settings`, `ProxyEnable=1`) pointing at
+  `127.0.0.1:<port>` — even a bare `GET /health` on a single node measured
+  ~500-900ms median round-trip on loopback, vs. the sub-millisecond
+  latency Raft's timers assume. `trust_env=False` (see the note above)
+  only stops httpx from *choosing* to route through a configured proxy;
+  it can't defeat something intercepting sockets below the application
+  layer. Symptom: `test_raft.py`/`test_quorum.py`/`test_cloud_sync.py`
+  see leadership flip continuously, not just at boot, and
+  `test_cloud_sync.py`'s leader-targeted calls land on a stale leader.
+  No code fix applied for this — the two real options are disabling the
+  intercepting proxy for the test run, or raising `raft.py`'s timing
+  constants (which would also slow down every number in ROADMAP.md's
+  Phase 8 section, so don't do that silently). If you hit flaky
+  leader-dependent tests, check for this before assuming a code
+  regression.
 - **A load-test measurement that detects state via one "observer" node
   is measuring gossip lag, not the thing it's trying to measure.** The
   first version of `load_test.py`'s recovery measurement polled a single

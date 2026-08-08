@@ -24,13 +24,17 @@ export const events: EventEntry[] = [
   },
 ];
 
-/** The look itself is still local to each phone -- picking a stock sends
- * nothing to the server, and no photo carries one. But `key` is now a
- * real contract with the backend: ai_engine.py's FILM_STOCKS uses these
- * exact keys, and /analyze/preview returns one of them as
- * suggested_filter so the strip can highlight what it recommends. Rename
- * a key on one side only and the recommendation silently stops matching
- * anything. `note` stays presentation, owned here. */
+/** The stock *choice* is local to each phone -- no filter name or ID is ever
+ * sent to the server, and the live viewfinder strip is cosmetic only. But
+ * routes/capture.tsx's post-capture review sheet bakes the picked stock's
+ * look into real pixels (buildFilterCss -> canvas ctx.filter) before a
+ * confirmed shot ever reaches the outbox, so a saved photo *does* carry the
+ * look now -- just as ordinary image data, not as separate metadata.
+ * `key` is a real contract with the backend either way: ai_engine.py's
+ * FILM_STOCKS uses these exact keys, and /analyze/preview returns one of
+ * them as suggested_filter so the strip can highlight what it recommends.
+ * Rename a key on one side only and the recommendation silently stops
+ * matching anything. `note` stays presentation, owned here. */
 export const filmStocks = [
   { key: "portra_400", name: "Portra 400", note: "skin, candlelight" },
   { key: "cinestill_800t", name: "Cinestill 800T", note: "tungsten, halation" },

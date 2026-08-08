@@ -42,6 +42,20 @@ const RATIOS = [
   { key: "strip", cls: "aspect-[1/3]", ar: 1 / 3 },
 ] as const;
 
+/** Per-stock starting point for the review sheet's TONE/COLOR/PALETTE
+ * sliders -- picking a different stock on the strip resets to its own
+ * preset rather than keeping whatever the previous stock's sliders were
+ * left at, matching a real film swap more than a shared global edit. Keyed
+ * by the same filmStocks[].key contract ai_engine.py's FILM_STOCKS uses. */
+const STOCK_PRESETS: Record<string, { tone: number; color: number; palette: number }> = {
+  portra_400: { tone: -10, color: 85, palette: 65 },
+  cinestill_800t: { tone: -20, color: 100, palette: 80 },
+  tri_x_400: { tone: 0, color: 0, palette: 100 },
+  ektar_100: { tone: 10, color: 130, palette: 60 },
+  gold_200: { tone: 5, color: 90, palette: 70 },
+};
+const DEFAULT_PRESET = { tone: 0, color: 100, palette: 50 };
+
 /** How often the viewfinder asks a node to look at what it's seeing. One
  * analysis measured ~37ms server-side, so this is set by taste and by
  * politeness to a shared node rather than by compute: fast enough to feel
@@ -114,13 +128,50 @@ function Toggle({
   );
 }
 
+/** A continuous adjust knob for the review sheet -- unlike Dial's discrete
+ * ticks, TONE/COLOR/PALETTE are free-ranging canvas filter inputs, so a
+ * native range input (cheap, correct touch/keyboard handling for free)
+ * fits better than reimplementing drag math. */
+function Slider({
+  label,
+  value,
+  min,
+  max,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div>
+      <div className="flex items-center justify-between">
+        <p className="font-mono text-[0.5rem] tracking-[0.16em] text-fixer-dim">{label}</p>
+        <p className="font-mono text-[0.6rem] font-bold text-drifting">
+          {value > 0 ? `+${value}` : value}
+        </p>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="mt-1 w-full accent-drifting"
+      />
+    </div>
+  );
+}
+
 function Capture() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  // Separate from canvasRef on purpose: the preview loop and a shutter press
-  // can land in the same tick, and shootOnce resizes its canvas to the full
-  // sensor frame. Sharing one canvas would let a capture and an analysis
-  // scribble over each other's pixels.
+  // A capture (captureFrame) makes its own throwaway canvas rather than
+  // reusing a ref, precisely so it can never collide with this one: the
+  // preview loop and a shutter press can land in the same tick, and
+  // sharing a canvas would let a capture and an analysis scribble over
+  // each other's pixels mid-draw.
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
 
@@ -138,7 +189,53 @@ function Capture() {
   const [facing, setFacing] = useState<"environment" | "user">("environment");
   const mirrored = facing === "user";
 
+  // Scattered once per mount, not per render -- the scan overlay flickers
+  // in and out with every "reading the light" phase, and regenerating
+  // positions on each of those renders would make the particles jump
+  // around instead of twinkling in place.
+  const scanDots = useMemo(
+    () =>
+      Array.from({ length: 26 }, () => ({
+        left: Math.random() * 100,
+        top: Math.random() * 100,
+        size: Math.random() < 0.25 ? 3 : 1.5,
+        delay: Math.random() * 2.2,
+        duration: 1.4 + Math.random() * 1.6,
+      })),
+    [],
+  );
+
+  // Tap-to-zoom: "ZOOM IN 2.3x" turns the passive crop-rectangle label into
+  // an actual digital zoom, the same move doca cam's viewfinder does. `rect`
+  // is always absolute against the ar-cropped full frame, in the SAME
+  // coordinate space grabPreviewFrame already mirrors into when facing the
+  // selfie camera (composeRect folds a second tap's rect, itself relative
+  // to the already-zoomed view, into that same absolute space) so shootOnce
+  // can crop straight from it without knowing how many taps got it there or
+  // which camera is active.
+  const [digitalZoom, setDigitalZoom] = useState<{
+    rect: { x: number; y: number; w: number; h: number };
+    zoom: number;
+  } | null>(null);
+
   const [stock, setStock] = useState(0);
+
+  // Post-capture review: the shutter no longer queues straight to the
+  // outbox for a single (non-burst) frame. It freezes the shot on its own
+  // canvas -- decoupled from canvasRef/videoRef, which keep going -- and
+  // holds it here until RETAKE (discarded) or USE THIS FRAME (baked
+  // through buildFilterCss and only then queued). Burst mode skips this
+  // entirely: reviewing three frames one at a time is a different, un-asked-
+  // for feature, so it keeps the old immediate-queue path.
+  const [reviewing, setReviewing] = useState<{
+    canvas: HTMLCanvasElement;
+    previewUrl: string;
+    stock: number;
+    tone: number;
+    color: number;
+    palette: number;
+  } | null>(null);
+
   const [zone, setZone] = useState(ZONES[0]!);
   const [reachable, setReachable] = useState(false);
   const [composing, setComposing] = useState(false);
@@ -164,6 +261,15 @@ function Capture() {
   const frame = myPhotos.length;
 
   const showNudge = !composing && !panel;
+
+  // The zoom rect's coordinate space is tied to both the frame ratio and
+  // which camera is active (mirrored or not -- see grabPreviewFrame). Either
+  // changing invalidates it. Turning AI off removes the only control that
+  // can reset it, so treat that as a reset too rather than leaving the guest
+  // stuck zoomed in with no way back.
+  useEffect(() => {
+    setDigitalZoom(null);
+  }, [ratio, aiOn, facing]);
 
   // real camera feed, not a bundled photo. Re-runs on flip; the cleanup
   // stops the old tracks first, since a phone won't hand out the front
@@ -240,8 +346,14 @@ function Capture() {
   // did before this feature existed. Guidance is the only part of this screen
   // that needs the cluster -- capture, the outbox and the roll are all local,
   // so a partition costs the guest advice, never a photo.
+  const isReviewing = reviewing !== null;
+
   useEffect(() => {
-    if (!aiOn || cameraError) {
+    // Reading isReviewing (a boolean), not reviewing itself: reviewing is a
+    // new object on every slider drag, and depending on the object would
+    // restart this whole polling loop -- aborting an in-flight request and
+    // rescheduling -- on every tick of a slider the guest is dragging.
+    if (!aiOn || cameraError || isReviewing) {
       setAi(null);
       setAiScanning(false);
       return;
@@ -258,7 +370,14 @@ function Capture() {
       const node = video && canvas && video.videoWidth > 0 ? await pickNode() : null;
 
       if (!stopped && node) {
-        const frame = grabPreviewFrame(video!, canvas!, ar, mirrored);
+        // Crop to the applied zoom rect (if any) so the AI reads the same
+        // tightened frame the guest is actually looking at, not the full
+        // scene it already recommended zooming out of. Mirroring happens
+        // inside grabPreviewFrame too, and must -- the zoom rect itself is
+        // expressed in mirrored space when facing the selfie camera (see
+        // digitalZoom's docstring above), so the two have to agree on
+        // orientation or every box lands on the wrong side of its subject.
+        const frame = grabPreviewFrame(video!, canvas!, ar, mirrored, digitalZoom?.rect);
         if (frame) {
           setAiScanning(true);
           try {
@@ -298,7 +417,10 @@ function Capture() {
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [aiOn, cameraError, ratio, mirrored]);
+    // digitalZoom is intentionally a dep, not just read from a ref: applying
+    // or resetting zoom should trigger an immediate re-read of the new view
+    // instead of waiting up to PREVIEW_INTERVAL_MS for the next scheduled tick.
+  }, [aiOn, cameraError, ratio, mirrored, digitalZoom, isReviewing]);
 
   useEffect(() => {
     return () => {
@@ -326,14 +448,12 @@ function Capture() {
 
   /** Grabs the current video frame into a real JPEG, queues it in the
    * offline outbox immediately (the shutter never waits on the network),
-   * then fires a background sync attempt. Burst just repeats this. */
+   * then fires a background sync attempt. Used for burst mode, which
+   * bypasses the review sheet entirely (reviewing three frames one at a
+   * time is a separate feature nobody asked for). */
   function shootOnce() {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas || video.videoWidth === 0) return;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext("2d")!.drawImage(video, 0, 0);
+    const canvas = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
+    if (!canvas) return;
     canvas.toBlob(
       async (blob) => {
         if (!blob) return;
@@ -353,9 +473,26 @@ function Capture() {
     );
   }
 
+  /** A single (non-burst) shot freezes onto its own canvas -- decoupled
+   * from videoRef, which keeps playing underneath -- and opens the review
+   * sheet instead of queuing immediately. Preset TONE/COLOR/PALETTE come
+   * from whichever stock is currently selected (the live AI pick, if the
+   * guest hasn't touched the strip), so the review opens already looking
+   * like a reasonable default rather than flat/neutral. */
   function shoot() {
-    const n = burst ? 3 : 1;
-    for (let i = 0; i < n; i++) shootOnce();
+    if (burst) {
+      for (let i = 0; i < 3; i++) shootOnce();
+      return;
+    }
+    const canvas = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
+    if (!canvas) return;
+    const preset = STOCK_PRESETS[filmStocks[stock]!.key] ?? DEFAULT_PRESET;
+    setReviewing({
+      canvas,
+      previewUrl: canvas.toDataURL("image/jpeg", 0.85),
+      stock,
+      ...preset,
+    });
   }
 
   function onShutter() {
@@ -364,7 +501,87 @@ function Capture() {
     else shoot();
   }
 
+  /** RETAKE: discard the frozen frame, back to the live viewfinder. */
+  function retakeReview() {
+    setReviewing(null);
+  }
+
+  /** USE THIS FRAME: bakes TONE/COLOR/PALETTE into real pixels via
+   * ctx.filter (not just a CSS preview that vanishes on save) and only
+   * then queues it -- same offline-first outbox path as a normal shot. */
+  function confirmReview() {
+    if (!reviewing) return;
+    const filterCss = buildFilterCss(
+      filmStocks[reviewing.stock]!.key,
+      reviewing.tone,
+      reviewing.color,
+      reviewing.palette,
+    );
+    const out = document.createElement("canvas");
+    out.width = reviewing.canvas.width;
+    out.height = reviewing.canvas.height;
+    const ctx = out.getContext("2d")!;
+    ctx.filter = filterCss;
+    ctx.drawImage(reviewing.canvas, 0, 0);
+    out.toBlob(
+      async (blob) => {
+        if (!blob) return;
+        const image_base64 = await blobToBase64(blob);
+        addPhoto({
+          local_id: crypto.randomUUID(),
+          guest_id: currentGuestId(),
+          zone,
+          composition_score: 0,
+          vclock: tick(),
+          image_base64,
+        });
+        void syncOutbox();
+      },
+      "image/jpeg",
+      0.9,
+    );
+    // Carry the review's stock choice back to the live strip so the next
+    // shot starts from what was just confirmed, and stop the AI pick from
+    // silently overriding a choice the guest just acted on.
+    stockTouched.current = true;
+    setStock(reviewing.stock);
+    setReviewing(null);
+  }
+
   const today = "26 07 08";
+
+  // Visually zoom the video to `digitalZoom.rect` by scaling it up around
+  // that rect's center, then translating the (now off-center) rect back to
+  // the middle of the box. Derived once and worth writing down: with
+  // transform-origin left at its 50%/50% default, `scale(S) translate(tx,ty)`
+  // resolves (percentages are relative to the element's own unscaled box) to
+  // screen = 0.5 + S * ((u + tx) - 0.5) for a source fraction u -- solving
+  // that for "screen == (u - rect.x) / rect.w" gives S = 1/rect.w and
+  // tx = 0.5 - (rect.x + rect.w/2), independent of u, i.e. a single
+  // translate works for the whole rect, not just its center.
+  // Composed in that order -- scale/translate outermost, mirror innermost --
+  // because translate()'s percentages always resolve against the element's
+  // original (untransformed) box regardless of where a function sits in the
+  // chain, so mirroring first and then zooming the (now-mirrored) result
+  // works out to exactly the same math already derived above, with
+  // scaleX(-1) just prepended as one more step. digitalZoom.rect is already
+  // expressed in mirrored space when facing the selfie camera (captureFrame/
+  // grabPreviewFrame agree on that), so the rect needs no separate flip here
+  // -- only the video's own paint order does.
+  const videoTransformParts: string[] = [];
+  if (digitalZoom) {
+    videoTransformParts.push(
+      `scale(${(1 / digitalZoom.rect.w).toFixed(4)})`,
+      `translate(${((0.5 - (digitalZoom.rect.x + digitalZoom.rect.w / 2)) * 100).toFixed(2)}%, ${(
+        (0.5 - (digitalZoom.rect.y + digitalZoom.rect.h / 2)) *
+        100
+      ).toFixed(2)}%)`,
+    );
+  }
+  if (mirrored) videoTransformParts.push("scaleX(-1)");
+  const videoStyle = videoTransformParts.length
+    ? { transform: videoTransformParts.join(" ") }
+    : undefined;
 
   return (
     <main className="grain relative min-h-screen overflow-hidden bg-emulsion pb-16">
@@ -395,7 +612,7 @@ function Capture() {
                 autoPlay
                 playsInline
                 muted
-                className={`h-full w-full object-cover transition-[filter] duration-500 ${
+                className={`h-full w-full object-cover transition-[filter,transform] duration-500 ${
                   stock === 2
                     ? "grayscale contrast-125"
                     : stock === 1
@@ -408,9 +625,8 @@ function Capture() {
                 // analysis frame is mirrored to match in grabPreviewFrame --
                 // the two must never disagree or every overlay box lands on
                 // the wrong side of its subject.
-                style={mirrored ? { transform: "scaleX(-1)" } : undefined}
+                style={videoStyle}
               />
-              <canvas ref={canvasRef} className="hidden" />
               <canvas ref={previewCanvasRef} className="hidden" />
               {/* halation / vignette, stronger the faster the film */}
               <div
@@ -430,6 +646,32 @@ function Capture() {
                   was sent, which is this box's contents. */}
               {aiOn && (
                 <div className="pointer-events-none absolute inset-0">
+                  {/* Scan particles: only while there's nothing measured yet
+                      to show instead -- once a reading lands, ai is set and
+                      this scene's "hold still" phase is over, even though
+                      aiScanning itself will flip true/false again on every
+                      later tick (each ~37ms fetch, per PREVIEW_INTERVAL_MS's
+                      docstring). Twinkling forever during routine polling
+                      would read as constant uncertainty about a scene the
+                      guide has already spoken about. */}
+                  {!ai && reachable && aiScanning && (
+                    <div className="absolute inset-0 overflow-hidden">
+                      {scanDots.map((d, i) => (
+                        <span
+                          key={i}
+                          className="absolute rounded-full bg-drifting"
+                          style={{
+                            left: `${d.left}%`,
+                            top: `${d.top}%`,
+                            width: d.size,
+                            height: d.size,
+                            animation: `scan-twinkle ${d.duration}s ease-in-out ${d.delay}s infinite`,
+                          }}
+                        />
+                      ))}
+                    </div>
+                  )}
+
                   {ai?.reframe.subject_found && (
                     <div
                       className="absolute rounded-[3px] border border-drifting/80"
@@ -446,10 +688,30 @@ function Capture() {
                       className="settling absolute rounded-lg border-2 border-safelight/85"
                       style={pct(ai.reframe.rect)}
                     >
-                      <span className="absolute -bottom-5 right-0 rounded-sm bg-emulsion/85 px-1 font-mono text-[0.55rem] tracking-[0.16em] text-safelight">
-                        {ai.reframe.zoom}× TIGHTER
-                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const rect = digitalZoom
+                            ? composeRect(digitalZoom.rect, ai.reframe.rect)
+                            : ai.reframe.rect;
+                          const zoom = (digitalZoom?.zoom ?? 1) * ai.reframe.zoom;
+                          setDigitalZoom({ rect, zoom: Math.round(zoom * 100) / 100 });
+                        }}
+                        className="pointer-events-auto absolute -bottom-6 right-0 rounded-sm border border-safelight/70 bg-safelight/90 px-2 py-1 font-mono text-[0.55rem] font-bold tracking-[0.16em] text-emulsion active:scale-95"
+                      >
+                        ZOOM IN {ai.reframe.zoom}× →
+                      </button>
                     </div>
+                  )}
+
+                  {digitalZoom && (
+                    <button
+                      type="button"
+                      onClick={() => setDigitalZoom(null)}
+                      className="pointer-events-auto absolute right-2 bottom-2 rounded-sm border border-safelight/60 bg-emulsion/85 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-safelight active:scale-95"
+                    >
+                      ZOOMED {digitalZoom.zoom}× · TAP TO RESET
+                    </button>
                   )}
 
                   {/* Camera move. Anchored to the MIDDLE of the viewfinder, not
@@ -752,11 +1014,146 @@ function Capture() {
             </p>
           </div>
         </div>
+
+        {/* Post-capture review — a single (non-burst) frame lands here before
+            it ever reaches the outbox. Opaque and last in DOM order, so it
+            covers the viewfinder and shutter row beneath it without needing
+            an explicit z-index. */}
+        {reviewing && (
+          <div className="absolute inset-0 flex flex-col bg-emulsion">
+            <div className="relative flex-1 overflow-hidden bg-black">
+              <img
+                src={reviewing.previewUrl}
+                alt="Captured frame"
+                className="h-full w-full object-contain"
+                style={{
+                  filter: buildFilterCss(
+                    filmStocks[reviewing.stock]!.key,
+                    reviewing.tone,
+                    reviewing.color,
+                    reviewing.palette,
+                  ),
+                }}
+              />
+              <span className="absolute top-2 left-2 rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-drifting">
+                REVIEW · {filmStocks[reviewing.stock]!.name}
+              </span>
+            </div>
+
+            <div className="film-edge border-t border-fixer/20 bg-emulsion/95 px-4 py-4 backdrop-blur">
+              <div className="flex gap-2 overflow-x-auto pb-1 [scrollbar-width:none]">
+                {filmStocks.map((f, i) => (
+                  <button
+                    key={f.key}
+                    onClick={() => {
+                      const preset = STOCK_PRESETS[f.key] ?? DEFAULT_PRESET;
+                      setReviewing((r) => (r ? { ...r, stock: i, ...preset } : r));
+                    }}
+                    className={`shrink-0 rounded-sm border px-2.5 py-1.5 font-mono text-[0.55rem] tracking-widest ${
+                      i === reviewing.stock
+                        ? "border-drifting bg-drifting/20 text-drifting"
+                        : "border-fixer/20 text-fixer-dim"
+                    }`}
+                  >
+                    {f.name}
+                  </button>
+                ))}
+              </div>
+
+              <p className="mt-2 font-mono text-[0.55rem] leading-relaxed tracking-[0.08em] text-fixer-dim">
+                {ai?.reason ?? filmStocks[reviewing.stock]!.note}
+              </p>
+
+              <div className="mt-3 grid grid-cols-3 gap-3">
+                <Slider
+                  label="TONE"
+                  value={reviewing.tone}
+                  min={-100}
+                  max={100}
+                  onChange={(v) => setReviewing((r) => (r ? { ...r, tone: v } : r))}
+                />
+                <Slider
+                  label="COLOR"
+                  value={reviewing.color}
+                  min={0}
+                  max={150}
+                  onChange={(v) => setReviewing((r) => (r ? { ...r, color: v } : r))}
+                />
+                <Slider
+                  label="PALETTE"
+                  value={reviewing.palette}
+                  min={0}
+                  max={100}
+                  onChange={(v) => setReviewing((r) => (r ? { ...r, palette: v } : r))}
+                />
+              </div>
+
+              <div className="mt-4 flex gap-3">
+                <button
+                  onClick={retakeReview}
+                  className="flex-1 rounded-sm border border-fixer/30 py-2.5 font-mono text-[0.6rem] tracking-widest text-fixer-dim active:scale-95"
+                >
+                  RETAKE
+                </button>
+                <button
+                  onClick={confirmReview}
+                  className="flex-1 rounded-sm border border-drifting bg-drifting/20 py-2.5 font-mono text-[0.6rem] font-bold tracking-widest text-drifting active:scale-95"
+                >
+                  USE THIS FRAME
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       <GuestTabs active="capture" />
     </main>
   );
+}
+
+/** Center-crops the live video to `ar`, then further crops to `zoomRect`
+ * (if applied) -- the same absolute rect the CSS transform is showing on
+ * screen -- and draws the result onto a fresh canvas at full sensor
+ * resolution. Used for both the burst path (immediate queue) and the
+ * single-shot review path (frozen onto its own canvas, edited, then
+ * queued), so "zoom in" and the review sheet both operate on exactly what
+ * the viewfinder displayed, not the untouched raw frame.
+ *
+ * The saved photo itself is never pixel-mirrored, front camera or not --
+ * matching how the shutter has always behaved here, selfie or rear. `zoomRect`
+ * is expressed in mirrored (as-displayed) space when facing the selfie
+ * camera though, so its x still needs flipping before it can select raw
+ * sensor pixels -- same reasoning as grabPreviewFrame, minus that function's
+ * final mirror-the-output step, since this one deliberately skips it. */
+function captureFrame(
+  video: HTMLVideoElement | null,
+  zoomRect: { x: number; y: number; w: number; h: number } | null | undefined,
+  ar: number,
+  mirrored: boolean,
+): HTMLCanvasElement | null {
+  if (!video || video.videoWidth === 0) return null;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+
+  let sx = 0, sy = 0, sw = vw, sh = vh;
+  if (zoomRect) {
+    const cropW = Math.min(vw, vh * ar);
+    const cropH = cropW / ar;
+    const baseX = (vw - cropW) / 2;
+    const baseY = (vh - cropH) / 2;
+    const rectX = mirrored ? 1 - zoomRect.x - zoomRect.w : zoomRect.x;
+    sx = baseX + rectX * cropW;
+    sy = baseY + zoomRect.y * cropH;
+    sw = zoomRect.w * cropW;
+    sh = zoomRect.h * cropH;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = sw;
+  canvas.height = sh;
+  canvas.getContext("2d")!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+  return canvas;
 }
 
 /** Center-crops the live video to `ar` -- exactly how the viewfinder shows
@@ -773,6 +1170,7 @@ function grabPreviewFrame(
   canvas: HTMLCanvasElement,
   ar: number,
   mirrored: boolean,
+  zoomRect?: { x: number; y: number; w: number; h: number },
 ): string | null {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
@@ -780,12 +1178,30 @@ function grabPreviewFrame(
 
   const cropW = Math.min(vw, vh * ar);
   const cropH = cropW / ar;
-  const sx = (vw - cropW) / 2;
-  const sy = (vh - cropH) / 2;
+  let sx = (vw - cropW) / 2;
+  let sy = (vh - cropH) / 2;
+  let sw = cropW;
+  let sh = cropH;
+  // Applied zoom is a sub-rect of the ar-crop above, in the same normalized
+  // space the on-screen CSS transform uses -- crop to it here too, so the AI
+  // reads the zoomed-in view the guest is actually looking at, not the full
+  // scene it already recommended zooming out of.
+  if (zoomRect) {
+    // zoomRect.x is expressed in mirrored (as-displayed) space when facing
+    // the selfie camera -- flip it before selecting raw sensor pixels.
+    // Cropping window [a, a+w] of a mirrored frame is the same pixels as
+    // cropping [1-a-w, 1-a] of the raw frame and then mirroring just that
+    // crop, which is exactly what the mirror step below does.
+    const rectX = mirrored ? 1 - zoomRect.x - zoomRect.w : zoomRect.x;
+    sx += rectX * cropW;
+    sy += zoomRect.y * cropH;
+    sw = zoomRect.w * cropW;
+    sh = zoomRect.h * cropH;
+  }
 
-  const scale = PREVIEW_EDGE_PX / Math.max(cropW, cropH);
-  canvas.width = Math.max(1, Math.round(cropW * scale));
-  canvas.height = Math.max(1, Math.round(cropH * scale));
+  const scale = PREVIEW_EDGE_PX / Math.max(sw, sh);
+  canvas.width = Math.max(1, Math.round(sw * scale));
+  canvas.height = Math.max(1, Math.round(sh * scale));
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
   // Selfie view is displayed mirrored, so mirror what we analyze too.
@@ -797,7 +1213,7 @@ function grabPreviewFrame(
   } else {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
-  ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   return canvas.toDataURL("image/jpeg", 0.8).split(",")[1] ?? null;
 }
@@ -811,6 +1227,64 @@ function pct(r: { x: number; y: number; w: number; h: number }) {
     width: `${r.w * 100}%`,
     height: `${r.h * 100}%`,
   };
+}
+
+/** Folds a rect expressed relative to `outer` (e.g. a second "zoom in" tap,
+ * whose ai.reframe.rect is normalized against the already-zoomed view) into
+ * the same absolute space `outer` itself is expressed in -- so a chain of
+ * taps composes into one rect instead of each tap only knowing about the
+ * one before it. */
+function composeRect(
+  outer: { x: number; y: number; w: number; h: number },
+  inner: { x: number; y: number; w: number; h: number },
+) {
+  return {
+    x: outer.x + inner.x * outer.w,
+    y: outer.y + inner.y * outer.h,
+    w: inner.w * outer.w,
+    h: inner.h * outer.h,
+  };
+}
+
+/** TONE/COLOR/PALETTE -> a real canvas `filter` string, applied both live
+ * (the review sheet's <img> style, for instant feedback) and baked into
+ * the saved photo (confirmReview draws through this same string) -- one
+ * formula, not a preview effect that quietly doesn't survive the save.
+ *
+ * TONE drives brightness/contrast around neutral; COLOR is a direct
+ * saturation percentage (0 = grayscale, 100 = unchanged); PALETTE (0..100)
+ * scales each stock's own characteristic secondary treatment, so turning
+ * it down fades toward "no particular stock" rather than toward black. */
+function buildFilterCss(stockKey: string, tone: number, color: number, palette: number): string {
+  const brightness = 1 + tone / 250;
+  const contrast = 1 + Math.abs(tone) / 400;
+  const saturate = color / 100;
+  const p = palette / 100;
+
+  const parts = [
+    `brightness(${brightness.toFixed(3)})`,
+    `contrast(${contrast.toFixed(3)})`,
+    `saturate(${saturate.toFixed(3)})`,
+  ];
+
+  switch (stockKey) {
+    case "tri_x_400":
+      parts.push(`grayscale(${p.toFixed(3)})`, `contrast(${(1 + 0.25 * p).toFixed(3)})`);
+      break;
+    case "cinestill_800t":
+      parts.push(`hue-rotate(${(-6 * p).toFixed(1)}deg)`, `saturate(${(1 + 0.3 * p).toFixed(3)})`);
+      break;
+    case "ektar_100":
+      parts.push(`saturate(${(1 + 0.4 * p).toFixed(3)})`);
+      break;
+    case "gold_200":
+      parts.push(`sepia(${(0.25 * p).toFixed(3)})`);
+      break;
+    case "portra_400":
+      parts.push(`sepia(${(0.12 * p).toFixed(3)})`, `saturate(${(1 - 0.1 * p).toFixed(3)})`);
+      break;
+  }
+  return parts.join(" ");
 }
 
 const STRENGTH_COPY: Record<string, string> = {

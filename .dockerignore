@@ -1,0 +1,17 @@
+.git/
+__pycache__/
+*.pyc
+*.db
+data/
+models/
+load_test_results/
+
+client/node_modules/
+client/dist/
+client-2/node_modules/
+client-2/dist/
+client-2/.output/
+client-2/.vinxi/
+client-2/.tanstack/
+client-2/.nitro/
+client-2/certs/

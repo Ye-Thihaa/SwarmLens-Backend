@@ -15,7 +15,11 @@ pydantic-core>=2.40
 # ai_engine.py -- saliency (contrib, not base opencv-python, for cv2.saliency),
 # CLIP inference via ONNX Runtime, CLIP's tokenizer. See ai_engine.py's module
 # docstring for exact pretrained checkpoints used (downloaded on first use).
-opencv-contrib-python==5.0.0.93
+# headless, not the GUI build -- this only ever calls cv2.saliency/threshold/
+# cvtColor (no imshow/highgui), and the GUI build's libGL/libxcb/... deps
+# aren't present on python:3.12-slim (confirmed: `import cv2` in the
+# container raised ImportError: libxcb.so.1: cannot open shared object file).
+opencv-contrib-python-headless==5.0.0.93
 numpy==2.5.1
 pillow==12.3.0
 onnxruntime==1.28.0
