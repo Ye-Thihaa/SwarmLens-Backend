@@ -258,6 +258,36 @@ it self-corrects.
 
 ---
 
+## Phase 5 — backend slice done, guest client not started
+
+The backend half only: `store.py`'s `events` table gained a `vclock`
+column (JSON text, envelope metadata alongside origin/seq/kind, not
+payload). `POST /photos` and `POST /likes` accept an optional `vclock:
+{device_id: counter}`; events created internally (job leases, recap,
+aesthetic_score) default to `{}` since there's no guest device behind
+them. `GET /photos` computes `concurrent_with` per photo: other
+photo_ids whose vclock neither dominates nor is dominated by this one,
+so a gallery UI can render them side by side instead of implying a false
+total order from arrival time. An empty vclock (no client attached one --
+true of every photo posted anywhere else in this repo, since no guest
+client exists yet) is never flagged concurrent with anything; that would
+assert causal knowledge that doesn't exist.
+
+The React/TS PWA (Dexie.js outbox, localStorage vector clock, Background
+Sync API service worker) is unbuilt -- that repo isn't attached alongside
+this backend, so there's nothing to wire it into yet. `test_vclock.py`
+simulates a couple of guest "devices" attaching clocks directly to
+`POST /photos` (since there's no real client to generate them) and
+confirms: two independent devices' photos are mutually concurrent; a
+photo whose clock causally includes an earlier one is correctly *not*
+flagged concurrent (happened-after, not simultaneous); a bare photo with
+no vclock is never flagged concurrent with anything; and the vclock
+field (plus the concurrency relationships it implies) survives gossip
+replication to the other two nodes unchanged.
+
+<details>
+<summary>Original spec</summary>
+
 ## Phase 5 — Guest client (offline queue + vector clocks)
 
 **Why.** This is the other half of the system — without it you only have
@@ -285,6 +315,8 @@ ordered by arrival time.
 visibly in the UI. Reconnect. Confirm all 5 arrive at an edge node in
 their original causal order, verified by inspecting the `vclock` field
 in each event.
+
+</details>
 
 ---
 

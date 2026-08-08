@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS events (
     kind        TEXT    NOT NULL,
     payload     TEXT    NOT NULL,
     created_at  REAL    NOT NULL,
+    vclock      TEXT    NOT NULL DEFAULT '{}',
     PRIMARY KEY (origin, seq)
 );
 
@@ -50,19 +51,28 @@ class Store:
         )
         return nxt
 
-    async def append_local(self, kind: str, payload: dict) -> dict:
-        """Record an event this node originated. Assigns the next local sequence."""
+    async def append_local(self, kind: str, payload: dict, vclock: dict | None = None) -> dict:
+        """Record an event this node originated. Assigns the next local
+        sequence. vclock is envelope metadata (like origin/seq), not
+        payload -- a guest client's {device_id: counter} clock, attached
+        to whatever event it sends. Internal/system events (job leases,
+        recap, aesthetic_score, ...) have no guest device behind them, so
+        they default to {} -- an empty clock carries no causal info and is
+        never treated as concurrent with anything (see main.py's
+        _concurrent)."""
         seq = await self._next_seq()
+        vclock = vclock or {}
         event = {
             "origin": self.node_id,
             "seq": seq,
             "kind": kind,
             "payload": payload,
             "created_at": time.time(),
+            "vclock": vclock,
         }
         await self.db.execute(
-            "INSERT INTO events (origin, seq, kind, payload, created_at) VALUES (?,?,?,?,?)",
-            (event["origin"], seq, kind, json.dumps(payload), event["created_at"]),
+            "INSERT INTO events (origin, seq, kind, payload, created_at, vclock) VALUES (?,?,?,?,?,?)",
+            (event["origin"], seq, kind, json.dumps(payload), event["created_at"], json.dumps(vclock)),
         )
         await self.db.commit()
         return event
@@ -72,12 +82,13 @@ class Store:
         if not events:
             return 0
         rows = [
-            (e["origin"], e["seq"], e["kind"], json.dumps(e["payload"]), e["created_at"])
+            (e["origin"], e["seq"], e["kind"], json.dumps(e["payload"]), e["created_at"],
+             json.dumps(e.get("vclock") or {}))
             for e in events
         ]
         cur = await self.db.executemany(
-            "INSERT OR IGNORE INTO events (origin, seq, kind, payload, created_at) "
-            "VALUES (?,?,?,?,?)",
+            "INSERT OR IGNORE INTO events (origin, seq, kind, payload, created_at, vclock) "
+            "VALUES (?,?,?,?,?,?)",
             rows,
         )
         await self.db.commit()
@@ -110,6 +121,7 @@ class Store:
                         "kind": r["kind"],
                         "payload": json.loads(r["payload"]),
                         "created_at": r["created_at"],
+                        "vclock": json.loads(r["vclock"]),
                     }
                 )
         return out
@@ -125,6 +137,7 @@ class Store:
             p = json.loads(r["payload"])
             p["likes"] = await self.like_count(p["photo_id"])
             p["stored_on"] = r["origin"]
+            p["vclock"] = json.loads(r["vclock"])
             photos.append(p)
         return photos
 
@@ -169,6 +182,7 @@ class Store:
                 "kind": r["kind"],
                 "payload": json.loads(r["payload"]),
                 "created_at": r["created_at"],
+                "vclock": json.loads(r["vclock"]),
             }
             for r in await cur.fetchall()
         ]
@@ -176,6 +190,24 @@ class Store:
     async def event_count(self) -> int:
         cur = await self.db.execute("SELECT COUNT(*) AS n FROM events")
         return (await cur.fetchone())["n"]
+
+    async def get_meta(self, key: str, default):
+        """Node-local scratch state (like local_seq) -- never gossiped,
+        not shared across nodes. Safe only for values that are fine to
+        lose or reset on a fresh process (e.g. a sync checkpoint backed by
+        an idempotent destination), never for anything correctness
+        -critical -- that belongs in the replicated event log instead."""
+        cur = await self.db.execute("SELECT value FROM local_meta WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return json.loads(row["value"]) if row else default
+
+    async def set_meta(self, key: str, value):
+        await self.db.execute(
+            "INSERT INTO local_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps(value)),
+        )
+        await self.db.commit()
 
     async def event_exists(self, kind: str) -> bool:
         """Cluster-wide idempotence check: has any node already logged this

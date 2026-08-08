@@ -23,9 +23,9 @@ the consistent-hashing ring matches how peers already refer to it.
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/photos` | upload (guest_id, zone, composition_score) |
-| GET  | `/photos` | gallery as this node currently sees it |
-| POST | `/likes`  | like a photo (guest_id, photo_id) |
+| POST | `/photos` | upload (guest_id, zone, composition_score, optional vclock) |
+| GET  | `/photos` | gallery as this node currently sees it; each photo carries `vclock` + `concurrent_with` |
+| POST | `/likes`  | like a photo (guest_id, photo_id, optional vclock) |
 | GET  | `/zones`  | emergent aesthetic map, ranked; each zone's score comes from its owning node on the hash ring (`stale: true` if that node is unreachable) |
 | GET  | `/zones/local` | this node's own replica of every zone, no ownership filtering — what peers proxy to |
 | GET  | `/zones/ring` | debug: current ring membership and the zone → owner mapping |
@@ -157,8 +157,32 @@ subject, confirms suggested_filter differs between a sunset-gradient and
 a flat-gray image, and confirms the aesthetic_score event count matches
 across all three nodes' `.db` files after a gossip round.
 
+## Vector clocks (concurrent events)
+
+`events.vclock` (JSON, envelope metadata like origin/seq) lets a guest
+device attach its own `{device_id: counter}` causal clock to a photo or
+like. `GET /photos` uses it to compute `concurrent_with` per photo:
+other photo_ids whose clock neither dominates nor is dominated by this
+one, so the gallery can render them side by side instead of implying a
+false total order from network arrival timing. A photo posted with no
+vclock (everything in this repo today, since the guest client itself --
+Phase 5's other half -- doesn't exist yet) is never flagged concurrent
+with anything.
+
+    curl -X POST localhost:8001/photos -H 'content-type: application/json' \
+      -d '{"guest_id":"a","zone":"bar","vclock":{"deviceA":1}}'
+    curl -X POST localhost:8001/photos -H 'content-type: application/json' \
+      -d '{"guest_id":"b","zone":"bar","vclock":{"deviceB":1}}'
+    curl localhost:8001/photos   # each lists the other in concurrent_with
+
+`python test_vclock.py` simulates a couple of devices this way against 3
+live nodes and confirms the concurrency relationships are correct and
+survive gossip replication unchanged.
+
 ## Next
 
-- guest client: offline queue + vector clocks (Phase 5)
+- guest client itself: Dexie.js offline outbox, localStorage vector
+  clock, Background Sync service worker (Phase 5's other half -- not
+  this repo)
 - wire the guest UI and operator console to this backend (needs those
   repos attached alongside this one -- not present here yet)

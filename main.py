@@ -139,30 +139,61 @@ class PhotoIn(BaseModel):
     zone: str
     url: str = ""
     composition_score: int = 0
+    vclock: dict[str, int] = {}
 
 
 class LikeIn(BaseModel):
     guest_id: str
     photo_id: str
+    vclock: dict[str, int] = {}
 
 
 @app.post("/photos")
 async def upload_photo(body: PhotoIn):
-    payload = body.model_dump()
+    payload = body.model_dump(exclude={"vclock"})
     payload["photo_id"] = f"ph_{uuid.uuid4().hex[:8]}"
-    event = await store.append_local("photo", payload)
+    event = await store.append_local("photo", payload, vclock=body.vclock)
     return {"ok": True, "photo_id": payload["photo_id"], "seq": event["seq"]}
 
 
 @app.post("/likes")
 async def like_photo(body: LikeIn):
-    await store.append_local("like", body.model_dump())
+    await store.append_local("like", body.model_dump(exclude={"vclock"}), vclock=body.vclock)
     return {"ok": True, "likes": await store.like_count(body.photo_id)}
+
+
+def _vclock_leq(a: dict, b: dict) -> bool:
+    """True if a happened-before-or-equal b in the vector clock partial order."""
+    return all(v <= b.get(k, 0) for k, v in a.items())
+
+
+def _concurrent(a: dict, b: dict) -> bool:
+    """True only when both clocks carry real causal info and neither
+    dominates the other. An empty clock (no guest device attached one --
+    true for every event until a real guest client exists) carries no
+    causal info, so it's never flagged concurrent with anything; that
+    would be asserting knowledge we don't have."""
+    if not a or not b:
+        return False
+    return not _vclock_leq(a, b) and not _vclock_leq(b, a)
 
 
 @app.get("/photos")
 async def list_photos():
-    return {"node": NODE_ID, "photos": await store.photos()}
+    """Gallery as this node currently sees it. Each photo carries its own
+    vclock (empty if the guest client didn't attach one) plus
+    concurrent_with: other photo_ids whose vclock is concurrent with this
+    one -- neither happened before the other -- so a gallery UI can
+    render them side by side instead of implying a false total order
+    from arrival time. O(n^2) over this node's photos; fine at demo
+    scale, same tradeoff /zones already makes."""
+    photos = await store.photos()
+    for p in photos:
+        p["concurrent_with"] = [
+            q["photo_id"] for q in photos
+            if q["photo_id"] != p["photo_id"] and _concurrent(p["vclock"], q["vclock"])
+        ]
+    return {"node": NODE_ID, "photos": photos}
 
 
 class AnalyzeIn(BaseModel):

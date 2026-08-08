@@ -12,6 +12,15 @@ list and manual demo commands: [README.md](README.md).
 - `store.py` — SQLite-backed append-only event log. All state (photos,
   likes, job leases, recap) is derived by replaying `events`, never
   written directly. `(origin, seq)` primary key makes merges idempotent.
+  Each event also carries a `vclock` (JSON, envelope metadata like
+  origin/seq — a guest device's `{device_id: counter}` clock, `{}` for
+  internally-generated events with no device behind them) and `main.py`'s
+  `GET /photos` uses it to compute `concurrent_with` per photo (see
+  `_concurrent`/`_vclock_leq`) instead of implying a false total order
+  from arrival time. `get_meta`/`set_meta` are node-local scratch state
+  (like `local_seq`) — never gossiped, safe only for values it's fine to
+  lose or recompute on a fresh process (cloud_sync's checkpoint uses
+  this; see the cloud_sync.py entry below for why that's still correct).
 - `gossip.py` — anti-entropy loop: every `GOSSIP_INTERVAL` (default 1s),
   pick one random peer, exchange version-vector digests, pull/push
   whatever's missing.
@@ -91,6 +100,13 @@ Tests:
   count matches on all three nodes' own `.db` files after a gossip
   round. First run downloads ~154MB of models into `./models/`
   (gitignored) — cached after that, budget extra time for a cold run.
+- `python test_vclock.py` — spins up 3 nodes, simulates a couple of
+  guest "devices" attaching `{device_id: counter}` clocks directly to
+  `POST /photos` (no real guest client exists to generate these yet),
+  confirms `concurrent_with` matches the actual causal structure (mutual
+  concurrency for independent devices, no false concurrency once one
+  clock causally dominates another, never concurrent for a bare photo
+  with no vclock), and confirms it all survives gossip replication.
 - No test file yet for gossip/worker phases — those were verified
   manually per the curl sequences in README.md. Same for the live
   `/zones` ownership/proxy/stale-fallback behavior — verified manually
@@ -99,14 +115,16 @@ Tests:
 ## Current status
 
 Phases 0-4 done (gossip replication, worker leases, Raft election,
-consistent-hash zone ownership, quorum reads), plus the AI analysis
-engine (`ai_engine.py`, `POST /analyze`) described above. See ROADMAP.md
-for the full phase list and what's next (Phase 5: guest client with
-offline queue + vector clocks). Not started: the guest UI and operator
-console wiring, Phase 6 (cloud archive), Phase 7 (chaos/metrics
-dashboard), Phase 8 (load test) -- the guest UI and operator console
-repos aren't present in this working directory, so that wiring can't
-happen from here until they're attached alongside the backend.
+consistent-hash zone ownership, quorum reads), the AI analysis engine
+(`ai_engine.py`, `POST /analyze`), and Phase 5's backend slice (vector
+clocks + `concurrent_with`) described above. See ROADMAP.md for the full
+phase list. Not started: the guest client itself (Dexie.js outbox,
+localStorage vector clock, service worker -- Phase 5's other half), the
+guest UI and operator console wiring, Phase 6 (cloud archive), Phase 7
+(chaos/metrics dashboard), Phase 8 (load test) -- the guest UI and
+operator console repos aren't present in this working directory, so
+that wiring can't happen from here until they're attached alongside the
+backend.
 
 ## Gotchas hit so far (don't reintroduce these)
 
