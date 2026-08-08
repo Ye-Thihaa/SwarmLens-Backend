@@ -2,6 +2,14 @@
 film-stock suggestion, CLIP + a linear head -> aesthetic score. No training,
 nothing fine-tuned here -- every number below comes from a public checkpoint.
 
+Two entry points, and the difference between them is persistence, not
+computation. analyze() is the post-capture path: its aesthetic_score is
+written to the replicated event log. preview() is the live-viewfinder
+path used for guidance before the shutter (subject box, crop rectangle,
+film-stock recommendation) -- it computes strictly more but writes
+nothing, because it runs every couple of seconds against a frame nobody
+has shot yet. See main.py's /analyze and /analyze/preview.
+
 Runs on the same tier as worker.py: compute-heavy, tolerates seconds of
 latency, offloaded to a thread per call (see main.py's /analyze handler) so
 it never blocks this node's asyncio loop -- gossip and raft both depend on
@@ -55,17 +63,76 @@ CLIP_MAX_TOKENS = 77
 CLIP_BOS_ID = 49406
 CLIP_EOS_ID = 49407  # also used as the pad id, matching the HF tokenizer config
 
-# One prompt per film stock the guest UI offers. Placeholder set -- swap in
-# the real names/copy once the guest UI's actual film-stock list (item 4) is
-# available; only the prompt text matters for matching quality, the dict
-# keys are what /analyze returns as suggested_filter.
+# One entry per film stock the guest UI actually offers. These keys are
+# what /analyze returns as suggested_filter, and client-2's film strip
+# (src/guest/data.ts) matches on them -- so the keys are a contract
+# between the two, don't rename one side alone.
+#
+# `name` lives here rather than on the client because compose_reason()
+# below builds one whole sentence mentioning the stock; splitting that
+# sentence across the wire to keep the name client-side would be worse
+# than the small duplication. The client owns presentation (`note`, strip
+# order); this owns the canonical key, the CLIP prompt, and the copy.
+#
+# `prompts` describe the stock's *visual character*, not its name -- CLIP
+# scores an image against what a photo taken on that stock looks like,
+# and "Kodak Portra 400" as a bare string is a much weaker signal than a
+# description of warm, soft, natural-skin-toned light.
+#
+# Several short prompts per stock rather than one long one, averaged in
+# _film_stock_text_embeddings(). This is CLIP's own zero-shot recipe (the
+# reference implementation ensembles 80 templates per class) and it's not
+# cosmetic here: with one hand-written prompt each, a single stock won
+# all 18 reference frames including near-black ones, because a long
+# prompt full of generic photographic words picks up a constant offset
+# that swamps the real per-image signal. Keep new prompts short and
+# comparable in specificity for the same reason.
 FILM_STOCKS = {
-    "golden_hour":         "a photo with warm golden hour sunset lighting",
-    "moody_bw":             "a moody black and white portrait photo",
-    "vibrant_street":       "a vibrant, highly saturated street photography scene",
-    "pastel_dreamy":        "a soft, pastel-toned, dreamy film photo",
-    "high_contrast_noir":   "a high contrast, dramatic film noir photo",
-    "vintage_warm":         "a warm vintage film photo with faded colors",
+    "portra_400": {
+        "name": "Portra 400",
+        "prompts": [
+            "a soft warm portrait photograph with natural skin tones",
+            "a gentle muted color photograph of people in candlelight",
+            "a low contrast portrait with creamy pastel colors",
+        ],
+        "why": "holds skin warm and the colors gentle",
+    },
+    "cinestill_800t": {
+        "name": "Cinestill 800T",
+        "prompts": [
+            "a night photograph under tungsten street lights",
+            "red halation glowing around bright lights at night",
+            "a neon lit city street at night with cool blue shadows",
+        ],
+        "why": "lets the lights bloom the way tungsten night film does",
+    },
+    "tri_x_400": {
+        "name": "Tri-X 400",
+        "prompts": [
+            "a black and white photograph",
+            "a monochrome photograph with visible film grain",
+            "a high contrast grayscale photograph with deep blacks",
+        ],
+        "why": "drops the color and leans on contrast and grain",
+    },
+    "ektar_100": {
+        "name": "Ektar 100",
+        "prompts": [
+            "a bright daylight photograph with vivid saturated colors",
+            "a sunny outdoor photograph with a deep blue sky",
+            "a crisp colorful landscape in strong sunlight",
+        ],
+        "why": "pushes the saturation these colors are already reaching for",
+    },
+    "gold_200": {
+        "name": "Gold 200",
+        "prompts": [
+            "a warm golden sunlit photograph",
+            "a nostalgic faded film snapshot",
+            "a photograph with warm amber tones at sunset",
+        ],
+        "why": "adds the warm, faded cast of an old sunlit snapshot",
+    },
 }
 
 
@@ -126,16 +193,34 @@ def _aesthetic_head() -> tuple:
 
 @lru_cache(maxsize=1)
 def _film_stock_text_embeddings() -> dict:
-    """Text embeddings for the fixed FILM_STOCKS prompt set. Computed once
-    (module-level cache) since the prompt set never changes per request."""
+    """Text embeddings for the fixed FILM_STOCKS prompt set, mean-centered.
+    Computed once (module-level cache) since the prompt set never changes.
+
+    The centering matters more than it looks. Every prompt here starts
+    from "a photograph of ...", so their embeddings share a large common
+    component that has nothing to do with which stock suits a given image.
+    Scoring against the raw embeddings, all six similarities land in a
+    narrow 0.20-0.24 band and one stock wins nearly every real photo
+    regardless of content -- measured, not assumed: three visibly
+    different reference frames (a night motorcycle, a dappled-sun truck,
+    a sunflower field) all returned the same stock. Subtracting the mean
+    text embedding removes that shared component so the comparison runs
+    on what actually differs between the prompts. Standard practice for
+    zero-shot CLIP over a fixed, similarly-phrased label set."""
     sess = _text_session()
     tok = _tokenizer()
-    out = {}
-    for key, prompt in FILM_STOCKS.items():
-        ids = np.array([tok.encode(prompt).ids], dtype=np.int64)
-        emb = sess.run(["text_embeds"], {"input_ids": ids})[0][0]
-        out[key] = emb / np.linalg.norm(emb)
-    return out
+    raw = {}
+    for key, stock in FILM_STOCKS.items():
+        per_prompt = []
+        for prompt in stock["prompts"]:
+            ids = np.array([tok.encode(prompt).ids], dtype=np.int64)
+            emb = sess.run(["text_embeds"], {"input_ids": ids})[0][0]
+            per_prompt.append(emb / np.linalg.norm(emb))
+        avg = np.mean(np.stack(per_prompt), axis=0)
+        raw[key] = avg / np.linalg.norm(avg)
+
+    mean = np.mean(np.stack(list(raw.values())), axis=0)
+    return {k: (v - mean) / np.linalg.norm(v - mean) for k, v in raw.items()}
 
 
 def _preprocess_image(img: Image.Image) -> np.ndarray:
@@ -162,29 +247,112 @@ def _embed_image(img: Image.Image) -> np.ndarray:
 WELL_COMPOSED_EPS = 0.03  # normalized fraction of width/height
 
 
-def _saliency_centroid(bgr: np.ndarray) -> tuple[float, float]:
+MIN_SUBJECT_AREA = 0.004   # below this the "subject" is speckle, not a subject
+MAX_SUBJECT_AREA = 0.72    # above this it's the whole scene, nothing to reframe to
+
+
+def _saliency_subject(bgr: np.ndarray) -> tuple[float, float, tuple[float, float, float, float], bool]:
+    """One saliency pass -> (centroid_x, centroid_y, bbox, found).
+
+    The box comes from the single strongest *connected region* of the
+    thresholded saliency map, not from the spread of all lit pixels. On a
+    real photograph -- foliage, gravel, fabric -- spectral-residual
+    saliency speckles across the entire frame, so any whole-image
+    statistic (min/max, or even a 6th/94th percentile, both tried)
+    collapses to a box covering ~90% of the frame and the reframe becomes
+    a no-op. Blurring before the threshold merges texture speckle into
+    its neighbours; the open/close pass drops what survives anyway.
+
+    `found` is False when nothing crossed the threshold, when the winning
+    region is too small to be a subject (a few noise pixels on a flat
+    wall), or when it's so large it *is* the scene. Callers must not draw
+    a subject box or a crop rectangle in those cases -- the fallback below
+    is a centered guess, not a detection, and presenting it as one is how
+    real arithmetic turns into confidently wrong advice.
+    """
+    h, w = bgr.shape[:2]
+    fallback = (w / 2, h / 2, (w / 3, h / 3, 2 * w / 3, 2 * h / 3), False)
+
     sal = cv2.saliency.StaticSaliencySpectralResidual_create()
     ok, smap = sal.computeSaliency(bgr)
+    if not ok:
+        return fallback
     smap = (smap * 255).astype(np.uint8)
+    smap = cv2.GaussianBlur(smap, (0, 0), sigmaX=max(w, h) / 90.0)
     _, thresh = cv2.threshold(smap, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    ys, xs = np.nonzero(thresh)
-    if len(xs) == 0:
-        h, w = smap.shape
-        return w / 2, h / 2
-    return float(xs.mean()), float(ys.mean())
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, k)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k)
+
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+    if n <= 1:
+        return fallback
+
+    # Rank on total saliency (mean intensity x area), not area alone: a big
+    # dim smear of background texture shouldn't outrank a small bright
+    # subject, which is exactly what pure largest-blob picking does.
+    best, best_weight = None, -1.0
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area / (w * h) < MIN_SUBJECT_AREA:
+            continue
+        weight = float(smap[labels == i].mean()) * area
+        if weight > best_weight:
+            best, best_weight = i, weight
+
+    if best is None or stats[best, cv2.CC_STAT_AREA] / (w * h) > MAX_SUBJECT_AREA:
+        return fallback
+
+    x0 = float(stats[best, cv2.CC_STAT_LEFT])
+    y0 = float(stats[best, cv2.CC_STAT_TOP])
+    x1 = x0 + float(stats[best, cv2.CC_STAT_WIDTH])
+    y1 = y0 + float(stats[best, cv2.CC_STAT_HEIGHT])
+    cx, cy = float(centroids[best][0]), float(centroids[best][1])
+    return cx, cy, (x0, y0, x1, y1), True
 
 
-def compute_ar_guide(img: Image.Image) -> dict:
+def _saliency_centroid(bgr: np.ndarray) -> tuple[float, float]:
+    cx, cy, _, _ = _saliency_subject(bgr)
+    return cx, cy
+
+
+_OPPOSITE = {"left": "right", "right": "left", "up": "down", "down": "up", "centered": "centered"}
+
+
+def _strength(mag: float) -> str:
+    """Bucketed off the real magnitude, never a fixed adverb: dx/dy are
+    fractions of frame width/height, so 0.04 genuinely is a nudge and 0.22
+    genuinely is a big reframe. Copy that says "a little" regardless of
+    the number would be invented flavor on top of measured data."""
+    if mag < WELL_COMPOSED_EPS:
+        return "none"
+    if mag < 0.08:
+        return "slight"
+    return "moderate" if mag < 0.18 else "large"
+
+
+def compute_ar_guide(img: Image.Image, subject: tuple | None = None) -> dict:
     """Where the subject currently sits vs. the nearest rule-of-thirds
     intersection, and which way it needs to move within the frame to get
-    there. dx/dy are normalized to [-1, 1] (fraction of width/height);
-    move_subject_x/y describe the direction *the subject* should shift
-    in-frame -- translating that into a camera-pan arrow (which is
-    inverted relative to subject motion) is a frontend concern, not
-    encoded here."""
-    bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-    h, w = bgr.shape[:2]
-    cx, cy = _saliency_centroid(bgr)
+    there. dx/dy are normalized to [-1, 1] (fraction of width/height).
+
+    Two directions are reported, and they are opposites -- read the names
+    carefully. move_subject_x/y is which way *the subject* should shift
+    within the frame; pan_camera_x/y is which way *the camera* must turn
+    to achieve that, which is inverted (to push the subject rightward in
+    frame you pan left). Both are returned explicitly because a UI that
+    picks the wrong one renders correct arithmetic as confidently wrong
+    advice -- worse than no guidance at all, since it still looks
+    trustworthy.
+
+    Pass `subject` to reuse an existing _saliency_subject() result instead
+    of paying for a second saliency pass."""
+    if subject is None:
+        bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        subject = _saliency_subject(bgr)
+    cx, cy, _bbox, found = subject
+    w, h = img.size
 
     tx = min((w / 3, 2 * w / 3), key=lambda t: abs(t - cx))
     ty = min((h / 3, 2 * h / 3), key=lambda t: abs(t - cy))
@@ -192,26 +360,200 @@ def compute_ar_guide(img: Image.Image) -> dict:
     dy = (ty - cy) / h
 
     well_composed = abs(dx) < WELL_COMPOSED_EPS and abs(dy) < WELL_COMPOSED_EPS
+    move_x = "centered" if abs(dx) < WELL_COMPOSED_EPS else ("right" if dx > 0 else "left")
+    move_y = "centered" if abs(dy) < WELL_COMPOSED_EPS else ("down" if dy > 0 else "up")
     return {
         "centroid": {"x": round(cx, 1), "y": round(cy, 1)},
         "image_size": {"w": w, "h": h},
         "target": {"x": round(tx, 1), "y": round(ty, 1)},
         "dx": round(float(dx), 3),
         "dy": round(float(dy), 3),
-        "move_subject_x": "centered" if abs(dx) < WELL_COMPOSED_EPS else ("right" if dx > 0 else "left"),
-        "move_subject_y": "centered" if abs(dy) < WELL_COMPOSED_EPS else ("down" if dy > 0 else "up"),
+        "move_subject_x": move_x,
+        "move_subject_y": move_y,
+        "pan_camera_x": _OPPOSITE[move_x],
+        "pan_camera_y": _OPPOSITE[move_y],
+        "strength": _strength(max(abs(dx), abs(dy))),
+        "subject_found": found,
         "well_composed": well_composed,
     }
 
 
+# ---- reframe: a crop rectangle + how much tighter it is ----
+
+SUBJECT_SHARE = 0.38   # subject's long edge should fill this much of the crop
+MAX_ZOOM = 4.0         # never recommend a crop tighter than this
+MIN_USEFUL_ZOOM = 1.15  # below this the crop isn't worth telling anyone about
+
+
+def compute_reframe(img: Image.Image, aspect: float | None = None,
+                    subject: tuple | None = None) -> dict:
+    """A concrete crop rectangle, not just a nudge direction: where the
+    frame would sit if the subject were placed on a rule-of-thirds
+    intersection and tightened to fill SUBJECT_SHARE of the frame.
+
+    `aspect` is the crop's width/height -- pass the ratio the client is
+    actually shooting (3:4, 1:1, ...) so the rectangle it draws matches
+    the frame it will get. Defaults to the source image's own aspect.
+
+    The rect is normalized to 0..1 of the source image so the caller can
+    render it at any display size. `zoom` is relative to the largest crop
+    of this same aspect that fits the frame -- i.e. how much tighter than
+    the current framing -- so it's >= 1.0 by construction.
+
+    `worth_it` is False when the subject wasn't really detected or the
+    crop is barely tighter than what's already framed; the UI should show
+    nothing at all rather than a rectangle that means nothing."""
+    w, h = img.size
+    if subject is None:
+        bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        subject = _saliency_subject(bgr)
+    cx, cy, (sx0, sy0, sx1, sy1), found = subject
+    aspect = aspect or (w / h)
+
+    # Largest crop of this aspect that still fits inside the frame.
+    max_w = min(float(w), h * aspect)
+    max_h = max_w / aspect
+
+    sw, sh = max(sx1 - sx0, 1.0), max(sy1 - sy0, 1.0)
+    crop_w = max(sw / SUBJECT_SHARE, (sh / SUBJECT_SHARE) * aspect)
+    crop_w = min(crop_w, max_w)                 # never larger than fits
+    crop_w = max(crop_w, max_w / MAX_ZOOM)      # never tighter than MAX_ZOOM
+    crop_h = crop_w / aspect
+
+    # Put the subject on the nearer thirds line of the *crop*. Choosing the
+    # near side (rather than always 1/3) is what keeps the rectangle from
+    # immediately running off the edge it's closest to.
+    third_x = 1 / 3 if cx < w / 2 else 2 / 3
+    third_y = 1 / 3 if cy < h / 2 else 2 / 3
+    x0 = min(max(cx - third_x * crop_w, 0.0), w - crop_w)
+    y0 = min(max(cy - third_y * crop_h, 0.0), h - crop_h)
+
+    zoom = max_w / crop_w
+    return {
+        "rect": {
+            "x": round(x0 / w, 4), "y": round(y0 / h, 4),
+            "w": round(crop_w / w, 4), "h": round(crop_h / h, 4),
+        },
+        "subject_box": {
+            "x": round(sx0 / w, 4), "y": round(sy0 / h, 4),
+            "w": round((sx1 - sx0) / w, 4), "h": round((sy1 - sy0) / h, 4),
+        },
+        "zoom": round(float(zoom), 2),
+        "worth_it": bool(found and zoom >= MIN_USEFUL_ZOOM),
+        "subject_found": found,
+    }
+
+
+# ---- scene colour, for the recommendation sentence ----
+
+# OpenCV hue is 0-179, and red wraps around both ends of that range.
+_HUE_BANDS = [
+    (0, 10, "red"), (10, 22, "orange"), (22, 33, "yellow"), (33, 78, "green"),
+    (78, 100, "cyan"), (100, 130, "blue"), (130, 157, "purple"), (157, 180, "red"),
+]
+
+
+def describe_scene(img: Image.Image) -> dict:
+    """Dominant hues + saturation/brightness, straight from an HSV
+    histogram. Cheap enough to run on every preview frame, and it's what
+    lets the recommendation sentence say something specific about *this*
+    scene instead of a generic line about the film stock.
+
+    Very dark pixels are excluded before the hue histogram: their hue is
+    numerically defined but perceptually meaningless, and including them
+    makes every night shot report whatever noise tinted the shadows.
+    Bright pixels are NOT excluded -- an earlier version dropped V > 250
+    as blown highlights, which silently discarded *every* pixel of a
+    fully-saturated image (a vivid orange is V=255 with plenty of hue)
+    and reported a bright sunset as colorless. Achromatic pixels are
+    already handled by the saturation gate below, which is the correct
+    test for "this pixel has no useful hue"."""
+    small = img.convert("RGB")
+    small.thumbnail((160, 160), Image.BILINEAR)
+    hsv = cv2.cvtColor(np.asarray(small), cv2.COLOR_RGB2HSV)
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+
+    lit = val > 35
+    colored = lit & (sat > 55)
+    total = int(colored.sum())
+
+    colors: list[str] = []
+    if total > 0:
+        counts = np.bincount(hue[colored].ravel(), minlength=180)
+        shares: dict[str, float] = {}
+        for lo, hi, name in _HUE_BANDS:
+            shares[name] = shares.get(name, 0.0) + float(counts[lo:hi].sum()) / total
+        colors = [n for n, s in sorted(shares.items(), key=lambda kv: -kv[1]) if s >= 0.15][:2]
+
+    lit_px = int(lit.sum()) or 1
+    mean_sat = float(sat[lit].mean()) if lit.any() else 0.0
+    mean_val = float(val[lit].mean()) if lit.any() else 0.0
+    color_share = total / lit_px
+
+    return {
+        "colors": colors,
+        "saturation": "high" if (mean_sat > 110 and color_share > 0.35)
+                      else ("low" if mean_sat < 55 else "medium"),
+        "brightness": "dark" if mean_val < 70 else ("bright" if mean_val > 175 else "even"),
+        "mean_saturation": round(mean_sat, 1),
+        "mean_brightness": round(mean_val, 1),
+    }
+
+
+def _join(words: list[str]) -> str:
+    return words[0] if len(words) == 1 else f"{words[0]} and {words[1]}"
+
+
+def compose_reason(scene: dict, stock_key: str, confident: bool = True) -> str:
+    """The one-line 'why this stock' shown over the viewfinder. Templated
+    from measured values (dominant hues, saturation, brightness) plus the
+    stock's own `why` clause -- deliberately not an LLM call: it would be
+    a new runtime dependency and a network round-trip for a sentence that
+    has maybe a dozen honest shapes, and this module's whole contract is
+    pretrained-only with nothing generated out of thin air.
+
+    `confident` comes from CONFIDENT_MARGIN. When the top two stocks are
+    effectively tied, the sentence says so instead of asserting a
+    preference the scores don't support -- the scene half is still a real
+    measurement, so it's reported either way."""
+    stock = FILM_STOCKS[stock_key]
+    colors, sat, bright = scene["colors"], scene["saturation"], scene["brightness"]
+
+    if colors and sat == "high":
+        lead = f"Vivid {_join(colors)}"
+    elif colors:
+        lead = f"Mostly {_join(colors)}"
+    elif sat == "low" and bright == "dark":
+        lead = "Dim, near-colorless light"
+    elif sat == "low":
+        lead = "Flat, muted color"
+    else:
+        lead = "Even, unremarkable color"
+
+    if bright == "dark" and colors:
+        lead += ", low light"
+
+    if not confident:
+        return f"{lead} — no strong preference here, {stock['name']} is the closest."
+    return f"{lead} — {stock['name']} {stock['why']}."
+
+
 # ---- step 3: CLIP filter suggestion ----
+
+# Margin (top score minus runner-up) below which the two are a tie in all
+# but name. Measured, not guessed: across the reference frames, genuine
+# picks separate by 0.01-0.06 while coin-flips sit under 0.005. The UI
+# must not render a 0.0009 margin in the same confident voice as a 0.05
+# one -- see compose_reason().
+CONFIDENT_MARGIN = 0.01
+
 
 def suggest_filter(img: Image.Image) -> dict:
     image_emb = _embed_image(img)
     text_embs = _film_stock_text_embeddings()
     scores = {key: float(np.dot(image_emb, emb)) for key, emb in text_embs.items()}
     best = max(scores, key=scores.get)
-    return {"suggested_filter": best, "scores": {k: round(v, 4) for k, v in scores.items()}}, image_emb
+    return {"suggested_filter": best, "scores": {k: round(v, 5) for k, v in scores.items()}}, image_emb
 
 
 # ---- step 4: aesthetic score (reuses the CLIP embedding from step 3) ----
@@ -237,6 +579,54 @@ def analyze(image_bytes: bytes) -> dict:
         "suggested_filter": filter_result["suggested_filter"],
         "filter_scores": filter_result["scores"],
         "aesthetic_score": aesthetic_score,
+    }
+
+
+def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
+    """Live-viewfinder analysis, for guidance *before* the shutter.
+
+    Same pretrained models and the same saliency/CLIP work as analyze(),
+    plus a crop rectangle (compute_reframe) and a recommendation sentence
+    (compose_reason). The difference that matters is what the caller does
+    with it: analyze() results get written to the replicated event log as
+    an aesthetic_score, and this one's must not be. A viewfinder calls
+    this every couple of seconds against a photo_id that doesn't exist
+    yet -- persisting that would flood the log, gossip it to every node,
+    and skew /zones' avg_aesthetic with scores for frames nobody shot.
+    See main.py's /analyze/preview.
+
+    One saliency pass is shared between the AR guide and the reframe;
+    one CLIP image embedding is shared between the filter picks and the
+    aesthetic score. Still synchronous and CPU-bound -- offload it."""
+    img = Image.open(io.BytesIO(image_bytes))
+    img.load()
+    bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    subject = _saliency_subject(bgr)
+
+    ar_guide = compute_ar_guide(img, subject=subject)
+    reframe = compute_reframe(img, aspect=aspect, subject=subject)
+    scene = describe_scene(img)
+    filter_result, image_emb = suggest_filter(img)
+
+    scores = filter_result["scores"]
+    ranked = sorted(scores, key=scores.get, reverse=True)
+    best = filter_result["suggested_filter"]
+    margin = scores[ranked[0]] - scores[ranked[1]]
+    confident = margin >= CONFIDENT_MARGIN
+
+    return {
+        "ar_guide": ar_guide,
+        "reframe": reframe,
+        "scene": scene,
+        "suggested_filter": best,
+        "confident": confident,
+        "margin": round(float(margin), 5),
+        "picks": [
+            {"key": k, "name": FILM_STOCKS[k]["name"], "score": scores[k]}
+            for k in ranked[:3]
+        ],
+        "reason": compose_reason(scene, best, confident),
+        "aesthetic_score": score_aesthetic(image_emb),
     }
 
 

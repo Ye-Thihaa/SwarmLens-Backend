@@ -172,6 +172,82 @@ export const postAnalyze = (node: string, body: { photo_id: string; image_base64
     ),
   );
 
+type Rect = { x: number; y: number; w: number; h: number };
+
+/** Directions come in matched, opposite pairs -- read the field names.
+ * move_subject_* is which way the subject should shift *within the frame*;
+ * pan_camera_* is which way to turn the camera to achieve that, which is
+ * the inverse. Rendering the wrong one gives the guest a confidently
+ * backwards arrow, so the UI should use pan_camera_* for anything shaped
+ * like an instruction. See ai_engine.compute_ar_guide. */
+export type ArGuide = {
+  centroid: { x: number; y: number };
+  image_size: { w: number; h: number };
+  target: { x: number; y: number };
+  dx: number;
+  dy: number;
+  move_subject_x: "left" | "right" | "centered";
+  move_subject_y: "up" | "down" | "centered";
+  pan_camera_x: "left" | "right" | "centered";
+  pan_camera_y: "up" | "down" | "centered";
+  strength: "none" | "slight" | "moderate" | "large";
+  subject_found: boolean;
+  well_composed: boolean;
+};
+
+/** rect/subject_box are normalized 0..1 against the frame that was sent,
+ * so they overlay the viewfinder directly -- which is why the client must
+ * send the frame cropped the way it's displayed (see grabPreviewFrame in
+ * routes/capture.tsx), not the raw uncropped sensor image. */
+export type Reframe = {
+  rect: Rect;
+  subject_box: Rect;
+  zoom: number;
+  worth_it: boolean;
+  subject_found: boolean;
+};
+
+export type ComposePreview = {
+  ar_guide: ArGuide;
+  reframe: Reframe;
+  scene: {
+    colors: string[];
+    saturation: "low" | "medium" | "high";
+    brightness: "dark" | "even" | "bright";
+    mean_saturation: number;
+    mean_brightness: number;
+  };
+  suggested_filter: string;
+  /** False when the top two stocks are within CONFIDENT_MARGIN of each
+   * other -- i.e. a tie. The UI must soften its copy rather than assert a
+   * preference the scores don't support. */
+  confident: boolean;
+  margin: number;
+  picks: { key: string; name: string; score: number }[];
+  reason: string;
+  aesthetic_score: number;
+};
+
+/** Live viewfinder guidance, computed but never persisted (unlike
+ * postAnalyze above, which appends an aesthetic_score event). Returns
+ * null when the node sheds the request with 503 -- every preview slot
+ * busy is an expected, routine outcome under load, not an error worth
+ * surfacing: the caller just tries again on its next tick. */
+export async function postAnalyzePreview(
+  node: string,
+  body: { image_base64: string; aspect: number },
+  signal?: AbortSignal,
+): Promise<ComposePreview | null> {
+  const r = await fetch(`${node}/analyze/preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal: signal ?? null, // exactOptionalPropertyTypes: RequestInit wants null, not undefined
+  });
+  if (r.status === 503) return null;
+  return asJson<ComposePreview>(r, `${node}/analyze/preview`);
+}
+
 export const postLike = (
   node: string,
   body: { guest_id: string; photo_id: string; vclock: Record<string, number> },

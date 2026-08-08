@@ -24,13 +24,17 @@ export const events: EventEntry[] = [
   },
 ];
 
-/** Purely cosmetic, local to each phone -- this backend has no film-stock
- * concept (ai_engine.py's suggested_filter is a different, real ML
- * output; these are just camera flavor). Never sent to the server. */
+/** The look itself is still local to each phone -- picking a stock sends
+ * nothing to the server, and no photo carries one. But `key` is now a
+ * real contract with the backend: ai_engine.py's FILM_STOCKS uses these
+ * exact keys, and /analyze/preview returns one of them as
+ * suggested_filter so the strip can highlight what it recommends. Rename
+ * a key on one side only and the recommendation silently stops matching
+ * anything. `note` stays presentation, owned here. */
 export const filmStocks = [
-  { name: "Portra 400", note: "skin, candlelight" },
-  { name: "Cinestill 800T", note: "tungsten, halation" },
-  { name: "Tri-X 400", note: "black & white, grain" },
-  { name: "Ektar 100", note: "daylight, saturated" },
-  { name: "Gold 200", note: "warm, forgiving" },
+  { key: "portra_400", name: "Portra 400", note: "skin, candlelight" },
+  { key: "cinestill_800t", name: "Cinestill 800T", note: "tungsten, halation" },
+  { key: "tri_x_400", name: "Tri-X 400", note: "black & white, grain" },
+  { key: "ektar_100", name: "Ektar 100", note: "daylight, saturated" },
+  { key: "gold_200", name: "Gold 200", note: "warm, forgiving" },
 ];

@@ -18,6 +18,17 @@ list and manual demo commands: [README.md](README.md).
   `store.photos()` strips `image_base64` back out of the list response for
   the same reason, and adds `taken_at` (already on the event as
   `created_at`, just not exposed until a client needed it for display).
+  `POST /analyze/preview` is the live-viewfinder sibling of `/analyze`:
+  same models, same `to_thread` offload, but it appends **no** events —
+  a camera calls it every 1.5s against a frame that has no `photo_id` and
+  was never shot, so persisting those would flood the log, gossip every
+  one to all three nodes, and drag `/zones`' `avg_aesthetic` toward
+  frames no guest kept. It is bounded by a `PREVIEW_CONCURRENCY`
+  semaphore and sheds excess with 503 rather than queueing (guidance for
+  a frame the guest already panned away from is worse than none), and
+  caps the request body — measured at ~37ms/frame with `/health` staying
+  under 10ms alongside it, so the asyncio loop and raft's 50ms heartbeat
+  are unaffected.
   `/chaos/partition/{i}` and `/chaos/heal` are gated by
   `require_operator_token` (checks `X-Operator-Token` against
   `OPERATOR_TOKEN` with `secrets.compare_digest`) — fails open when
@@ -64,8 +75,23 @@ list and manual demo commands: [README.md](README.md).
   node.
 - `ai_engine.py` — pretrained-only photo analysis (no training anywhere):
   saliency subject detection, a rule-of-thirds AR reframe guide, CLIP
-  film-stock suggestion, and a CLIP-embedding aesthetic score. Wired up
-  as `POST /analyze` in `main.py`, which runs it on a thread (it's
+  film-stock suggestion, and a CLIP-embedding aesthetic score. Two entry
+  points that differ in *persistence, not computation*: `analyze()` is the
+  post-capture path whose `aesthetic_score` is written to the event log,
+  and `preview()` is the live-viewfinder path (`POST /analyze/preview`)
+  that computes strictly more — a subject box, a crop rectangle
+  (`compute_reframe`), a dominant-colour read (`describe_scene`) and a
+  templated recommendation sentence (`compose_reason`) — and writes
+  nothing at all. `compute_ar_guide` returns `move_subject_*` *and* its
+  inverse `pan_camera_*` explicitly, because a UI that renders the wrong
+  one shows a confidently backwards arrow; it also reports `strength`
+  bucketed off the real dx/dy magnitude so copy like "a little" tracks
+  the measurement instead of being a fixed adverb. `FILM_STOCKS`' keys
+  are a contract with `client-2/src/guest/data.ts` (rename one side alone
+  and the recommendation silently stops matching anything), and each
+  stock carries several short prompts that get ensembled — see the
+  Gotchas entry on CLIP class priors for why one long prompt each did not
+  work. Wired up as `POST /analyze` in `main.py`, which runs it on a thread (it's
   synchronous CPU-bound ONNX/OpenCV work — awaiting it directly would
   stall this node's asyncio loop, and gossip/raft both depend on that
   loop staying responsive). Models are downloaded on first use into
@@ -144,6 +170,19 @@ list and manual demo commands: [README.md](README.md).
   - `POST /analyze` fires automatically after each photo syncs (see
     `outbox.ts`) — the first time either client has actually exercised
     `ai_engine.py`'s aesthetic pipeline instead of leaving it dark.
+  - `src/routes/capture.tsx` also runs a live **AI compose** overlay
+    before the shutter: a 1.5s loop posts a 224px frame to
+    `/analyze/preview` and draws the subject box, the crop rectangle with
+    its zoom factor, a camera-move instruction, and the recommendation
+    sentence. `grabPreviewFrame()` center-crops the video to the selected
+    ratio before sending — a correctness requirement, not bandwidth
+    thrift, since the returned rects are normalized to whatever frame was
+    sent and get painted straight onto the displayed video box. Every
+    element is gated on the engine actually having found something
+    (`subject_found`, `worth_it`, `confident`), and the whole overlay
+    goes silent — not stale — when no node answers, since capture and the
+    outbox are local and a partition should cost a guest advice, never a
+    photo.
   - `src/routes/console.tsx` — the operator console: real Raft
     term/role and gossip/partition state polled from all 3 nodes, an
     event tape built from *observed state diffs* (term changes, peer
@@ -408,6 +447,54 @@ instead of `client/`'s Dexie/service-worker one).
   guest sitting in the real gallery. Don't run these test scripts
   against a cluster you care about the data in — check `netstat`/`lsof`
   for 8001-8003 first, or only run them when nothing else is up.
+- **Zero-shot CLIP with one hand-written prompt per class has a class
+  prior that can swamp the actual signal.** The film-stock suggester
+  originally used one long prompt per stock. Measured against 18 real
+  reference frames — a night motorcycle, a dappled-sun truck, a sunflower
+  field, and near-black end cards — **one stock won all 18**, because a
+  long prompt full of generic photographic words picks up a constant
+  offset (`gold_200` sat at a mean +0.034 while the rest were near zero)
+  larger than the per-image variation (0.02–0.056). Two fixes together:
+  mean-center the text embeddings to remove the component every prompt
+  shares, and ensemble several *short* prompts per class (CLIP's own
+  zero-shot recipe). After both, the same 18 frames split across 4
+  different stocks. If you add a stock, keep its prompts short and
+  comparable in specificity, and re-measure the winner distribution
+  rather than eyeballing one image. Because the resulting margins are
+  genuinely small, `preview()` also reports `confident`
+  (`CONFIDENT_MARGIN`) so a coin-flip is never rendered in the same voice
+  as a clear win.
+- **Excluding "blown highlights" with `V > 250` throws away every pixel
+  of a fully saturated image.** `describe_scene`'s first version masked
+  out both very dark and very bright pixels before its hue histogram.
+  A vivid orange is `V=255` with plenty of hue, so a bright sunset came
+  back as *"dim, near-colorless light"* with mean S and V both exactly
+  0.0 — the mask had emptied the array. The correct test for "this pixel
+  has no usable hue" is the saturation gate, not brightness; only the
+  dark floor is a legitimate exclusion.
+- **Whole-image statistics over a saliency map collapse to the whole
+  image on any real photograph.** Foliage, gravel and fabric make
+  spectral-residual saliency speckle across the entire frame, so both
+  min/max and a 6th/94th percentile bbox (both tried) returned a subject
+  box covering ~90% of the frame — which silently made the reframe a
+  permanent no-op, since a crop that size is never tighter than what's
+  already framed. Fixed by blurring before the Otsu threshold, an
+  open/close pass, then taking the single strongest *connected
+  component*, ranked on mean saliency × area (area alone lets a big dim
+  smear of background beat a small bright subject). Also bound the result
+  by area: below `MIN_SUBJECT_AREA` it's noise (a flat gray test image
+  produced a 0.5%-of-frame "subject" and a confident 4× zoom into an
+  empty corner), above `MAX_SUBJECT_AREA` it *is* the scene.
+- **`test_ai_engine.py` (and its siblings) `os.remove()` `./node1.db`
+  through `./node3.db` on cleanup — the same files the demo cluster
+  uses.** This is the sharper edge of the port-collision gotcha below: it
+  isn't only that a test run pollutes live data, it's that the run
+  *deletes those databases when it finishes*. And because the test also
+  attaches to whatever DBs already exist, running it against a populated
+  demo cluster fails in a confusing way first (`expected 3
+  aesthetic_score events` counting 109 pre-existing ones) before wiping
+  them. Back the `.db` files up, or only run these with nothing else set
+  up on 8001-8003.
 - **`useSyncExternalStore`'s snapshot function must return a stable
   reference when nothing changed, or it loops forever.**
   `client-2/src/lib/outbox.ts`'s first version re-parsed the

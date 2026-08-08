@@ -283,6 +283,64 @@ async def analyze_photo(body: AnalyzeIn):
     }
 
 
+class AnalyzePreviewIn(BaseModel):
+    image_base64: str
+    # The crop ratio the client is actually shooting (width/height), so the
+    # rectangle it draws matches the frame it will get. Optional -- falls
+    # back to the submitted frame's own aspect.
+    aspect: float | None = None
+
+
+# How many preview analyses may run at once on this node. Each one occupies
+# a thread for ~0.05-1s of ONNX/OpenCV work; several guests pointing their
+# viewfinders at the same node would otherwise saturate the default thread
+# pool, which is shared with every other asyncio.to_thread caller here.
+PREVIEW_CONCURRENCY = int(os.getenv("PREVIEW_CONCURRENCY", "2"))
+MAX_PREVIEW_BYTES = 2 * 1024 * 1024
+_preview_slots = asyncio.Semaphore(PREVIEW_CONCURRENCY)
+
+
+@app.post("/analyze/preview")
+async def analyze_preview(body: AnalyzePreviewIn):
+    """Live-viewfinder guidance: subject box, a rule-of-thirds crop
+    rectangle, a film-stock recommendation and why. Same models as
+    /analyze (ai_engine.preview) and the same to_thread offload.
+
+    The difference that matters is that this writes NOTHING. /analyze
+    appends an aesthetic_score event, which is correct for a photo that
+    exists; a viewfinder calls this every couple of seconds against a
+    frame that was never shot and has no photo_id. Persisting those would
+    flood the append-only log, gossip every one of them to all three
+    nodes, and drag /zones' avg_aesthetic toward frames no guest ever
+    kept. If you add a field here, resist the urge to record it.
+
+    Fails fast with 503 when every preview slot is busy rather than
+    queueing: guidance computed for a frame the guest has already panned
+    away from is worse than no guidance, and a queue would keep serving
+    staler and staler answers under load. The client simply asks again on
+    its next tick."""
+    if len(body.image_base64) > MAX_PREVIEW_BYTES:
+        raise HTTPException(413, "preview frame too large -- downscale before sending")
+    if body.aspect is not None and not (0.2 <= body.aspect <= 5.0):
+        raise HTTPException(400, "aspect must be between 0.2 and 5.0")
+    try:
+        image_bytes = base64.b64decode(body.image_base64, validate=True)
+    except Exception:
+        raise HTTPException(400, "image_base64 is not valid base64")
+
+    if _preview_slots.locked():
+        raise HTTPException(503, "preview busy, try the next frame")
+
+    async with _preview_slots:
+        try:
+            return await asyncio.to_thread(ai_engine.preview, image_bytes, body.aspect)
+        except Exception as e:
+            # A malformed/undecodable frame is a client problem, not a node
+            # fault -- and this endpoint is called on a loop, so a 500 here
+            # would spam the log a few times a second.
+            raise HTTPException(400, f"could not analyze frame: {e}")
+
+
 @app.get("/zones")
 async def zone_scores():
     """The emergent aesthetic map. Each zone's authoritative score comes
