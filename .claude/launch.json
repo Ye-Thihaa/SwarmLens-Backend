@@ -6,6 +6,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "client", "run", "dev", "--", "--host"],
       "port": 5173
+    },
+    {
+      "name": "swarmlens-client-2",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "client-2", "run", "dev", "--", "--host"],
+      "port": 8080
     }
   ]
 }

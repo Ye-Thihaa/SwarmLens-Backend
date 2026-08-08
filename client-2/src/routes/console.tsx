@@ -1,0 +1,611 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { useEffect, useRef, useState } from "react";
+import type { NodeState } from "@/operator/cluster";
+import {
+  CLUSTER,
+  URL_TO_ID,
+  getHealth,
+  getPhotos,
+  getZones,
+  getZonesQuorum,
+  prettyZone,
+  type NodeHealth,
+  type QuorumResult,
+  type ZoneScore,
+} from "@/lib/api";
+import { checkConsoleSession, loginToConsole, logoutOfConsole } from "@/lib/consoleAuth";
+import { serverHealAll, serverIsolateNode } from "@/lib/operatorGateway";
+
+/** APP B — Operator Console. One operator, laptop → room display. No camera.
+ * Real server-side gate (see lib/consoleAuth.ts): the loader checks the
+ * session cookie on every request, including the first SSR render, so an
+ * unauthenticated visitor never receives the console's data. */
+export const Route = createFileRoute("/console")({
+  head: () => ({
+    meta: [
+      { title: "SwarmLens Operator Console" },
+      {
+        name: "description",
+        content:
+          "Live cluster state behind SwarmLens: Raft leader and term, gossip convergence, W/R/N quorum, and a chaos panel for partitioning the mesh.",
+      },
+      { property: "og:title", content: "SwarmLens Operator Console" },
+      {
+        property: "og:description",
+        content: "Raft term, gossip convergence and quorum state for the room, on one screen.",
+      },
+    ],
+  }),
+  loader: async () => {
+    const { authorized } = await checkConsoleSession();
+    return { authorized };
+  },
+  component: Console,
+});
+
+type Log = { t: string; text: string; kind: "ok" | "warn" | "bad" };
+type HealthMap = Record<string, NodeHealth | null>;
+
+function nodeState(h: NodeHealth | null): NodeState {
+  if (!h) return "dead";
+  if (h.raft.role === "leader") return "leader";
+  if (h.raft.role === "candidate") return "candidate";
+  if (h.gossip.partitioned.length > 0) return "partitioned";
+  return "follower";
+}
+
+function secondsSinceLastSync(h: NodeHealth): number | null {
+  const times = Object.values(h.gossip.peers)
+    .map((p) => p.last_ok)
+    .filter((t): t is number => t != null);
+  if (times.length === 0) return null;
+  return Math.max(0, Date.now() / 1000 - Math.max(...times));
+}
+
+function Console() {
+  const { authorized } = Route.useLoaderData();
+  const [unlocked, setUnlocked] = useState(authorized);
+  const [key, setKey] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+
+  const [health, setHealth] = useState<HealthMap>({});
+  const [zones, setZones] = useState<ZoneScore[]>([]);
+  const [frames, setFrames] = useState(0);
+  const [guests, setGuests] = useState(0);
+
+  const [w, setW] = useState(3);
+  const [r, setR] = useState(3);
+  const [quorum, setQuorum] = useState<QuorumResult | null>(null);
+  const [quorumRunning, setQuorumRunning] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const [log, setLog] = useState<Log[]>([]);
+  const [latched, setLatched] = useState(false);
+  const prevRef = useRef<
+    Record<string, { term: number; leader: string | null; partitioned: string[] }>
+  >({});
+
+  function push(text: string, kind: Log["kind"]) {
+    const t = new Date().toLocaleTimeString("en-GB", { hour12: false });
+    setLog((l) => [{ t, text, kind }, ...l].slice(0, 8));
+  }
+
+  // Real state, polled at dashboard.html's cadence (1s). Diffs against
+  // the previous snapshot to produce a real event tape -- term/leader
+  // changes and partition set changes, not scripted lines.
+  useEffect(() => {
+    if (!unlocked) return;
+    let cancelled = false;
+
+    async function poll() {
+      const results = await Promise.all(
+        CLUSTER.map(async (n) => {
+          try {
+            return [n.id, await getHealth(n.url)] as const;
+          } catch {
+            return [n.id, null] as const;
+          }
+        }),
+      );
+      if (cancelled) return;
+      const next: HealthMap = Object.fromEntries(results);
+      diffAndLog(next);
+      setHealth(next);
+
+      const anyNode = CLUSTER.find((n) => next[n.id])?.url;
+      if (anyNode) {
+        try {
+          const [ps, zs] = await Promise.all([getPhotos(anyNode), getZones(anyNode)]);
+          if (!cancelled) {
+            setFrames(ps.length);
+            setGuests(new Set(ps.map((p) => p.guest_id)).size);
+            setZones(zs);
+          }
+        } catch {
+          // stay on the last known-good snapshot
+        }
+      }
+    }
+
+    function diffAndLog(next: HealthMap) {
+      const prev = prevRef.current;
+      for (const n of CLUSTER) {
+        const h = next[n.id];
+        const p = prev[n.id];
+        if (!h) {
+          if (p) push(`${n.id} unreachable`, "bad");
+          delete prev[n.id];
+          continue;
+        }
+        if (
+          p &&
+          h.raft.role === "leader" &&
+          (h.raft.term !== p.term || h.raft.leader_id !== p.leader)
+        ) {
+          push(`term ${h.raft.term} · ${n.id} elected leader`, "ok");
+        }
+        if (p) {
+          for (const url of h.gossip.partitioned) {
+            if (!p.partitioned.includes(url)) push(`${n.id} cut → ${URL_TO_ID[url] ?? url}`, "bad");
+          }
+          for (const url of p.partitioned) {
+            if (!h.gossip.partitioned.includes(url))
+              push(`${n.id} healed → ${URL_TO_ID[url] ?? url}`, "warn");
+          }
+        }
+        prev[n.id] = {
+          term: h.raft.term,
+          leader: h.raft.leader_id,
+          partitioned: h.gossip.partitioned,
+        };
+      }
+    }
+
+    void poll();
+    const id = setInterval(poll, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [unlocked]);
+
+  const healthy = CLUSTER.map((n) => health[n.id]).filter((h): h is NodeHealth => !!h);
+  const leaderIds = new Set(healthy.map((h) => h.raft.leader_id).filter((x): x is string => !!x));
+  const anyPartitioned = healthy.some((h) => h.gossip.partitioned.length > 0);
+  const anyCandidate = healthy.some((h) => h.raft.role === "candidate");
+  const converged =
+    healthy.length === CLUSTER.length && leaderIds.size === 1 && !anyPartitioned && !anyCandidate;
+  const term = healthy.length > 0 ? Math.max(...healthy.map((h) => h.raft.term)) : 0;
+  const leaderNode = CLUSTER.find((n) => health[n.id]?.raft.role === "leader");
+  const topZone = zones[0];
+
+  // agreement latch: re-arms whenever the cluster comes back into agreement
+  useEffect(() => {
+    if (converged) {
+      setLatched(false);
+      const id = setTimeout(() => setLatched(true), 40);
+      return () => clearTimeout(id);
+    }
+    setLatched(false);
+    return;
+  }, [converged, term]);
+
+  async function isolateLeader() {
+    if (!leaderNode) return;
+    setBusy("isolate-leader");
+    push(`isolating ${leaderNode.id} from gossip…`, "warn");
+    await serverIsolateNode({ data: { nodeId: leaderNode.id } });
+    push(
+      `${leaderNode.id} cut from every peer · raft heartbeats bypass this, no re-election`,
+      "bad",
+    );
+    setBusy(null);
+  }
+
+  async function isolateOne(nodeId: string) {
+    setBusy(`isolate-${nodeId}`);
+    await serverIsolateNode({ data: { nodeId } });
+    push(`${nodeId} cut from every peer`, "bad");
+    setBusy(null);
+  }
+
+  async function healAll() {
+    setBusy("heal");
+    await serverHealAll();
+    push("heal requested on every node · partitions clearing", "warn");
+    setBusy(null);
+  }
+
+  async function runQuorumRead() {
+    setQuorumRunning(true);
+    try {
+      const result = await getZonesQuorum(CLUSTER[0]!.url, r, w);
+      setQuorum(result);
+      const unreachableNote =
+        result.unreachable.length > 0
+          ? ` · missed ${result.unreachable.map((u) => URL_TO_ID[u] ?? u).join(", ")}`
+          : "";
+      push(
+        `quorum read R=${result.R} W=${result.W} · queried ${result.queried.length}/${result.N}${unreachableNote}`,
+        result.strongly_consistent ? "ok" : "warn",
+      );
+    } catch (e) {
+      push(`quorum read failed: ${String(e)}`, "bad");
+    }
+    setQuorumRunning(false);
+  }
+
+  async function reset() {
+    setBusy("reset");
+    await serverHealAll();
+    setW(3);
+    setR(3);
+    setQuorum(null);
+    push("cluster reset · every partition healed", "ok");
+    setBusy(null);
+  }
+
+  if (!unlocked) {
+    return (
+      <main className="grain flex min-h-screen items-center justify-center px-6">
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setAuthError(null);
+            setChecking(true);
+            try {
+              await loginToConsole({ data: { password: key } });
+              setUnlocked(true);
+            } catch {
+              setAuthError("Incorrect password.");
+            }
+            setChecking(false);
+          }}
+          className="w-full max-w-sm rounded-sm border border-border bg-card p-6"
+        >
+          <p className="label-mono">SwarmLens · operator</p>
+          <h1 className="mt-2 text-2xl font-extrabold">Operator key</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            This console is not the guest app. It can partition nodes from the cluster.
+          </p>
+          <input
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+            type="password"
+            placeholder="operator key"
+            autoFocus
+            className="mt-5 w-full rounded-sm border border-input bg-emulsion px-3 py-2.5 font-mono text-sm"
+          />
+          {authError && <p className="mt-2 text-sm text-safelight">{authError}</p>}
+          <button
+            disabled={checking}
+            className="mt-4 w-full rounded-sm bg-fixer py-2.5 text-sm font-semibold text-emulsion disabled:opacity-50"
+          >
+            {checking ? "Checking…" : "Open console"}
+          </button>
+        </form>
+      </main>
+    );
+  }
+
+  return (
+    <main className="grain min-h-screen px-6 py-6 xl:px-10">
+      <header className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 border-b border-border pb-4 lg:flex lg:justify-between">
+        <div className="min-w-0">
+          <p className="label-mono">SwarmLens · 3-node local cluster</p>
+          <h1 className="truncate text-2xl font-extrabold xl:text-3xl">Operator Console</h1>
+        </div>
+        <div className="flex shrink-0 items-center gap-6 font-mono text-xs">
+          <button
+            onClick={async () => {
+              await logoutOfConsole();
+              setUnlocked(false);
+              setKey("");
+            }}
+            className="text-fixer-dim underline decoration-dotted underline-offset-2"
+          >
+            log out
+          </button>
+          <span className="text-fixer-dim">
+            TERM <span className="text-fixer">{term}</span>
+          </span>
+          <span className="text-fixer-dim">
+            W <span className="text-fixer">{w}</span> / R <span className="text-fixer">{r}</span> /
+            N <span className="text-fixer">{CLUSTER.length}</span>
+          </span>
+        </div>
+      </header>
+
+      {/* SIGNATURE: the agreement latch — one wide perf rail across the top.
+          Amber and open while replicas disagree; snaps green and stamped when
+          the cluster agrees. Readable from across the room in under a second. */}
+      <section
+        className={`mt-5 rounded-sm border-2 p-5 ${
+          converged ? "border-converged bg-converged/10" : "border-safelight bg-safelight/10"
+        } ${converged && latched ? "latch" : ""}`}
+      >
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-6">
+          <div className="min-w-0">
+            <p className="label-mono">Agreement latch</p>
+            <p
+              className={`mt-1 font-display text-3xl font-extrabold xl:text-5xl ${
+                converged ? "text-converged" : "text-safelight"
+              }`}
+            >
+              {converged
+                ? `AGREED · TERM ${term}`
+                : anyPartitioned
+                  ? "SPLIT · GOSSIP CUT SOMEWHERE"
+                  : anyCandidate
+                    ? "ELECTING · NO LEADER"
+                    : "DISAGREEING"}
+            </p>
+          </div>
+          <div className="perf-rail shrink-0">
+            {CLUSTER.map((n) => {
+              const state = nodeState(health[n.id] ?? null);
+              return (
+                <span
+                  key={n.id}
+                  title={n.id}
+                  className={`perf h-10 w-6 ${
+                    state === "dead" || state === "partitioned"
+                      ? "perf-lost"
+                      : converged
+                        ? "perf-held"
+                        : "perf-inflight"
+                  }`}
+                />
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
+      <div className="mt-5 grid gap-5 lg:grid-cols-[2fr_1fr]">
+        <div className="space-y-5">
+          {/* room state, reframed as system state */}
+          <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+            {[
+              ["Guests shooting", String(guests), "text-fixer"],
+              ["Frames landed", frames.toLocaleString(), "text-fixer"],
+              ["Leading spot", topZone ? prettyZone(topZone.zone) : "—", "text-drifting"],
+              [
+                "Last quorum read",
+                quorum
+                  ? quorum.strongly_consistent
+                    ? "consistent"
+                    : "may be stale"
+                  : "not run yet",
+                quorum
+                  ? quorum.strongly_consistent
+                    ? "text-converged"
+                    : "text-safelight"
+                  : "text-stale",
+              ],
+            ].map(([label, value, cls]) => (
+              <div key={label} className="rounded-sm border border-border bg-card p-4">
+                <p className="label-mono">{label}</p>
+                <p
+                  className={`mt-1.5 font-display text-xl leading-tight font-bold xl:text-2xl ${cls}`}
+                >
+                  {value}
+                </p>
+              </div>
+            ))}
+          </section>
+
+          {/* the mesh, drawn as a contact sheet of nodes */}
+          <section className="rounded-sm border border-border bg-card p-4">
+            <div className="flex items-baseline justify-between">
+              <h2 className="text-lg font-bold">Mesh</h2>
+              <p className="label-mono">gossip ~every 1s</p>
+            </div>
+            <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-3">
+              {CLUSTER.map((n) => {
+                const h = health[n.id] ?? null;
+                const state = nodeState(h);
+                const bad = state === "dead" || state === "partitioned";
+                const sinceSync = h ? secondsSinceLastSync(h) : null;
+                return (
+                  <div
+                    key={n.id}
+                    className={`film-edge rounded-sm border px-3 py-5 text-center ${
+                      state === "leader"
+                        ? "border-converged bg-converged/10"
+                        : bad
+                          ? "border-safelight bg-safelight/10"
+                          : state === "candidate"
+                            ? "border-drifting bg-drifting/10 settling"
+                            : "border-border"
+                    }`}
+                  >
+                    <p className="font-mono text-sm font-bold">{n.id}</p>
+                    <p
+                      className={`mt-1 font-mono text-[0.6rem] tracking-widest ${
+                        state === "leader"
+                          ? "text-converged"
+                          : bad
+                            ? "text-safelight"
+                            : state === "candidate"
+                              ? "text-drifting"
+                              : "text-fixer-dim"
+                      }`}
+                    >
+                      {state.toUpperCase()}
+                    </p>
+                    <p className="mt-2 font-mono text-[0.6rem] text-stale">
+                      {!h ? "—" : `${h.events} events`}
+                    </p>
+                    <p className="mt-0.5 font-mono text-[0.55rem] text-stale">
+                      {sinceSync != null ? `synced ${sinceSync.toFixed(1)}s ago` : ""}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className="rounded-sm border border-border bg-card p-4">
+            <h2 className="text-lg font-bold">Merged aesthetic scores</h2>
+            {zones.length === 0 ? (
+              <p className="mt-3 font-mono text-[0.6rem] tracking-widest text-stale">
+                NO FRAMES YET
+              </p>
+            ) : (
+              <ul className="mt-3 space-y-2">
+                {zones.map((z) => (
+                  <li key={z.zone} className="grid grid-cols-[12rem_1fr_5rem] items-center gap-3">
+                    <span className="truncate text-sm capitalize">{prettyZone(z.zone)}</span>
+                    <span className="h-2 bg-muted">
+                      <span
+                        className="block h-full"
+                        style={{
+                          width: `${Math.min(100, (z.likes * 2 + z.photos) * 8)}%`,
+                          background: z.stale ? "var(--safelight)" : "var(--converged)",
+                        }}
+                      />
+                    </span>
+                    <span className="text-right font-mono text-xs text-fixer-dim">
+                      {z.avg_aesthetic != null ? z.avg_aesthetic.toFixed(2) : "—"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          {quorum && (
+            <section className="rounded-sm border border-border bg-card p-4">
+              <h2 className="text-lg font-bold">Last quorum read</h2>
+              <p className="mt-1 font-mono text-[0.65rem] tracking-widest text-fixer-dim">
+                N={quorum.N} R={quorum.R} W={quorum.W} ·{" "}
+                {quorum.strongly_consistent ? "R+W>N, always fresh" : "R+W≤N, can land stale"}
+              </p>
+              <p className="mt-2 font-mono text-[0.6rem] tracking-widest text-fixer-dim">
+                queried: {quorum.queried.map((u) => URL_TO_ID[u] ?? u).join(", ") || "—"}
+              </p>
+              <p className="mt-1 font-mono text-[0.6rem] tracking-widest text-safelight">
+                unreachable: {quorum.unreachable.map((u) => URL_TO_ID[u] ?? u).join(", ") || "none"}
+              </p>
+            </section>
+          )}
+        </div>
+
+        {/* chaos panel */}
+        <aside className="space-y-5">
+          <section className="rounded-sm border-2 border-safelight/60 bg-card p-4">
+            <p className="label-mono">Chaos</p>
+            <h2 className="mt-1 text-lg font-bold text-safelight">Break it on purpose</h2>
+            <div className="mt-4 space-y-2">
+              <button
+                onClick={isolateLeader}
+                disabled={!leaderNode || busy === "isolate-leader"}
+                className="w-full rounded-sm border border-safelight px-3 py-3 text-left text-sm font-semibold text-safelight disabled:opacity-40"
+              >
+                Isolate the leader
+                <span className="block font-mono text-[0.6rem] tracking-widest text-fixer-dim">
+                  CUTS GOSSIP BOTH WAYS · RAFT HEARTBEATS UNAFFECTED, NO RE-ELECTION
+                </span>
+              </button>
+
+              <div className="flex gap-2">
+                {CLUSTER.map((n) => (
+                  <button
+                    key={n.id}
+                    onClick={() => isolateOne(n.id)}
+                    disabled={busy === `isolate-${n.id}`}
+                    className="flex-1 rounded-sm border border-drifting px-2 py-2 font-mono text-[0.6rem] tracking-widest text-drifting disabled:opacity-40"
+                  >
+                    CUT {n.id}
+                  </button>
+                ))}
+              </div>
+
+              <button
+                onClick={healAll}
+                disabled={busy === "heal"}
+                className="w-full rounded-sm border border-converged px-3 py-3 text-left text-sm font-semibold text-converged disabled:opacity-40"
+              >
+                Heal all
+                <span className="block font-mono text-[0.6rem] tracking-widest text-fixer-dim">
+                  CLEAR EVERY PARTITION ON EVERY NODE
+                </span>
+              </button>
+
+              <div className="flex gap-2 pt-2">
+                {[1, 2, 3].map((v) => (
+                  <button
+                    key={v}
+                    onClick={() => setW(v)}
+                    className={`flex-1 rounded-sm border py-2 font-mono text-xs ${
+                      w === v ? "border-drifting text-drifting" : "border-border text-fixer-dim"
+                    }`}
+                  >
+                    W={v}
+                  </button>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                {[1, 2, 3].map((v) => (
+                  <button
+                    key={v}
+                    onClick={() => setR(v)}
+                    className={`flex-1 rounded-sm border py-2 font-mono text-xs ${
+                      r === v ? "border-drifting text-drifting" : "border-border text-fixer-dim"
+                    }`}
+                  >
+                    R={v}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={runQuorumRead}
+                disabled={quorumRunning}
+                className="w-full rounded-sm border border-border px-3 py-3 text-left text-sm font-semibold disabled:opacity-40"
+              >
+                {quorumRunning ? "Reading…" : "Run a quorum read"}
+                <span className="block font-mono text-[0.6rem] tracking-widest text-fixer-dim">
+                  GET /zones/quorum?R={r}&W={w} · SAMPLE IS RANDOM EACH CALL
+                </span>
+              </button>
+              <button
+                onClick={reset}
+                disabled={busy === "reset"}
+                className="w-full rounded-sm bg-fixer py-2.5 text-sm font-semibold text-emulsion disabled:opacity-40"
+              >
+                Reset cluster
+              </button>
+            </div>
+          </section>
+
+          <section className="rounded-sm border border-border bg-card p-4">
+            <p className="label-mono">Event tape</p>
+            <ul className="mt-3 space-y-1.5">
+              {log.length === 0 && (
+                <li className="font-mono text-[0.62rem] text-stale">watching the cluster…</li>
+              )}
+              {log.map((l, i) => (
+                <li key={`${l.t}-${i}`} className="font-mono text-[0.68rem] leading-relaxed">
+                  <span className="text-stale">{l.t}</span>{" "}
+                  <span
+                    className={
+                      l.kind === "ok"
+                        ? "text-converged"
+                        : l.kind === "warn"
+                          ? "text-drifting"
+                          : "text-safelight"
+                    }
+                  >
+                    {l.text}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        </aside>
+      </div>
+    </main>
+  );
+}
