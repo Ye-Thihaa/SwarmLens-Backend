@@ -17,7 +17,7 @@ from gossip import Gossip
 from worker import Worker
 from raft import Raft
 from hashing import ring_for, owner_of
-from cloud_sync import CloudSync
+from cloud_sync import CloudSync, TRUST_ENV as CLOUD_SYNC_TRUST_ENV
 
 QUORUM_EVENT_KINDS = ("photo", "like", "aesthetic_score")
 
@@ -265,7 +265,10 @@ async def zone_scores():
     ring = ring_for(cluster_members())
 
     out = []
-    async with httpx.AsyncClient(timeout=1.0) as client:
+    # trust_env=False: `owner` is always a peer from PEERS/SELF_ID, i.e.
+    # always 127.0.0.1 -- see the same note in gossip.py for why a system
+    # proxy would otherwise break this.
+    async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
         for zone, mine in local.items():
             owner = owner_of(zone, ring)
             if owner == SELF_ID:
@@ -341,7 +344,9 @@ async def zones_quorum(R: int = 2, W: int = 2):
 
     merged: dict[tuple[str, int], dict] = {}
     queried, unreachable = [], []
-    async with httpx.AsyncClient(timeout=1.0) as client:
+    # trust_env=False: `member` is always PEERS/SELF_ID, always
+    # 127.0.0.1 -- see the same note in gossip.py.
+    async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
         for member in chosen:
             if member == SELF_ID:
                 events = await store.raw_events(QUORUM_EVENT_KINDS)
@@ -445,7 +450,7 @@ async def cloud_sync_trigger():
     (cloud_sync.enabled is False), or if the cloud is unreachable (check
     last_error, not an exception -- a network blip here should never 500
     the request)."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, trust_env=CLOUD_SYNC_TRUST_ENV) as client:
         n = await cloud_sync.sync_once(client)
     return {"synced": n, **cloud_sync.status()}
 

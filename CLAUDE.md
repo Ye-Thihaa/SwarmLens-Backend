@@ -275,6 +275,29 @@ alongside this one.
   and in parallel, catching the claim via the claimant's own zero-lag
   self-report. If you write another measurement that needs to catch a
   node in a specific state fast, poll every node, not one.
+- **`pydantic==2.10.4` (the old pin) has no Python 3.14 Windows wheel,
+  and every internal `httpx` client defaults to trusting a system
+  proxy.** Two separate environment gotchas that both surfaced only once
+  someone actually tried running this on a real Windows machine (not
+  this dev sandbox): (1) `pydantic-core` only ships a `cp314-win_amd64`
+  wheel from 2.40.0 onward -- older pins force pip to compile from
+  source via Rust + the MSVC linker, which fails without Visual Studio
+  Build Tools installed. Fixed in `requirements.txt` with an explicit
+  `pydantic-core>=2.40` floor (pydantic's own version number doesn't
+  track pydantic-core's, so constraining only `pydantic` isn't enough).
+  (2) `httpx`'s default `trust_env=True` means any client honors
+  `HTTP_PROXY`/system proxy settings -- on a machine with one configured
+  that doesn't exempt loopback traffic, every 127.0.0.1-only call in
+  this codebase (gossip, raft, the `/zones` proxy calls, every test
+  script, `load_test.py`) intermittently 502s / connection-resets /
+  returns empty bodies. Every client that *only* ever talks to
+  127.0.0.1 now hardcodes `trust_env=False`. The two exceptions that
+  must NOT get this: `ai_engine.py`'s model downloader and the `/analyze`
+  endpoint's photo-`url` fetch (both may need to reach the real
+  internet), and `cloud_sync.py`'s client (must honor a real proxy to
+  reach a real Supabase in production) -- its trust setting is
+  controlled by `CLOUD_SYNC_TRUST_ENV` instead, which `test_cloud_sync.py`
+  flips to `false` only because its "cloud" is a local fake server.
 
 ## Conventions
 

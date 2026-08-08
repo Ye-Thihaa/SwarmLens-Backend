@@ -30,7 +30,12 @@ class Gossip:
         self.running = False
 
     async def _loop(self):
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        # trust_env=False: every peer is 127.0.0.1 -- httpx defaults to
+        # honoring HTTP_PROXY/system proxy settings, which on a machine
+        # with one configured routes loopback traffic through it too,
+        # producing 502s / connection resets for purely local traffic
+        # that was never meant to leave the machine.
+        async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
             while self.running:
                 await asyncio.sleep(self.interval)
                 if not self.peers:

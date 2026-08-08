@@ -75,6 +75,11 @@ def start_all(supabase_url, fake_port):
         env["SUPABASE_KEY"] = FAKE_KEY
         env["SUPABASE_EVENTS_TABLE"] = "events"
         env["CLOUD_SYNC_INTERVAL"] = "3600"  # only explicit /trigger calls matter in this test
+        # The fake cloud below is local (127.0.0.1) even though
+        # cloud_sync.py defaults to trusting a system proxy (correct for
+        # a real, external Supabase) -- override it for this test only,
+        # same reasoning as every other trust_env=False in this file.
+        env["CLOUD_SYNC_TRUST_ENV"] = "false"
         p = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "main:app", "--port", str(port)],
             env=env,
@@ -86,8 +91,11 @@ def start_all(supabase_url, fake_port):
 
 
 def find_leader():
+    # trust_env=False throughout this file: node calls are always
+    # 127.0.0.1 -- a system HTTP proxy would otherwise intercept loopback
+    # traffic. (The fake cloud server also binds 127.0.0.1, same reason.)
     for nid, (p, port) in procs.items():
-        r = httpx.get(f"http://127.0.0.1:{port}/raft/status", timeout=2.0).json()
+        r = httpx.get(f"http://127.0.0.1:{port}/raft/status", timeout=2.0, trust_env=False).json()
         if r["role"] == "leader":
             return nid, port
     return None, None
@@ -96,12 +104,12 @@ def find_leader():
 def post_photo(port, zone):
     r = httpx.post(f"http://127.0.0.1:{port}/photos", json={
         "guest_id": "g1", "zone": zone, "composition_score": 90,
-    }, timeout=2.0)
+    }, timeout=2.0, trust_env=False)
     r.raise_for_status()
 
 
 def trigger(port):
-    r = httpx.post(f"http://127.0.0.1:{port}/cloud_sync/trigger", timeout=5.0)
+    r = httpx.post(f"http://127.0.0.1:{port}/cloud_sync/trigger", timeout=5.0, trust_env=False)
     r.raise_for_status()
     return r.json()
 
@@ -133,7 +141,7 @@ def main():
         if result["synced"] != 0 or not result["last_error"]:
             print(f"FAIL: expected a soft failure (synced=0, last_error set), got {result}")
             return 1
-        h = httpx.get(f"http://127.0.0.1:{leader_port}/health", timeout=2.0).json()
+        h = httpx.get(f"http://127.0.0.1:{leader_port}/health", timeout=2.0, trust_env=False).json()
         if h["events"] < 2:
             print("FAIL: core functionality should be unaffected while cloud is unreachable")
             return 1
@@ -150,7 +158,7 @@ def main():
         if result["synced"] < 2 or result["last_error"]:
             print(f"FAIL: expected the backlog to sync cleanly, got {result}")
             return 1
-        node_event_count = httpx.get(f"http://127.0.0.1:{leader_port}/health", timeout=2.0).json()["events"]
+        node_event_count = httpx.get(f"http://127.0.0.1:{leader_port}/health", timeout=2.0, trust_env=False).json()["events"]
         with fake_cloud_lock:
             cloud_count = len(fake_cloud_rows)
         if cloud_count != node_event_count:

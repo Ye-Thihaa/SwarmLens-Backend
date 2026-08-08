@@ -82,9 +82,11 @@ def flat_gray_image() -> Image.Image:
 
 
 def post_photo(port, zone):
+    # trust_env=False throughout this file: every call targets 127.0.0.1
+    # -- a system HTTP proxy would otherwise intercept loopback traffic.
     r = httpx.post(f"http://127.0.0.1:{port}/photos", json={
         "guest_id": "g1", "zone": zone, "composition_score": 90,
-    }, timeout=2.0)
+    }, timeout=2.0, trust_env=False)
     r.raise_for_status()
     return r.json()["photo_id"]
 
@@ -93,7 +95,7 @@ def analyze(port, photo_id, img):
     r = httpx.post(f"http://127.0.0.1:{port}/analyze", json={
         "photo_id": photo_id,
         "image_base64": base64.b64encode(png_bytes(img)).decode(),
-    }, timeout=90.0)  # first call loads ~154MB of models from disk
+    }, timeout=90.0, trust_env=False)  # first call loads ~154MB of models from disk
     r.raise_for_status()
     return r.json()
 
@@ -146,7 +148,7 @@ def main():
         print("PASS: suggested_filter differentiates between images")
 
         # --- aesthetic_score event: local count + gossip replication ---
-        h1 = httpx.get("http://127.0.0.1:8001/health", timeout=2.0).json()
+        h1 = httpx.get("http://127.0.0.1:8001/health", timeout=2.0, trust_env=False).json()
         print("node1 event count after 3 analyses:", h1["events"])
         if event_count("./node1.db", "aesthetic_score") != 3:
             print("FAIL: expected 3 aesthetic_score events on node1's own db")

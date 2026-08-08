@@ -46,15 +46,20 @@ def start_all():
 
 
 def post_photo(port, zone, guest="g1"):
+    # trust_env=False throughout this file: every call targets 127.0.0.1
+    # -- a system HTTP proxy would otherwise intercept loopback traffic
+    # and produce 502s / connection resets for what should always be
+    # purely local calls.
     r = httpx.post(f"http://127.0.0.1:{port}/photos", json={
         "guest_id": guest, "zone": zone, "composition_score": 90,
-    }, timeout=2.0)
+    }, timeout=2.0, trust_env=False)
     r.raise_for_status()
     return r.json()["photo_id"]
 
 
 def quorum(port, R, W=2):
-    r = httpx.get(f"http://127.0.0.1:{port}/zones/quorum", params={"R": R, "W": W}, timeout=2.0)
+    r = httpx.get(f"http://127.0.0.1:{port}/zones/quorum", params={"R": R, "W": W},
+                  timeout=2.0, trust_env=False)
     r.raise_for_status()
     return r.json()
 
@@ -82,10 +87,10 @@ def main():
         # Fully isolate node3, both directions, from both other nodes --
         # a one-sided partition just delays convergence, it doesn't hold.
         print("partitioning node3 (bidirectional, from all sides)...")
-        httpx.post("http://127.0.0.1:8001/chaos/partition/1", timeout=2.0)  # node1 -> node3
-        httpx.post("http://127.0.0.1:8002/chaos/partition/1", timeout=2.0)  # node2 -> node3
-        httpx.post("http://127.0.0.1:8003/chaos/partition/0", timeout=2.0)  # node3 -> node1
-        httpx.post("http://127.0.0.1:8003/chaos/partition/1", timeout=2.0)  # node3 -> node2
+        httpx.post("http://127.0.0.1:8001/chaos/partition/1", timeout=2.0, trust_env=False)  # node1 -> node3
+        httpx.post("http://127.0.0.1:8002/chaos/partition/1", timeout=2.0, trust_env=False)  # node2 -> node3
+        httpx.post("http://127.0.0.1:8003/chaos/partition/0", timeout=2.0, trust_env=False)  # node3 -> node1
+        httpx.post("http://127.0.0.1:8003/chaos/partition/1", timeout=2.0, trust_env=False)  # node3 -> node2
 
         # New write after the partition: reaches node1 and (via gossip)
         # node2, never reaches the isolated node3.
@@ -117,9 +122,9 @@ def main():
         print("PASS: R=2 always fresh (20/20)")
 
         print("healing partition...")
-        httpx.post("http://127.0.0.1:8001/chaos/heal", timeout=2.0)
-        httpx.post("http://127.0.0.1:8002/chaos/heal", timeout=2.0)
-        httpx.post("http://127.0.0.1:8003/chaos/heal", timeout=2.0)
+        httpx.post("http://127.0.0.1:8001/chaos/heal", timeout=2.0, trust_env=False)
+        httpx.post("http://127.0.0.1:8002/chaos/heal", timeout=2.0, trust_env=False)
+        httpx.post("http://127.0.0.1:8003/chaos/heal", timeout=2.0, trust_env=False)
         time.sleep(3.0)  # a few gossip rounds to let node3 catch up
 
         post_heal = [has_zone(quorum(8001, R=1), "new_zone") for _ in range(10)]

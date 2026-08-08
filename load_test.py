@@ -83,7 +83,10 @@ def stop_cluster(procs, configs, db_suffix="_load"):
 
 async def wait_for_boot(configs, timeout=10):
     deadline = time.time() + timeout
-    async with httpx.AsyncClient() as client:
+    # trust_env=False throughout this file: load_test.py only ever talks
+    # to clusters it spins up itself on 127.0.0.1 -- a system HTTP proxy
+    # would otherwise intercept that loopback traffic.
+    async with httpx.AsyncClient(trust_env=False) as client:
         while time.time() < deadline:
             try:
                 await asyncio.gather(*(
@@ -109,7 +112,7 @@ def percentiles(data, ps=(50, 95, 99)):
 
 async def measure_latency(configs, n_photos, n_likes):
     ports = [c["port"] for c in configs]
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
         async def upload_one(i):
             port = random.choice(ports)
             t0 = time.perf_counter()
@@ -141,7 +144,7 @@ async def measure_latency(configs, n_photos, n_likes):
 async def measure_convergence(configs, sample_interval=0.1, timeout=20):
     samples = []
     t0 = time.perf_counter()
-    async with httpx.AsyncClient(timeout=2.0) as client:
+    async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
         while time.perf_counter() - t0 < timeout:
             try:
                 resps = await asyncio.gather(*(
@@ -169,7 +172,7 @@ async def measure_convergence(configs, sample_interval=0.1, timeout=20):
 async def measure_recovery(configs, procs):
     """Post a photo, wait for a node's worker to claim its job, kill that
     node, measure time until a surviving node reclaims + completes it."""
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
         r = await client.post(f"http://127.0.0.1:{configs[0]['port']}/photos", json={
             "guest_id": "loadtest", "zone": "recovery_test", "composition_score": 80,
         })
@@ -227,7 +230,7 @@ async def measure_election_latency(trials, gossip_interval="1.0"):
         try:
             if not await wait_for_boot(configs):
                 continue
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
                 leader_id = None
                 deadline = time.time() + 10
                 while time.time() < deadline and not leader_id:
@@ -280,7 +283,7 @@ async def measure_throughput(n, n_uploads):
         if not await wait_for_boot(configs):
             return None
         ports = [c["port"] for c in configs]
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
             async def upload(i):
                 port = ports[i % len(ports)]
                 r = await client.post(f"http://127.0.0.1:{port}/photos", json={
@@ -297,7 +300,7 @@ async def measure_throughput(n, n_uploads):
 
 
 async def measure_gossip_bandwidth(configs):
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
         r_cold = await client.post(f"http://127.0.0.1:{configs[0]['port']}/gossip/sync", json={"digest": {}})
         cold_bytes = len(r_cold.content)
 

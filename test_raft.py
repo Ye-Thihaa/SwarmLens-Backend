@@ -35,7 +35,11 @@ def start_all():
 
 def get_status(port):
     try:
-        r = httpx.get(f"http://127.0.0.1:{port}/raft/status", timeout=1.0)
+        # trust_env=False: this is always 127.0.0.1 -- a system HTTP
+        # proxy would otherwise intercept loopback traffic and produce
+        # 502s / resets that this try/except silently swallows as "node
+        # unreachable", which is a very confusing false signal.
+        r = httpx.get(f"http://127.0.0.1:{port}/raft/status", timeout=1.0, trust_env=False)
         return r.json()
     except Exception:
         return None
@@ -81,7 +85,7 @@ def main():
         print("triggering recap on all nodes...")
         trig_results = {}
         for nid, (p, port) in procs.items():
-            r = httpx.post(f"http://127.0.0.1:{port}/recap/trigger", timeout=2.0)
+            r = httpx.post(f"http://127.0.0.1:{port}/recap/trigger", timeout=2.0, trust_env=False)
             trig_results[nid] = r.json()
         print("trigger results:", trig_results)
 
@@ -116,7 +120,7 @@ def main():
         # Broadcast trigger again post-election (idempotency check: must
         # NOT create a second recap_sent event even from the new leader).
         for nid, (p, port) in procs.items():
-            httpx.post(f"http://127.0.0.1:{port}/recap/trigger", timeout=2.0)
+            httpx.post(f"http://127.0.0.1:{port}/recap/trigger", timeout=2.0, trust_env=False)
 
         time.sleep(2.0)  # let gossip converge across survivors
         final_counts = {nid: recap_count_in_db(f"./{nid}.db") for nid, _ in procs.items()}

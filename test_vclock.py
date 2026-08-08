@@ -49,16 +49,19 @@ def start_all():
 
 
 def post_photo(port, zone, vclock=None):
+    # trust_env=False throughout this file: every call targets 127.0.0.1
+    # -- a system HTTP proxy would otherwise intercept loopback traffic.
     r = httpx.post(f"http://127.0.0.1:{port}/photos", json={
         "guest_id": "g1", "zone": zone, "composition_score": 90,
         "vclock": vclock or {},
-    }, timeout=2.0)
+    }, timeout=2.0, trust_env=False)
     r.raise_for_status()
     return r.json()["photo_id"]
 
 
 def photos(port):
-    return {p["photo_id"]: p for p in httpx.get(f"http://127.0.0.1:{port}/photos", timeout=2.0).json()["photos"]}
+    r = httpx.get(f"http://127.0.0.1:{port}/photos", timeout=2.0, trust_env=False)
+    return {p["photo_id"]: p for p in r.json()["photos"]}
 
 
 def main():

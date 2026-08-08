@@ -59,7 +59,11 @@ class Raft:
         self.leader_id = None
 
     async def _loop(self):
-        async with httpx.AsyncClient(timeout=RPC_TIMEOUT) as client:
+        # trust_env=False: see the same note in gossip.py -- peers are
+        # always 127.0.0.1, and a system proxy would silently break every
+        # RPC here, not just add latency this timeout is already tight
+        # against.
+        async with httpx.AsyncClient(timeout=RPC_TIMEOUT, trust_env=False) as client:
             while self.running:
                 if self.role == "leader":
                     await self._send_heartbeats(client)

@@ -41,6 +41,15 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_EVENTS_TABLE", "events")
 SYNC_INTERVAL = float(os.getenv("CLOUD_SYNC_INTERVAL", "15.0"))
 SYNC_META_KEY = "cloud_synced_digest"
+# Real Supabase is external, so this client must honor a system/corporate
+# proxy by default (trust_env=True) -- unlike every other httpx client in
+# this codebase, which only ever talks to 127.0.0.1 and hardcodes
+# trust_env=False. test_cloud_sync.py points SUPABASE_URL at a *local*
+# fake-cloud server though, so on a machine whose proxy doesn't exempt
+# loopback traffic, that would break the test in the same way it broke
+# everything else -- hence this override, defaulted to the correct
+# production behavior and only ever flipped by the test harness.
+TRUST_ENV = os.getenv("CLOUD_SYNC_TRUST_ENV", "true").lower() != "false"
 
 
 class CloudSync:
@@ -71,7 +80,7 @@ class CloudSync:
         self.running = False
 
     async def _loop(self):
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=TRUST_ENV) as client:
             while self.running:
                 await asyncio.sleep(self.interval)
                 await self.sync_once(client)
