@@ -8,7 +8,23 @@ list and manual demo commands: [README.md](README.md).
 ## Files
 
 - `main.py` — FastAPI app + all HTTP endpoints. Same file runs as every
-  node; behavior is set entirely by env vars (`NODE_ID`, `DB_PATH`, `PEERS`).
+  node; behavior is set entirely by env vars (`NODE_ID`, `DB_PATH`, `PEERS`,
+  and now optionally `OPERATOR_TOKEN` — see below). `POST /photos` accepts
+  an optional `image_base64`; gossip replicates it as part of the ordinary
+  `photo` event payload (no second storage path), and `GET
+  /photos/{photo_id}/image` serves the decoded bytes back out — kept as a
+  separate endpoint so `GET /photos` (polled every few seconds by both
+  guest clients) doesn't ship every photo's full image on every call;
+  `store.photos()` strips `image_base64` back out of the list response for
+  the same reason, and adds `taken_at` (already on the event as
+  `created_at`, just not exposed until a client needed it for display).
+  `/chaos/partition/{i}` and `/chaos/heal` are gated by
+  `require_operator_token` (checks `X-Operator-Token` against
+  `OPERATOR_TOKEN` with `secrets.compare_digest`) — fails open when
+  `OPERATOR_TOKEN` is unset, so `test_quorum.py`, `load_test.py`, and
+  `dashboard.html`, none of which set it, keep working unauthenticated.
+  `client-2`'s operator console is the one real caller that sets it (see
+  that entry below).
 - `store.py` — SQLite-backed append-only event log. All state (photos,
   likes, job leases, recap) is derived by replaying `events`, never
   written directly. `(origin, seq)` primary key makes merges idempotent.
@@ -23,7 +39,9 @@ list and manual demo commands: [README.md](README.md).
   this — see its entry below for why that's still correct). `append_local`
   holds `self._write_lock` (an `asyncio.Lock`) around assigning the next
   seq + inserting — see the Gotchas section for the real concurrency bug
-  this fixes.
+  this fixes. `photo_image_b64(photo_id)` is the read side of the
+  image-sharing feature above — pulls straight from the same event row,
+  no second table.
 - `gossip.py` — anti-entropy loop: every `GOSSIP_INTERVAL` (default 1s),
   pick one random peer, exchange version-vector digests, pull/push
   whatever's missing.
@@ -101,10 +119,54 @@ list and manual demo commands: [README.md](README.md).
   which the default `generateSW` strategy doesn't support). A functional
   reference implementation proving the offline+causal-ordering mechanism,
   not the polished branded guest UI described elsewhere in the project's
-  task list — that's a separate, unattached frontend. See
-  `client/README.md` for the full stack breakdown and rationale, and the
-  Phase 5 writeup in ROADMAP.md for what was verified live in a browser
-  against the real backend.
+  task list. Also has a working like button (`POST /likes`) and renders
+  other guests' photos for real via `GET /photos/{id}/image` — falls back
+  to a metadata-only placeholder, never a broken-image icon, for older
+  captures with no `image_base64` attached. See `client/README.md` for
+  the full stack breakdown and rationale, and the Phase 5 writeup in
+  ROADMAP.md for what was verified live in a browser against the real
+  backend.
+- `client-2/` — the actual branded guest app + operator console (two
+  separate apps sharing one design system), originally a Lovable-
+  generated TanStack Start scaffold with zero backend calls anywhere
+  (static bundled images standing in for the camera, fake
+  `killLeader()`/`partition()` client state) — now fully wired to the
+  real cluster, closing the gap `client/`'s entry above used to describe
+  as unattached. See the "Branded guest app + operator console" writeup
+  in ROADMAP.md for the full list of what got wired and the real bugs
+  found doing it. Highlights:
+  - `src/lib/api.ts` — the node-picking/fetch client (same "race
+    `/health`, use whichever answers first" pattern as `client/src/nodes.ts`).
+  - `src/lib/outbox.ts` — offline photo/like queue, localStorage-backed
+    (this app has no Dexie yet, unlike `client/`) — `useOutbox()` is a
+    `useSyncExternalStore` hook; see the Gotchas entry on caching its
+    snapshot.
+  - `POST /analyze` fires automatically after each photo syncs (see
+    `outbox.ts`) — the first time either client has actually exercised
+    `ai_engine.py`'s aesthetic pipeline instead of leaving it dark.
+  - `src/routes/console.tsx` — the operator console: real Raft
+    term/role and gossip/partition state polled from all 3 nodes, an
+    event tape built from *observed state diffs* (term changes, peer
+    reachability flips) rather than scripted log lines, and chaos
+    actions relabeled honestly — "Isolate the leader", not "Kill", since
+    partitioning doesn't force a re-election (`/chaos/partition` only
+    stops gossip; raft's heartbeats bypass it entirely, same gotcha as
+    below).
+  - `src/lib/consoleAuth.ts` — real password gate on `/console`: a
+    TanStack server function verifies the password server-side and
+    issues an HttpOnly session cookie; the route's `loader` checks it on
+    every request including the first SSR render, so an unauthenticated
+    visitor's HTML never contains the console's data.
+  - `src/lib/operatorGateway.ts` — chaos actions route through server
+    functions (not straight from browser to FastAPI backend like the
+    read-only calls in `api.ts` still do), so `main.py`'s
+    `OPERATOR_TOKEN` is read from `process.env` server-side and never
+    has to touch client JS. Also re-checks the console session itself,
+    on every call — a `beforeLoad` route guard alone doesn't protect a
+    server function, since it's reachable independently of the route
+    that happens to call it.
+  - `client-2/.env` (gitignored; `.env.example` documents the shape)
+    holds `CONSOLE_PASSWORD` and `OPERATOR_TOKEN`.
 
 ## Run it
 
@@ -126,6 +188,17 @@ install && npm run dev` — Vite dev server on :5173, talks to
 `localhost:8001-8003` by default (override with `VITE_NODE_URLS`). A
 `.claude/launch.json` entry (`swarmlens-client`) is already set up for
 `preview_start` if driving it through the Browser tool.
+
+Branded guest app + operator console (also needs the backend running):
+`npm --prefix client-2 run dev -- --host`. Defaults to :8080, but Vite
+auto-increments if that's taken — check the terminal output for the
+real port, especially if an old instance from a previous session is
+still holding it (see the Gotchas entry on this). `client-2/.env`
+(gitignored, already present locally) holds `CONSOLE_PASSWORD` and
+`OPERATOR_TOKEN`; to actually enforce the latter, the backend nodes
+above need the matching `OPERATOR_TOKEN` env var set too (optional —
+`/chaos/*` fails open without it). A `.claude/launch.json` entry
+(`swarmlens-client-2`) is set up for `preview_start`.
 
 Tests:
 - `python test_raft.py` — spins up 3 nodes itself, confirms leader
@@ -187,11 +260,19 @@ chaos/metrics dashboard, load test), plus the AI analysis engine
 See ROADMAP.md for the full phase-by-phase writeup, including two real
 bugs Phase 8's load test found (one in `store.py`, described in the
 Gotchas section below), the actual measured numbers, and what was
-verified live in a browser for the guest client. Not started, and can't
-be from this working directory: wiring the *actual* branded guest UI and
-operator console to this backend — neither of those repos is attached
-alongside this one (`client/` is a functional stand-in for the guest
-half, proving the offline+vclock mechanism, not that design).
+verified live in a browser for the guest client.
+
+Also done, and also outside the phase numbering: the *actual* branded
+guest app + operator console now live in this working directory
+(`client-2/`, added mid-project) and are fully wired to the real
+backend — real camera capture, real gallery/likes/heatmap, a real
+operator console (Raft/gossip state, chaos actions, quorum reads), and
+a real password gate on `/console` plus an optional backend
+`OPERATOR_TOKEN`. See the "Branded guest app + operator console"
+writeup in ROADMAP.md for what was built, the real bugs found wiring
+it up, and what's still a known simplification (a single "room" since
+this backend has no multi-event concept, and a localStorage outbox
+instead of `client/`'s Dexie/service-worker one).
 
 ## Gotchas hit so far (don't reintroduce these)
 
@@ -316,6 +397,56 @@ half, proving the offline+vclock mechanism, not that design).
   reach a real Supabase in production) -- its trust setting is
   controlled by `CLOUD_SYNC_TRUST_ENV` instead, which `test_cloud_sync.py`
   flips to `false` only because its "cloud" is a local fake server.
+- **A test script that spins up its own nodes will silently attach to
+  already-running ones on the same ports instead of erroring.**
+  `test_vclock.py` (and likely the other `test_*.py` scripts) hardcode
+  ports 8001-8003 — running one while the demo cluster is already up on
+  those same ports doesn't fail to bind, it just posts the test's
+  synthetic events (guest `g1`, devices `deviceA`/`deviceB`) straight
+  into the live demo's real databases, polluting them. Confirmed live:
+  a test run bumped the live cluster's event count and left a fake
+  guest sitting in the real gallery. Don't run these test scripts
+  against a cluster you care about the data in — check `netstat`/`lsof`
+  for 8001-8003 first, or only run them when nothing else is up.
+- **`useSyncExternalStore`'s snapshot function must return a stable
+  reference when nothing changed, or it loops forever.**
+  `client-2/src/lib/outbox.ts`'s first version re-parsed the
+  localStorage JSON blob on every call to `getSnapshot` — a *new* array
+  every time, even when the underlying data hadn't changed, which React
+  reads as "changed" on every render and re-renders forever ("Maximum
+  update depth exceeded"). Fixed by caching against the raw string and
+  only re-parsing when it actually differs. If you add another
+  `useSyncExternalStore`-backed store anywhere, the snapshot function
+  needs the same caching, not just "return the current value."
+- **In TanStack Start, `src/start.ts` is isomorphic (bundled for both
+  client and server); `src/server.ts` is not.** Importing a Node
+  built-in (`node:fs`, `node:path`) at the top of `start.ts` breaks
+  client-side hydration with a cryptic "Module has been externalized
+  for browser compatibility" error, because Vite has to stub those
+  modules out for the browser bundle. `client-2/src/server.ts` (the
+  actual Nitro server entry, see `vite.config.ts`'s `server: { entry:
+  "server" }`) is the safe place for Node-only bootstrap code like
+  `client-2`'s own `.env` loader — never `start.ts`.
+- **Vite's own `.env` loading treats `$` as variable-interpolation
+  syntax (`dotenv-expand`), even for non-`VITE_`-prefixed keys your own
+  code never asked it to touch.** `client-2/.env`'s
+  `CONSOLE_PASSWORD=c0n$ol3` silently became `"c0n"` server-side —
+  `$ol3` was read as a reference to an undefined env var `ol3` and
+  expanded to nothing — before `client-2/src/server.ts`'s own loader
+  (which does zero interpolation) ever ran. A guarded "only set if not
+  already present" write kept that mangled value; the fix was making
+  the custom loader unconditional so the literal file value always
+  wins. If a secret contains `$`, don't trust any `.env` value you
+  haven't verified end-to-end.
+- **A dev server bound with `--host` on a port that's already taken
+  silently moves to the next one, and the old process on the old port
+  doesn't stop just because you meant to replace it.** Running
+  `client-2`'s dev server twice (e.g. once from a previous session,
+  once fresh) leaves two live processes — one on :8080, one on :8081 —
+  both serving the app, but only the newer one has the latest code.
+  Hitting the stale one looks exactly like a real bug (e.g. a correct
+  password being rejected) until you check `netstat`/`lsof` for extra
+  listeners and close the old terminal.
 
 ## Conventions
 

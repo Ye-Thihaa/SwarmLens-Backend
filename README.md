@@ -293,11 +293,24 @@ Defaults to talking to `localhost:8001,8002,8003`; override with
 [`client/README.md`](client/README.md) for the full stack breakdown and
 how it fits together with the backend -- it's a functional reference
 implementation proving the offline+vclock mechanism, not the polished
-branded guest UI (that's a separate, unattached frontend).
+branded guest UI.
 
-## Next
+## Branded guest app + operator console (client-2)
 
-- wire the *actual* guest UI and operator console to this backend
-  (needs those repos attached alongside this one -- not present here
-  yet; `client/` above is a functional stand-in for the guest half,
-  not that design)
+The actual branded frontend -- two separate apps (guest app, operator
+console) sharing one design system -- wired to this backend in full:
+real camera capture, real zone picker, real offline outbox, real
+gallery/likes/heatmap, and an operator console with real Raft/gossip
+state, a real event tape, and real chaos actions.
+
+    npm --prefix client-2 run dev -- --host
+
+Defaults to `:8080` (Vite auto-increments if that's taken -- check the
+terminal output). Needs `client-2/.env` (gitignored; see
+`client-2/.env.example`) with `CONSOLE_PASSWORD` and `OPERATOR_TOKEN` --
+the latter also needs setting as an env var on the backend nodes above
+to actually be enforced (`/chaos/*` fails open without it). See the
+"Branded guest app + operator console" writeup in
+[ROADMAP.md](ROADMAP.md) for what was built and the real bugs found
+wiring it up, and CLAUDE.md's Files section for the file-by-file
+breakdown.

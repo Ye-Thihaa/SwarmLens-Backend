@@ -550,6 +550,97 @@ quantified" the spec asked for, not just "it works."
 
 ---
 
+## Branded guest app + operator console — done (outside the phase numbering)
+
+`client-2/` — added mid-project as a Lovable-generated TanStack Start
+scaffold (React 19, two separate apps sharing one design system: a
+guest app and an operator console), with zero backend calls anywhere:
+a static bundled JPEG stood in for the camera feed, and the operator
+console's "kill the leader" / "partition" buttons just flipped local
+React state. Wired the whole thing to the real 3-node cluster.
+
+**Guest app**: real `getUserMedia` camera capture (the mock had none),
+a real zone picker using the backend's actual zones (the mock had no
+zone concept at all — capture just implied one via a hardcoded nudge
+string), a real offline outbox (localStorage-backed — this app has no
+Dexie, unlike `client/`'s Phase 5 IndexedDB one), real gallery/likes/
+heatmap from `GET /photos` + `GET /zones`, and `POST /analyze` now
+fires automatically after every upload — the first time either guest
+client has actually exercised `ai_engine.py`'s aesthetic pipeline
+instead of leaving it completely dark. Landing page collapses to one
+real "room" card with live guest/frame counts, since this backend has
+no multi-event concept to back the mock's fake 3-event directory.
+
+**Operator console**: real Raft term/role and gossip/partition state
+polled from all 3 nodes every second, a real event tape built from
+*observed state diffs* (term changes, peer reachability flips) instead
+of scripted log lines, and a real `GET /zones/quorum?R=&W=` demo
+(sample size, `queried`/`unreachable`, `strongly_consistent`) replacing
+the mock's fake "W=1 R=1 stale read" button. Chaos actions were
+relabeled honestly rather than kept as-is: "Isolate the leader," not
+"Kill the leader" — `POST /chaos/partition` only stops gossip
+anti-entropy, and Raft's heartbeats bypass `gossip.partitioned`
+entirely (same distinction as the existing Gotchas entry on this), so
+isolating the leader demonstrates gossip/quorum staleness, not a
+forced re-election. No real process-kill button was added, matching
+`dashboard.html`'s own documented stance on why that was deliberately
+left unbuilt.
+
+**Auth, added after the fact at the user's request**: a real password
+gate on `/console` (`client-2/src/lib/consoleAuth.ts`) — a TanStack
+server function verifies the password server-side and issues an
+HttpOnly session cookie, checked by the route's `loader` on every
+request including the first SSR render, so an unauthenticated
+visitor's HTML never contains the console's data. Chaos actions route
+through server functions (`src/lib/operatorGateway.ts`) rather than
+straight from the browser to the FastAPI backend, so `main.py`'s new
+`OPERATOR_TOKEN` gate (`require_operator_token`, `/chaos/partition`
+and `/chaos/heal` only, `secrets.compare_digest`, fails open when
+unset so existing tests/`dashboard.html` keep working) never has to be
+readable from client JS — only this Node process's own `process.env`
+ever sees it.
+
+**Three real bugs found wiring this up, in order:**
+
+1. `useSyncExternalStore`'s snapshot function re-parsed the outbox's
+   localStorage JSON on every call — a new array reference each time,
+   which React reads as "always changed," looping the `EventGallery`
+   route into "Maximum update depth exceeded" on every visit. Fixed by
+   caching against the raw string and only re-parsing when it actually
+   changed.
+2. The `.env` loader for `CONSOLE_PASSWORD`/`OPERATOR_TOKEN` was first
+   added to `src/start.ts`, which (unlike `src/server.ts`) is bundled
+   for the *client* too — importing `node:fs`/`node:path` there broke
+   hydration with a cryptic "Module externalized for browser
+   compatibility" error. Moved to `server.ts`, the genuinely
+   server-only Nitro entry point.
+3. Vite's own internal `.env` loading (`dotenv-expand`) treats `$` as
+   variable-interpolation syntax and silently mangled
+   `CONSOLE_PASSWORD=c0n$ol3` down to `"c0n"` (`$ol3` resolved as a
+   reference to an undefined env var and expanded to nothing) before
+   the app's own loader ran — and that loader's "only set if not
+   already present" guard then kept the mangled value. Fixed by making
+   the custom loader unconditional so the literal file value always
+   wins over whatever Vite already put there.
+
+Also found, unrelated to the wiring itself: `test_vclock.py` (likely
+every `test_*.py` here) hardcodes ports 8001-8003 and doesn't fail to
+bind if those are already in use — it silently attaches to an
+already-running demo cluster and posts its synthetic test events
+(guest `g1`) straight into real data. Confirmed live: a test run left
+a fake guest sitting in the actual gallery. See the Gotchas section in
+CLAUDE.md for the operational rule this implies.
+
+Verified live end-to-end in a browser: real photo capture → real
+upload → real gallery display on a device that never captured it →
+real like → real `/analyze` call → real operator-console login → a
+real `/chaos/partition` isolate/heal cycle with the event tape logging
+genuine state transitions → a real `R=1` quorum read landing on the
+isolated node → confirmed the browser's network tab never once shows
+a direct call to `/chaos/*` post-auth, only the `_serverFn` proxy.
+
+---
+
 ## Suggested pacing (8 weeks, solo, from here)
 
 | Week | Phase |
