@@ -697,6 +697,22 @@ alongside it, so raft's 50ms heartbeat is untouched.
    it's speckle, above the ceiling it *is* the scene — and the UI draws
    nothing when `subject_found` is false.
 
+5. **The subject detector inverted the guidance near a thirds line** —
+   found only after the browser test "passed". Picking the strongest
+   connected component (the fix for bug 3) breaks differently: spectral
+   residual answers on *edges*, so one object splits into separate
+   fragments and the winner's centroid sits off to one side, while the
+   dim background that survives thresholding drags it toward frame
+   centre. Synthetic subjects at x=0.22 and x=0.72 were reported at 0.40
+   and 0.53 — both close enough to centre to cross the nearest
+   rule-of-thirds line, so the arrow told the user to move the camera
+   **the wrong way**. The earlier browser test missed it because its
+   subject was far enough off-centre to survive the pull. Fixed by
+   keeping only the top few percent of saliency mass and taking a
+   saliency-weighted centroid: error against four known-position
+   subjects dropped to ≤1px per axis, and the directions came back
+   correct.
+
 Because the resulting film-stock margins are genuinely small, the
 response also carries `confident`; when the top two are within
 `CONFIDENT_MARGIN` the sentence says *"no strong preference here"* and
@@ -719,6 +735,19 @@ Killing all three nodes cleared the overlay to *"GUIDANCE OFFLINE ·
 SHUTTER UNAFFECTED"* rather than leaving stale boxes on screen, the
 shutter still queued a frame to the outbox with the cluster down, and
 guidance resumed on its own when the nodes came back.
+
+**Phone testing (HTTPS).** `getUserMedia` needs a secure context and
+only `localhost` is exempt, so over plain HTTP the app loads on a phone
+and silently has no camera at all. `client-2/vite.config.ts` now serves
+dev HTTPS from a gitignored `certs/` pair (LAN IPs in `subjectAltName`,
+since CN hasn't been honoured for host matching in years) and proxies
+`/n1,/n2,/n3` to the three nodes — which also solves the two problems
+HTTPS creates on its own: an HTTPS page can't fetch `http://` (mixed
+content), and `127.0.0.1` means *the phone* when the page runs on one.
+The guest app follows `VITE_NODE_URLS`; the operator console is
+untouched because it reads `CLUSTER` directly. Real-camera behaviour is
+still unverified by this session — the sandbox has no webcam and the
+in-app browser won't accept a self-signed cert.
 
 ## Suggested pacing (8 weeks, solo, from here)
 

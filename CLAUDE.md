@@ -472,19 +472,36 @@ instead of `client/`'s Dexie/service-worker one).
   0.0 — the mask had emptied the array. The correct test for "this pixel
   has no usable hue" is the saturation gate, not brightness; only the
   dark floor is a legitimate exclusion.
-- **Whole-image statistics over a saliency map collapse to the whole
-  image on any real photograph.** Foliage, gravel and fabric make
-  spectral-residual saliency speckle across the entire frame, so both
-  min/max and a 6th/94th percentile bbox (both tried) returned a subject
-  box covering ~90% of the frame — which silently made the reframe a
-  permanent no-op, since a crop that size is never tighter than what's
-  already framed. Fixed by blurring before the Otsu threshold, an
-  open/close pass, then taking the single strongest *connected
-  component*, ranked on mean saliency × area (area alone lets a big dim
-  smear of background beat a small bright subject). Also bound the result
-  by area: below `MIN_SUBJECT_AREA` it's noise (a flat gray test image
-  produced a 0.5%-of-frame "subject" and a confident 4× zoom into an
-  empty corner), above `MAX_SUBJECT_AREA` it *is* the scene.
+- **Locating a subject in a saliency map: two obvious approaches are
+  both wrong, and the second is wrong in a way that inverts the
+  guidance.** Worth reading before "improving" `_saliency_subject`,
+  because both were tried and measured.
+  (1) *Whole-image statistics over every above-Otsu pixel* (min/max, or
+  a 6th/94th percentile) collapse to ~90% of the frame on any real
+  photograph — foliage, gravel and fabric speckle saliency everywhere —
+  which silently makes the reframe a permanent no-op, since a crop that
+  size is never tighter than what's already framed.
+  (2) *The strongest connected component* fixes that and breaks
+  differently: spectral residual responds to **edges, not filled
+  regions**, so one object answers as several fragments (a uniform
+  square splits into separate left-edge and right-edge blobs) and the
+  winning fragment's centroid sits off to one side. Worse, the dimly-lit
+  background that survives thresholding drags the centroid toward the
+  frame centre — measured on synthetic subjects at x=0.22 and x=0.72,
+  the reported positions were 0.40 and 0.53, both close enough to centre
+  to cross the nearest rule-of-thirds line and **tell the user to move
+  the camera the wrong way**. Correct arithmetic, backwards advice,
+  which is the exact failure this feature is supposed to avoid.
+  The fix that holds: keep only the top `SUBJECT_TOP_PCT` of the blurred
+  map's saliency mass (drops the background doing the centre-pulling),
+  weight by height *above* that threshold, and take the weighted
+  centroid — an object's several edge responses then average back onto
+  the object. Extent comes from the weighted standard deviation, and
+  `found` is false when that spread exceeds `SUBJECT_DIFFUSE_MAX`.
+  Centroid error against four synthetic subjects at known positions is
+  ≤1px per axis; if you change any of this, re-run that check rather
+  than eyeballing one photo, since the failure mode is a *plausible*
+  box in the wrong place.
 - **`test_ai_engine.py` (and its siblings) `os.remove()` `./node1.db`
   through `./node3.db` on cleanup — the same files the demo cluster
   uses.** This is the sharper edge of the port-collision gotcha below: it
@@ -525,6 +542,23 @@ instead of `client/`'s Dexie/service-worker one).
   the custom loader unconditional so the literal file value always
   wins. If a secret contains `$`, don't trust any `.env` value you
   haven't verified end-to-end.
+- **Testing the camera on a real phone needs three separate things, and
+  each fails silently on its own.** `client-2`'s capture route uses
+  `getUserMedia`, which requires a *secure context*; only `localhost` is
+  exempt. So on a phone at `http://192.168.x.x:8080` the app loads
+  perfectly and simply has no camera — the route's own error copy
+  ("NEEDS HTTPS OR LOCALHOST") is the only clue. Enabling HTTPS then
+  breaks the backend calls two more ways: an HTTPS page may not fetch
+  `http://` URLs (mixed content), and `127.0.0.1:8001` means *the phone*
+  when the page is running on a phone. `vite.config.ts` handles all
+  three: a dev cert from `certs/` (gitignored; the LAN IPs must be in
+  `subjectAltName` — browsers stopped honouring CN for host matching
+  years ago), plus a `/n1,/n2,/n3` same-origin proxy to the nodes that
+  the guest app is pointed at with `VITE_NODE_URLS`. The operator
+  console is deliberately unaffected: it reads `api.ts`'s `CLUSTER`
+  (absolute URLs) rather than `NODES`, because `/chaos/partition`
+  indexes positionally into a specific node's own `PEERS` list. Missing
+  cert files fall back to HTTP rather than failing to boot.
 - **A dev server bound with `--host` on a port that's already taken
   silently moves to the next one, and the old process on the old port
   doesn't stop just because you meant to replace it.** Running
