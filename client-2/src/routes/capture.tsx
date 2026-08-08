@@ -132,6 +132,12 @@ function Capture() {
   const [aiScanning, setAiScanning] = useState(false);
   const stockTouched = useRef(false);
 
+  // Which way the camera faces. "user" (selfie) is shown mirrored, the way
+  // every phone camera does it -- which has consequences for the AI overlay,
+  // see grabPreviewFrame and panInstruction.
+  const [facing, setFacing] = useState<"environment" | "user">("environment");
+  const mirrored = facing === "user";
+
   const [stock, setStock] = useState(0);
   const [zone, setZone] = useState(ZONES[0]!);
   const [reachable, setReachable] = useState(false);
@@ -159,18 +165,31 @@ function Capture() {
 
   const showNudge = !composing && !panel;
 
-  // real camera feed, not a bundled photo
+  // real camera feed, not a bundled photo. Re-runs on flip; the cleanup
+  // stops the old tracks first, since a phone won't hand out the front
+  // camera while the back one still holds the hardware.
   useEffect(() => {
     let stream: MediaStream | null = null;
+    let cancelled = false;
+    setCameraError(null);
     navigator.mediaDevices
-      .getUserMedia({ video: { facingMode: "environment" }, audio: false })
+      .getUserMedia({ video: { facingMode: facing }, audio: false })
       .then((s) => {
+        if (cancelled) {
+          s.getTracks().forEach((t) => t.stop());
+          return;
+        }
         stream = s;
         if (videoRef.current) videoRef.current.srcObject = s;
       })
-      .catch((e) => setCameraError(String(e)));
-    return () => stream?.getTracks().forEach((t) => t.stop());
-  }, []);
+      .catch((e) => {
+        if (!cancelled) setCameraError(String(e));
+      });
+    return () => {
+      cancelled = true;
+      stream?.getTracks().forEach((t) => t.stop());
+    };
+  }, [facing]);
 
   // real reachability, polled the same way the guest roll and gallery do
   useEffect(() => {
@@ -239,7 +258,7 @@ function Capture() {
       const node = video && canvas && video.videoWidth > 0 ? await pickNode() : null;
 
       if (!stopped && node) {
-        const frame = grabPreviewFrame(video!, canvas!, ar);
+        const frame = grabPreviewFrame(video!, canvas!, ar, mirrored);
         if (frame) {
           setAiScanning(true);
           try {
@@ -279,7 +298,7 @@ function Capture() {
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [aiOn, cameraError, ratio]);
+  }, [aiOn, cameraError, ratio, mirrored]);
 
   useEffect(() => {
     return () => {
@@ -383,6 +402,13 @@ function Capture() {
                       ? "saturate-150 hue-rotate-[-8deg]"
                       : ""
                 } ${flash ? "brightness-110" : ""}`}
+                // Inline rather than a Tailwind scale utility: v4 emits those
+                // via the `scale` property, not `transform`, which makes the
+                // mirror easy to misread as "not applied" when verifying. The
+                // analysis frame is mirrored to match in grabPreviewFrame --
+                // the two must never disagree or every overlay box lands on
+                // the wrong side of its subject.
+                style={mirrored ? { transform: "scaleX(-1)" } : undefined}
               />
               <canvas ref={canvasRef} className="hidden" />
               <canvas ref={previewCanvasRef} className="hidden" />
@@ -426,19 +452,25 @@ function Capture() {
                     </div>
                   )}
 
-                  {/* Camera move. Reads pan_camera_*, never move_subject_* */}
+                  {/* Camera move. Anchored to the MIDDLE of the viewfinder, not
+                      its bottom: the film strip and shutter row are positioned
+                      against the screen, and at phone height (375x812) a
+                      bottom-anchored badge lands in exactly the same band as
+                      the strip, which paints later and hides it completely.
+                      The viewfinder's centre is clear at every frame ratio
+                      because the box is centred in the container. */}
                   {ai &&
                     ai.ar_guide.subject_found &&
                     !ai.ar_guide.well_composed &&
                     (() => {
-                      const nudge = panInstruction(ai.ar_guide);
+                      const nudge = panInstruction(ai.ar_guide, mirrored);
                       if (!nudge) return null;
                       return (
-                        <div className="absolute inset-x-0 bottom-8 flex flex-col items-center gap-1">
-                          <span className="font-display text-3xl leading-none font-bold text-safelight [text-shadow:0_0_10px_color-mix(in_oklab,var(--emulsion)_90%,transparent)]">
+                        <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 flex-col items-center gap-1">
+                          <span className="font-display text-5xl leading-none font-bold text-safelight [text-shadow:0_0_12px_color-mix(in_oklab,var(--emulsion)_95%,transparent)]">
                             {nudge.arrows}
                           </span>
-                          <span className="rounded-sm bg-emulsion/80 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-safelight">
+                          <span className="rounded-sm bg-emulsion/85 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-safelight">
                             {nudge.text}
                           </span>
                         </div>
@@ -446,37 +478,32 @@ function Capture() {
                     })()}
 
                   {ai?.ar_guide.well_composed && ai.ar_guide.subject_found && (
-                    <div className="absolute inset-x-0 bottom-8 flex justify-center">
-                      <span className="rounded-sm bg-emulsion/80 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-converged">
+                    <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 justify-center">
+                      <span className="rounded-sm bg-emulsion/85 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-converged">
                         ON THE THIRDS · HOLD IT
                       </span>
                     </div>
                   )}
 
-                  {/* Top banner: scanning until the first real reading lands,
-                      then the measured reason for the recommendation. */}
-                  <div className="absolute inset-x-0 top-0 flex justify-center p-2">
-                    {ai ? (
-                      <span className="max-w-[92%] rounded-sm bg-emulsion/85 px-2 py-1 text-center font-mono text-[0.55rem] leading-relaxed tracking-[0.1em] text-fixer">
-                        {ai.reason}
+                  {/* Say why there's nothing to show. Saliency genuinely finds
+                      no single subject in a diffuse scene (~1 frame in 3 on
+                      real photos), and silent absence is indistinguishable
+                      from the feature being broken -- which is exactly how
+                      this looked on a phone before. */}
+                  {ai && !ai.ar_guide.subject_found && (
+                    <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 justify-center">
+                      <span className="rounded-sm bg-emulsion/80 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-stale">
+                        NO CLEAR SUBJECT
                       </span>
-                    ) : !reachable ? (
-                      <span className="rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-stale">
-                        GUIDANCE OFFLINE · SHUTTER UNAFFECTED
-                      </span>
-                    ) : aiScanning ? (
-                      <span className="settling rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-drifting">
-                        READING THE LIGHT · HOLD STILL
-                      </span>
-                    ) : null}
-                  </div>
-
-                  {ai && (
-                    <span className="absolute bottom-2 left-2 rounded-sm bg-emulsion/80 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-fixer-dim">
-                      LOOKS {ai.aesthetic_score.toFixed(1)}/10
-                      {!ai.confident && " · NO STRONG STOCK"}
-                    </span>
+                    </div>
                   )}
+
+                  {/* The reason banner and the score readout are NOT here --
+                      see the container-level block below. Only things that
+                      must line up with frame coordinates (the subject box,
+                      the crop rect, the nudge) belong inside the viewfinder;
+                      text pinned to its edges lands underneath the camera's
+                      own chrome. */}
                 </div>
               )}
               {stamp && (
@@ -540,6 +567,40 @@ function Capture() {
               <div className="absolute inset-y-16 left-1/3 w-px bg-fixer/20" />
               <div className="absolute inset-y-16 left-2/3 w-px bg-fixer/20" />
             </>
+          )}
+
+          {/* AI compose text, anchored to the SCREEN rather than to the
+              viewfinder. The camera's own chrome -- the EI/FRAME readout at
+              top-0 and the zone chips at top-16 -- is positioned against the
+              container, so anything pinned to the viewfinder's top edge
+              renders underneath it: on a phone this clipped the reason
+              sentence mid-word ("...rops the color and leans on contrast").
+              At 375px wide the chips already wrap to two rows and end at
+              y=133; 10rem leaves room for a third row on a narrower phone
+              while still sitting well above the nudge at the viewfinder's
+              centre (y~345). */}
+          {aiOn && (
+            <div className="absolute inset-x-0 top-[10rem] flex flex-col items-center gap-1 px-4">
+              {ai ? (
+                <span className="max-w-full rounded-sm bg-emulsion/85 px-2 py-1 text-center font-mono text-[0.55rem] leading-relaxed tracking-[0.1em] text-fixer">
+                  {ai.reason}
+                </span>
+              ) : !reachable ? (
+                <span className="rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-stale">
+                  GUIDANCE OFFLINE · SHUTTER UNAFFECTED
+                </span>
+              ) : aiScanning ? (
+                <span className="settling rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-drifting">
+                  READING THE LIGHT · HOLD STILL
+                </span>
+              ) : null}
+              {ai && (
+                <span className="rounded-sm bg-emulsion/80 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-fixer-dim">
+                  LOOKS {ai.aesthetic_score.toFixed(1)}/10
+                  {!ai.confident && " · NO STRONG STOCK"}
+                </span>
+              )}
+            </div>
           )}
 
           {showNudge && topZone && topZone.zone !== zone && (
@@ -670,13 +731,26 @@ function Capture() {
             aria-label="Take a photo"
             className="h-20 w-20 rounded-full border-4 border-fixer/80 bg-fixer/90 active:scale-95 transition disabled:opacity-40"
           />
-          <p className="w-20 text-right font-mono text-[0.55rem] leading-tight tracking-widest text-fixer-dim">
-            {(filmStocks[stock]?.name ?? "").split(" ")[0]?.toUpperCase()}
-            <br />
-            LOADED
-            <br />
-            {flash ? "FLASH ⚡" : "NO FLASH"}
-          </p>
+          <div className="flex w-20 flex-col items-end gap-1.5">
+            <button
+              onClick={() => setFacing((f) => (f === "environment" ? "user" : "environment"))}
+              aria-label={mirrored ? "Switch to rear camera" : "Switch to front camera"}
+              className="flex items-center gap-1 rounded-sm border border-fixer/25 px-1.5 py-1 font-mono text-[0.5rem] tracking-widest text-fixer-dim active:bg-fixer/10"
+            >
+              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+                <polyline points="21 3 21 8 16 8" />
+                <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+                <polyline points="3 21 3 16 8 16" />
+              </svg>
+              {mirrored ? "FRONT" : "REAR"}
+            </button>
+            <p className="text-right font-mono text-[0.55rem] leading-tight tracking-widest text-fixer-dim">
+              {(filmStocks[stock]?.name ?? "").split(" ")[0]?.toUpperCase()}
+              <br />
+              {flash ? "FLASH ⚡" : "NO FLASH"}
+            </p>
+          </div>
         </div>
       </div>
 
@@ -698,6 +772,7 @@ function grabPreviewFrame(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
   ar: number,
+  mirrored: boolean,
 ): string | null {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
@@ -713,7 +788,17 @@ function grabPreviewFrame(
   canvas.height = Math.max(1, Math.round(cropH * scale));
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
+  // Selfie view is displayed mirrored, so mirror what we analyze too.
+  // Otherwise every returned rect is drawn on the opposite side of the
+  // subject it describes -- the boxes must live in the same coordinate
+  // space as the pixels the guest is actually looking at.
+  if (mirrored) {
+    ctx.setTransform(-1, 0, 0, 1, canvas.width, 0);
+  } else {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
   ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, canvas.width, canvas.height);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   return canvas.toDataURL("image/jpeg", 0.8).split(",")[1] ?? null;
 }
 
@@ -740,12 +825,29 @@ const STRENGTH_COPY: Record<string, string> = {
  * Picking the wrong field renders correct arithmetic as a backwards
  * arrow, which is worse than showing nothing at all because it still
  * looks authoritative. See ai_engine.compute_ar_guide's docstring. */
-function panInstruction(g: ComposePreview["ar_guide"]): { arrows: string; text: string } | null {
+function panInstruction(
+  g: ComposePreview["ar_guide"],
+  mirrored: boolean,
+): { arrows: string; text: string } | null {
+  // Horizontal mirroring flips the relationship between screen direction and
+  // physical camera motion, so the selfie camera needs the OTHER field:
+  //
+  //   rear (not mirrored): to push the subject right in frame, pan left.
+  //     -> pan_camera_x, which is already the inverse of move_subject_x.
+  //   front (mirrored):    the frame we analyzed is itself mirrored, so
+  //     "subject moves right on screen" means "moves left in the raw sensor
+  //     frame", which needs a pan RIGHT -- i.e. the same word as
+  //     move_subject_x, not its inverse.
+  //
+  // Vertical is untouched by a horizontal mirror, so tilt always reads
+  // pan_camera_y. Getting this wrong gives a confidently backwards arrow on
+  // exactly one of the two cameras, which is the hardest kind to notice.
+  const xDir = mirrored ? g.move_subject_x : g.pan_camera_x;
   const arrows: string[] = [];
   const words: string[] = [];
-  if (g.pan_camera_x !== "centered") {
-    arrows.push(g.pan_camera_x === "left" ? "←" : "→");
-    words.push(g.pan_camera_x === "left" ? "PAN LEFT" : "PAN RIGHT");
+  if (xDir !== "centered") {
+    arrows.push(xDir === "left" ? "←" : "→");
+    words.push(xDir === "left" ? "PAN LEFT" : "PAN RIGHT");
   }
   if (g.pan_camera_y !== "centered") {
     arrows.push(g.pan_camera_y === "up" ? "↑" : "↓");
