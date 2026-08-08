@@ -2,7 +2,15 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { filmStocks } from "@/guest/data";
 import { GuestTabs } from "@/guest/ui";
-import { pickNode, prettyZone, ZONES, type ZoneScore, getZones } from "@/lib/api";
+import {
+  pickNode,
+  postAnalyzePreview,
+  prettyZone,
+  ZONES,
+  type ComposePreview,
+  type ZoneScore,
+  getZones,
+} from "@/lib/api";
 import { currentGuestId, tick } from "@/lib/guest";
 import { addPhoto, syncOutbox, useOutbox } from "@/lib/outbox";
 
@@ -25,11 +33,24 @@ export const Route = createFileRoute("/capture")({
 const ISO = [100, 200, 400, 800, 1600, 3200];
 const SHUTTER = ["1/500", "1/250", "1/125", "1/60", "1/30", "1/15"];
 const EV = ["-1.0", "-0.7", "-0.3", "0.0", "+0.3", "+0.7", "+1.0"];
+// `ar` is width/height and must match `cls` exactly: it's what gets sent to
+// /analyze/preview so the crop rectangle that comes back is expressed in
+// the same frame the guest is actually looking at.
 const RATIOS = [
-  { key: "3:4", cls: "aspect-[3/4]" },
-  { key: "1:1", cls: "aspect-square" },
-  { key: "strip", cls: "aspect-[1/3]" },
+  { key: "3:4", cls: "aspect-[3/4]", ar: 3 / 4 },
+  { key: "1:1", cls: "aspect-square", ar: 1 },
+  { key: "strip", cls: "aspect-[1/3]", ar: 1 / 3 },
 ] as const;
+
+/** How often the viewfinder asks a node to look at what it's seeing. One
+ * analysis measured ~37ms server-side, so this is set by taste and by
+ * politeness to a shared node rather than by compute: fast enough to feel
+ * live, slow enough that several guests on one node don't spend their
+ * whole time being shed with 503s. */
+const PREVIEW_INTERVAL_MS = 1500;
+/** CLIP resizes its input to 224px anyway; sending more is pure upload
+ * cost on a phone's uplink for zero extra signal. */
+const PREVIEW_EDGE_PX = 224;
 
 /** A knurled dial: tap the ticks to step through discrete values, like a real camera. */
 function Dial({
@@ -96,7 +117,20 @@ function Toggle({
 function Capture() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Separate from canvasRef on purpose: the preview loop and a shutter press
+  // can land in the same tick, and shootOnce resizes its canvas to the full
+  // sensor frame. Sharing one canvas would let a capture and an analysis
+  // scribble over each other's pixels.
+  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
+
+  // AI compose: live guidance from POST /analyze/preview (ai_engine.py's
+  // saliency + CLIP, same models /analyze uses after a capture -- this path
+  // just never persists anything).
+  const [aiOn, setAiOn] = useState(true);
+  const [ai, setAi] = useState<ComposePreview | null>(null);
+  const [aiScanning, setAiScanning] = useState(false);
+  const stockTouched = useRef(false);
 
   const [stock, setStock] = useState(0);
   const [zone, setZone] = useState(ZONES[0]!);
@@ -178,6 +212,74 @@ function Capture() {
       clearInterval(id);
     };
   }, []);
+
+  // Live composition guidance, one analysis at a time (recursive timeout, not
+  // setInterval, so a slow node can never stack up overlapping requests).
+  //
+  // Deliberately degrades to silence rather than to a stale opinion: when no
+  // node answers, the overlay clears and the camera carries on exactly as it
+  // did before this feature existed. Guidance is the only part of this screen
+  // that needs the cluster -- capture, the outbox and the roll are all local,
+  // so a partition costs the guest advice, never a photo.
+  useEffect(() => {
+    if (!aiOn || cameraError) {
+      setAi(null);
+      setAiScanning(false);
+      return;
+    }
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const controller = new AbortController();
+    const ar = RATIOS[ratio]!.ar;
+
+    async function tick() {
+      if (stopped) return;
+      const video = videoRef.current;
+      const canvas = previewCanvasRef.current;
+      const node = video && canvas && video.videoWidth > 0 ? await pickNode() : null;
+
+      if (!stopped && node) {
+        const frame = grabPreviewFrame(video!, canvas!, ar);
+        if (frame) {
+          setAiScanning(true);
+          try {
+            const result = await postAnalyzePreview(
+              node,
+              { image_base64: frame, aspect: ar },
+              controller.signal,
+            );
+            // null means the node shed this frame with 503 (all preview
+            // slots busy). Keep the previous reading on screen rather than
+            // blanking for one tick -- it's one interval stale, not wrong.
+            if (!stopped && result) {
+              setAi(result);
+              // Never override a deliberate choice, and never auto-apply on
+              // a coin flip: only load the recommendation while the guest
+              // hasn't touched the strip and the scores actually separate.
+              if (!stockTouched.current && result.confident) {
+                const i = filmStocks.findIndex((f) => f.key === result.suggested_filter);
+                if (i >= 0) setStock(i);
+              }
+            }
+          } catch {
+            if (!stopped) setAi(null); // aborted, or the node went away
+          } finally {
+            if (!stopped) setAiScanning(false);
+          }
+        }
+      } else if (!stopped) {
+        setAi(null);
+      }
+      if (!stopped) timer = setTimeout(tick, PREVIEW_INTERVAL_MS);
+    }
+
+    void tick();
+    return () => {
+      stopped = true;
+      controller.abort();
+      if (timer) clearTimeout(timer);
+    };
+  }, [aiOn, cameraError, ratio]);
 
   useEffect(() => {
     return () => {
@@ -283,6 +385,7 @@ function Capture() {
                 } ${flash ? "brightness-110" : ""}`}
               />
               <canvas ref={canvasRef} className="hidden" />
+              <canvas ref={previewCanvasRef} className="hidden" />
               {/* halation / vignette, stronger the faster the film */}
               <div
                 className="pointer-events-none absolute inset-0"
@@ -290,6 +393,92 @@ function Capture() {
                   boxShadow: `inset 0 0 ${40 + iso * 14}px ${12 + iso * 6}px color-mix(in oklab, var(--emulsion) 80%, transparent)`,
                 }}
               />
+
+              {/* AI COMPOSE overlay. Everything drawn here is measured, and
+                  every element is gated on the engine actually having found
+                  something: no subject box when saliency found nothing, no
+                  crop rectangle when the crop wouldn't be tighter than the
+                  current framing, no film-stock claim when the top two
+                  scores are tied. Drawn inside the ratio box (not the
+                  screen) because the rects are normalized to the frame that
+                  was sent, which is this box's contents. */}
+              {aiOn && (
+                <div className="pointer-events-none absolute inset-0">
+                  {ai?.reframe.subject_found && (
+                    <div
+                      className="absolute rounded-[3px] border border-drifting/80"
+                      style={pct(ai.reframe.subject_box)}
+                    >
+                      <span className="absolute -top-4 left-0 rounded-sm bg-emulsion/85 px-1 font-mono text-[0.5rem] tracking-[0.16em] text-drifting">
+                        SUBJECT
+                      </span>
+                    </div>
+                  )}
+
+                  {ai?.reframe.worth_it && (
+                    <div
+                      className="settling absolute rounded-lg border-2 border-safelight/85"
+                      style={pct(ai.reframe.rect)}
+                    >
+                      <span className="absolute -bottom-5 right-0 rounded-sm bg-emulsion/85 px-1 font-mono text-[0.55rem] tracking-[0.16em] text-safelight">
+                        {ai.reframe.zoom}× TIGHTER
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Camera move. Reads pan_camera_*, never move_subject_* */}
+                  {ai &&
+                    ai.ar_guide.subject_found &&
+                    !ai.ar_guide.well_composed &&
+                    (() => {
+                      const nudge = panInstruction(ai.ar_guide);
+                      if (!nudge) return null;
+                      return (
+                        <div className="absolute inset-x-0 bottom-8 flex flex-col items-center gap-1">
+                          <span className="font-display text-3xl leading-none font-bold text-safelight [text-shadow:0_0_10px_color-mix(in_oklab,var(--emulsion)_90%,transparent)]">
+                            {nudge.arrows}
+                          </span>
+                          <span className="rounded-sm bg-emulsion/80 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-safelight">
+                            {nudge.text}
+                          </span>
+                        </div>
+                      );
+                    })()}
+
+                  {ai?.ar_guide.well_composed && ai.ar_guide.subject_found && (
+                    <div className="absolute inset-x-0 bottom-8 flex justify-center">
+                      <span className="rounded-sm bg-emulsion/80 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-converged">
+                        ON THE THIRDS · HOLD IT
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Top banner: scanning until the first real reading lands,
+                      then the measured reason for the recommendation. */}
+                  <div className="absolute inset-x-0 top-0 flex justify-center p-2">
+                    {ai ? (
+                      <span className="max-w-[92%] rounded-sm bg-emulsion/85 px-2 py-1 text-center font-mono text-[0.55rem] leading-relaxed tracking-[0.1em] text-fixer">
+                        {ai.reason}
+                      </span>
+                    ) : !reachable ? (
+                      <span className="rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-stale">
+                        GUIDANCE OFFLINE · SHUTTER UNAFFECTED
+                      </span>
+                    ) : aiScanning ? (
+                      <span className="settling rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-drifting">
+                        READING THE LIGHT · HOLD STILL
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {ai && (
+                    <span className="absolute bottom-2 left-2 rounded-sm bg-emulsion/80 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-fixer-dim">
+                      LOOKS {ai.aesthetic_score.toFixed(1)}/10
+                      {!ai.confident && " · NO STRONG STOCK"}
+                    </span>
+                  )}
+                </div>
+              )}
               {stamp && (
                 <p className="pointer-events-none absolute right-3 bottom-3 font-mono text-[0.7rem] tracking-widest text-safelight/90 [text-shadow:0_0_6px_color-mix(in_oklab,var(--safelight)_60%,transparent)]">
                   {today} {reachable ? "" : "•"}
@@ -391,6 +580,9 @@ function Capture() {
                 <Toggle on={grid} onClick={() => setGrid((v) => !v)}>
                   GRID
                 </Toggle>
+                <Toggle on={aiOn} onClick={() => setAiOn((v) => !v)}>
+                  AI COMPOSE {aiOn ? "ON" : "OFF"}
+                </Toggle>
                 <Toggle on={stamp} onClick={() => setStamp((v) => !v)}>
                   DATE STAMP
                 </Toggle>
@@ -421,24 +613,41 @@ function Capture() {
         <div className="absolute inset-x-0 bottom-40">
           <div className="film-edge overflow-x-auto bg-emulsion/60 py-3 backdrop-blur [scrollbar-width:none]">
             <div className="flex gap-2 px-4">
-              {filmStocks.map((f, i) => (
-                <button
-                  key={f.name}
-                  onClick={() => setStock(i)}
-                  className={`min-w-[7.5rem] shrink-0 rounded-sm border px-3 py-2 text-left transition ${
-                    i === stock
-                      ? "border-drifting bg-drifting/15"
-                      : "border-fixer/20 bg-emulsion/40"
-                  }`}
-                >
-                  <span className="block font-display text-[0.82rem] leading-tight font-bold text-fixer">
-                    {f.name}
-                  </span>
-                  <span className="block font-mono text-[0.6rem] tracking-wide text-fixer-dim">
-                    {f.note}
-                  </span>
-                </button>
-              ))}
+              {filmStocks.map((f, i) => {
+                // Marked in place rather than sorted to the front: the strip
+                // re-reads every 1.5s, and cards sliding around under a
+                // thumb that's already reaching for one is a worse trade
+                // than a badge.
+                const recommended = aiOn && ai?.confident && ai.suggested_filter === f.key;
+                return (
+                  <button
+                    key={f.key}
+                    onClick={() => {
+                      stockTouched.current = true; // stop auto-applying from here on
+                      setStock(i);
+                    }}
+                    className={`relative min-w-[7.5rem] shrink-0 rounded-sm border px-3 py-2 text-left transition ${
+                      i === stock
+                        ? "border-drifting bg-drifting/15"
+                        : recommended
+                          ? "border-safelight/60 bg-emulsion/40"
+                          : "border-fixer/20 bg-emulsion/40"
+                    }`}
+                  >
+                    {recommended && (
+                      <span className="absolute -top-1.5 right-1 rounded-sm bg-safelight px-1 font-mono text-[0.45rem] tracking-[0.14em] text-emulsion">
+                        AI PICK
+                      </span>
+                    )}
+                    <span className="block font-display text-[0.82rem] leading-tight font-bold text-fixer">
+                      {f.name}
+                    </span>
+                    <span className="block font-mono text-[0.6rem] tracking-wide text-fixer-dim">
+                      {f.note}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -474,6 +683,77 @@ function Capture() {
       <GuestTabs active="capture" />
     </main>
   );
+}
+
+/** Center-crops the live video to `ar` -- exactly how the viewfinder shows
+ * it with object-cover -- then downscales to PREVIEW_EDGE_PX and returns
+ * bare base64 JPEG.
+ *
+ * The crop is a correctness requirement, not just bandwidth thrift.
+ * /analyze/preview returns rectangles normalized to whatever frame it was
+ * handed, and the overlay paints them straight onto the displayed video
+ * box. Send the raw uncropped sensor frame and every box lands visibly
+ * offset from the thing it claims to be pointing at. */
+function grabPreviewFrame(
+  video: HTMLVideoElement,
+  canvas: HTMLCanvasElement,
+  ar: number,
+): string | null {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return null;
+
+  const cropW = Math.min(vw, vh * ar);
+  const cropH = cropW / ar;
+  const sx = (vw - cropW) / 2;
+  const sy = (vh - cropH) / 2;
+
+  const scale = PREVIEW_EDGE_PX / Math.max(cropW, cropH);
+  canvas.width = Math.max(1, Math.round(cropW * scale));
+  canvas.height = Math.max(1, Math.round(cropH * scale));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.8).split(",")[1] ?? null;
+}
+
+/** Normalized 0..1 rect -> CSS percentages, so the overlay scales with the
+ * viewfinder at any screen size without knowing its pixel dimensions. */
+function pct(r: { x: number; y: number; w: number; h: number }) {
+  return {
+    left: `${r.x * 100}%`,
+    top: `${r.y * 100}%`,
+    width: `${r.w * 100}%`,
+    height: `${r.h * 100}%`,
+  };
+}
+
+const STRENGTH_COPY: Record<string, string> = {
+  slight: "slightly",
+  moderate: "a little",
+  large: "a good way",
+};
+
+/** Instructions are phrased as camera moves, so they read from
+ * pan_camera_*, NOT move_subject_* -- those two are inverses of each
+ * other (to push the subject right in frame you turn the camera left).
+ * Picking the wrong field renders correct arithmetic as a backwards
+ * arrow, which is worse than showing nothing at all because it still
+ * looks authoritative. See ai_engine.compute_ar_guide's docstring. */
+function panInstruction(g: ComposePreview["ar_guide"]): { arrows: string; text: string } | null {
+  const arrows: string[] = [];
+  const words: string[] = [];
+  if (g.pan_camera_x !== "centered") {
+    arrows.push(g.pan_camera_x === "left" ? "←" : "→");
+    words.push(g.pan_camera_x === "left" ? "PAN LEFT" : "PAN RIGHT");
+  }
+  if (g.pan_camera_y !== "centered") {
+    arrows.push(g.pan_camera_y === "up" ? "↑" : "↓");
+    words.push(g.pan_camera_y === "up" ? "TILT UP" : "TILT DOWN");
+  }
+  if (!words.length) return null;
+  const how = STRENGTH_COPY[g.strength];
+  return { arrows: arrows.join(" "), text: `${words.join(" · ")}${how ? ` ${how}` : ""}` };
 }
 
 /** This backend has no photo-binary storage of its own -- the only way

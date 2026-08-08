@@ -18,6 +18,17 @@ list and manual demo commands: [README.md](README.md).
   `store.photos()` strips `image_base64` back out of the list response for
   the same reason, and adds `taken_at` (already on the event as
   `created_at`, just not exposed until a client needed it for display).
+  `POST /analyze/preview` is the live-viewfinder sibling of `/analyze`:
+  same models, same `to_thread` offload, but it appends **no** events —
+  a camera calls it every 1.5s against a frame that has no `photo_id` and
+  was never shot, so persisting those would flood the log, gossip every
+  one to all three nodes, and drag `/zones`' `avg_aesthetic` toward
+  frames no guest kept. It is bounded by a `PREVIEW_CONCURRENCY`
+  semaphore and sheds excess with 503 rather than queueing (guidance for
+  a frame the guest already panned away from is worse than none), and
+  caps the request body — measured at ~37ms/frame with `/health` staying
+  under 10ms alongside it, so the asyncio loop and raft's 50ms heartbeat
+  are unaffected.
   `/chaos/partition/{i}` and `/chaos/heal` are gated by
   `require_operator_token` (checks `X-Operator-Token` against
   `OPERATOR_TOKEN` with `secrets.compare_digest`) — fails open when
@@ -64,8 +75,23 @@ list and manual demo commands: [README.md](README.md).
   node.
 - `ai_engine.py` — pretrained-only photo analysis (no training anywhere):
   saliency subject detection, a rule-of-thirds AR reframe guide, CLIP
-  film-stock suggestion, and a CLIP-embedding aesthetic score. Wired up
-  as `POST /analyze` in `main.py`, which runs it on a thread (it's
+  film-stock suggestion, and a CLIP-embedding aesthetic score. Two entry
+  points that differ in *persistence, not computation*: `analyze()` is the
+  post-capture path whose `aesthetic_score` is written to the event log,
+  and `preview()` is the live-viewfinder path (`POST /analyze/preview`)
+  that computes strictly more — a subject box, a crop rectangle
+  (`compute_reframe`), a dominant-colour read (`describe_scene`) and a
+  templated recommendation sentence (`compose_reason`) — and writes
+  nothing at all. `compute_ar_guide` returns `move_subject_*` *and* its
+  inverse `pan_camera_*` explicitly, because a UI that renders the wrong
+  one shows a confidently backwards arrow; it also reports `strength`
+  bucketed off the real dx/dy magnitude so copy like "a little" tracks
+  the measurement instead of being a fixed adverb. `FILM_STOCKS`' keys
+  are a contract with `client-2/src/guest/data.ts` (rename one side alone
+  and the recommendation silently stops matching anything), and each
+  stock carries several short prompts that get ensembled — see the
+  Gotchas entry on CLIP class priors for why one long prompt each did not
+  work. Wired up as `POST /analyze` in `main.py`, which runs it on a thread (it's
   synchronous CPU-bound ONNX/OpenCV work — awaiting it directly would
   stall this node's asyncio loop, and gossip/raft both depend on that
   loop staying responsive). Models are downloaded on first use into
@@ -144,6 +170,19 @@ list and manual demo commands: [README.md](README.md).
   - `POST /analyze` fires automatically after each photo syncs (see
     `outbox.ts`) — the first time either client has actually exercised
     `ai_engine.py`'s aesthetic pipeline instead of leaving it dark.
+  - `src/routes/capture.tsx` also runs a live **AI compose** overlay
+    before the shutter: a 1.5s loop posts a 224px frame to
+    `/analyze/preview` and draws the subject box, the crop rectangle with
+    its zoom factor, a camera-move instruction, and the recommendation
+    sentence. `grabPreviewFrame()` center-crops the video to the selected
+    ratio before sending — a correctness requirement, not bandwidth
+    thrift, since the returned rects are normalized to whatever frame was
+    sent and get painted straight onto the displayed video box. Every
+    element is gated on the engine actually having found something
+    (`subject_found`, `worth_it`, `confident`), and the whole overlay
+    goes silent — not stale — when no node answers, since capture and the
+    outbox are local and a partition should cost a guest advice, never a
+    photo.
   - `src/routes/console.tsx` — the operator console: real Raft
     term/role and gossip/partition state polled from all 3 nodes, an
     event tape built from *observed state diffs* (term changes, peer
@@ -408,6 +447,71 @@ instead of `client/`'s Dexie/service-worker one).
   guest sitting in the real gallery. Don't run these test scripts
   against a cluster you care about the data in — check `netstat`/`lsof`
   for 8001-8003 first, or only run them when nothing else is up.
+- **Zero-shot CLIP with one hand-written prompt per class has a class
+  prior that can swamp the actual signal.** The film-stock suggester
+  originally used one long prompt per stock. Measured against 18 real
+  reference frames — a night motorcycle, a dappled-sun truck, a sunflower
+  field, and near-black end cards — **one stock won all 18**, because a
+  long prompt full of generic photographic words picks up a constant
+  offset (`gold_200` sat at a mean +0.034 while the rest were near zero)
+  larger than the per-image variation (0.02–0.056). Two fixes together:
+  mean-center the text embeddings to remove the component every prompt
+  shares, and ensemble several *short* prompts per class (CLIP's own
+  zero-shot recipe). After both, the same 18 frames split across 4
+  different stocks. If you add a stock, keep its prompts short and
+  comparable in specificity, and re-measure the winner distribution
+  rather than eyeballing one image. Because the resulting margins are
+  genuinely small, `preview()` also reports `confident`
+  (`CONFIDENT_MARGIN`) so a coin-flip is never rendered in the same voice
+  as a clear win.
+- **Excluding "blown highlights" with `V > 250` throws away every pixel
+  of a fully saturated image.** `describe_scene`'s first version masked
+  out both very dark and very bright pixels before its hue histogram.
+  A vivid orange is `V=255` with plenty of hue, so a bright sunset came
+  back as *"dim, near-colorless light"* with mean S and V both exactly
+  0.0 — the mask had emptied the array. The correct test for "this pixel
+  has no usable hue" is the saturation gate, not brightness; only the
+  dark floor is a legitimate exclusion.
+- **Locating a subject in a saliency map: two obvious approaches are
+  both wrong, and the second is wrong in a way that inverts the
+  guidance.** Worth reading before "improving" `_saliency_subject`,
+  because both were tried and measured.
+  (1) *Whole-image statistics over every above-Otsu pixel* (min/max, or
+  a 6th/94th percentile) collapse to ~90% of the frame on any real
+  photograph — foliage, gravel and fabric speckle saliency everywhere —
+  which silently makes the reframe a permanent no-op, since a crop that
+  size is never tighter than what's already framed.
+  (2) *The strongest connected component* fixes that and breaks
+  differently: spectral residual responds to **edges, not filled
+  regions**, so one object answers as several fragments (a uniform
+  square splits into separate left-edge and right-edge blobs) and the
+  winning fragment's centroid sits off to one side. Worse, the dimly-lit
+  background that survives thresholding drags the centroid toward the
+  frame centre — measured on synthetic subjects at x=0.22 and x=0.72,
+  the reported positions were 0.40 and 0.53, both close enough to centre
+  to cross the nearest rule-of-thirds line and **tell the user to move
+  the camera the wrong way**. Correct arithmetic, backwards advice,
+  which is the exact failure this feature is supposed to avoid.
+  The fix that holds: keep only the top `SUBJECT_TOP_PCT` of the blurred
+  map's saliency mass (drops the background doing the centre-pulling),
+  weight by height *above* that threshold, and take the weighted
+  centroid — an object's several edge responses then average back onto
+  the object. Extent comes from the weighted standard deviation, and
+  `found` is false when that spread exceeds `SUBJECT_DIFFUSE_MAX`.
+  Centroid error against four synthetic subjects at known positions is
+  ≤1px per axis; if you change any of this, re-run that check rather
+  than eyeballing one photo, since the failure mode is a *plausible*
+  box in the wrong place.
+- **`test_ai_engine.py` (and its siblings) `os.remove()` `./node1.db`
+  through `./node3.db` on cleanup — the same files the demo cluster
+  uses.** This is the sharper edge of the port-collision gotcha below: it
+  isn't only that a test run pollutes live data, it's that the run
+  *deletes those databases when it finishes*. And because the test also
+  attaches to whatever DBs already exist, running it against a populated
+  demo cluster fails in a confusing way first (`expected 3
+  aesthetic_score events` counting 109 pre-existing ones) before wiping
+  them. Back the `.db` files up, or only run these with nothing else set
+  up on 8001-8003.
 - **`useSyncExternalStore`'s snapshot function must return a stable
   reference when nothing changed, or it loops forever.**
   `client-2/src/lib/outbox.ts`'s first version re-parsed the
@@ -438,6 +542,23 @@ instead of `client/`'s Dexie/service-worker one).
   the custom loader unconditional so the literal file value always
   wins. If a secret contains `$`, don't trust any `.env` value you
   haven't verified end-to-end.
+- **Testing the camera on a real phone needs three separate things, and
+  each fails silently on its own.** `client-2`'s capture route uses
+  `getUserMedia`, which requires a *secure context*; only `localhost` is
+  exempt. So on a phone at `http://192.168.x.x:8080` the app loads
+  perfectly and simply has no camera — the route's own error copy
+  ("NEEDS HTTPS OR LOCALHOST") is the only clue. Enabling HTTPS then
+  breaks the backend calls two more ways: an HTTPS page may not fetch
+  `http://` URLs (mixed content), and `127.0.0.1:8001` means *the phone*
+  when the page is running on a phone. `vite.config.ts` handles all
+  three: a dev cert from `certs/` (gitignored; the LAN IPs must be in
+  `subjectAltName` — browsers stopped honouring CN for host matching
+  years ago), plus a `/n1,/n2,/n3` same-origin proxy to the nodes that
+  the guest app is pointed at with `VITE_NODE_URLS`. The operator
+  console is deliberately unaffected: it reads `api.ts`'s `CLUSTER`
+  (absolute URLs) rather than `NODES`, because `/chaos/partition`
+  indexes positionally into a specific node's own `PEERS` list. Missing
+  cert files fall back to HTTP rather than failing to boot.
 - **A dev server bound with `--host` on a port that's already taken
   silently moves to the next one, and the old process on the old port
   doesn't stop just because you meant to replace it.** Running

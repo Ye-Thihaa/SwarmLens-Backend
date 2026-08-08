@@ -32,6 +32,7 @@ the consistent-hashing ring matches how peers already refer to it.
 | GET  | `/zones/quorum?R=&W=` | quorum read: union raw events from R of N random nodes and recompute; W is echoed back for the CAP narrative only |
 | GET  | `/zones/events` | this node's raw photo/like/aesthetic_score events, undigested — what quorum reads fetch from each sampled peer |
 | POST | `/analyze` | photo_id + image_base64 -> {ar_guide, suggested_filter, aesthetic_score}; writes an aesthetic_score event |
+| POST | `/analyze/preview` | live viewfinder: image_base64 + aspect -> subject box, crop rect + zoom, camera-move guide, film-stock picks, reason sentence. Writes **nothing**; sheds with 503 when busy |
 | GET  | `/health` | event count, version vector, gossip stats |
 | POST | `/gossip/sync` | peer-to-peer: exchange digest, return missing events |
 | POST | `/gossip/push` | peer-to-peer: deliver events the peer lacks |
@@ -158,7 +159,36 @@ everything else already does, no second replication path.
 confirms the AR guide direction is sane for an intentionally off-center
 subject, confirms suggested_filter differs between a sunset-gradient and
 a flat-gray image, and confirms the aesthetic_score event count matches
-across all three nodes' `.db` files after a gossip round.
+across all three nodes' `.db` files after a gossip round. **It deletes
+`./node1.db`-`./node3.db` when it finishes** — back them up first if the
+demo cluster has data you care about.
+
+### Live guidance before the shutter (`POST /analyze/preview`)
+
+Same models, run on the viewfinder instead of on a saved photo, so the
+guest gets composition help *while* framing rather than a verdict after.
+It returns a subject box, a rule-of-thirds crop rectangle with its zoom
+factor, a camera-move instruction, ranked film-stock picks, and a
+one-line reason built from the scene's measured dominant colours.
+
+It writes **nothing** — that is the whole distinction from `/analyze`.
+A camera calls it every 1.5s against a frame with no `photo_id` that was
+never shot; appending those would flood the replicated log and skew
+`avg_aesthetic` with frames no guest kept. It is also semaphore-bounded
+and sheds with 503 rather than queueing, since guidance computed for a
+frame the guest already panned away from is worse than none.
+
+    curl -X POST localhost:8001/analyze/preview -H 'content-type: application/json' \
+      -d '{"image_base64":"<base64 jpeg>","aspect":0.75}'
+
+Two directions come back and they are inverses: `move_subject_*` is
+which way the subject should shift *in the frame*, `pan_camera_*` is
+which way to turn the camera to achieve that. Anything phrased as an
+instruction must read `pan_camera_*` — rendering the other one gives a
+confidently backwards arrow. `strength` buckets the real dx/dy
+magnitude, and `confident` is false when the top two film stocks are
+within `CONFIDENT_MARGIN`, so a tie is never presented as a preference.
+`client-2`'s camera consumes all of this (see its AI compose overlay).
 
 ## Vector clocks (concurrent events)
 

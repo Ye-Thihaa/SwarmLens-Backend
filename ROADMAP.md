@@ -641,6 +641,114 @@ a direct call to `/chaos/*` post-auth, only the `_serverFn` proxy.
 
 ---
 
+## Live AI compose guidance — done (outside the phase numbering)
+
+`POST /analyze/preview` + the AI compose overlay in
+`client-2/src/routes/capture.tsx`. Moves `ai_engine.py`'s existing
+analysis from *after* the shutter to *before* it, so the guest gets
+composition help while framing instead of a verdict once the photo is
+already taken.
+
+Almost nothing new had to be invented on the model side — saliency,
+CLIP film-stock matching and the aesthetic head were all already there,
+and `/analyze` was already returning `ar_guide` and `suggested_filter`
+to a client that read neither. What was missing was a crop rectangle
+(`compute_reframe`), a scene colour read (`describe_scene`), a
+recommendation sentence (`compose_reason`, templated from measured
+values — no LLM, no new dependency), and film-stock keys that matched
+the guest UI's actual strip, which finally cashed the placeholder TODO
+`FILM_STOCKS` had carried since the engine was written.
+
+**The one real design constraint:** `/analyze` appends an
+`aesthetic_score` event, and a viewfinder calls this every 1.5s against
+a frame that has no `photo_id` and was never shot. So the preview path
+computes strictly more and persists strictly nothing. It's also
+semaphore-bounded and sheds with 503 instead of queueing — guidance for
+a frame the guest has already panned away from is worse than no
+guidance. Measured at ~37ms per frame with `/health` staying under 10ms
+alongside it, so raft's 50ms heartbeat is untouched.
+
+**Four real bugs found by measuring rather than eyeballing:**
+
+1. **One CLIP prompt per film stock produced a class prior that beat the
+   signal.** Across 18 real reference frames, *one stock won all 18* —
+   including near-black ones — because a long prompt full of generic
+   photographic words carries a constant offset (+0.034 mean) larger
+   than the per-image variation (0.02–0.056). Fixed by mean-centering
+   the text embeddings and ensembling several short prompts per stock
+   (CLIP's own zero-shot recipe). The same 18 frames then split across 4
+   stocks, and the vivid yellow motorcycle picked the saturated stock —
+   the same call the reference app made.
+2. **A "blown highlight" mask (`V > 250`) discarded every pixel of a
+   fully saturated image.** A bright orange sunset came back as *"dim,
+   near-colorless light"* with mean saturation and brightness both
+   exactly 0.0 — the mask had emptied the array. Saturation, not
+   brightness, is the correct test for "no usable hue".
+3. **Whole-image saliency statistics collapse to the whole image.** Both
+   min/max and a 6th/94th percentile bbox returned a subject box
+   covering ~90% of every real photo (foliage and gravel speckle
+   saliency everywhere), which silently made the reframe a permanent
+   no-op. Fixed with blur → threshold → morphology → strongest connected
+   component, ranked on mean saliency × area.
+4. **A featureless image produced a confident 4× zoom into an empty
+   corner.** With nothing salient, Otsu picked up a handful of noise
+   pixels and the reframe dutifully built a rectangle around them. Fixed
+   with area bounds on what counts as a subject at all — below the floor
+   it's speckle, above the ceiling it *is* the scene — and the UI draws
+   nothing when `subject_found` is false.
+
+5. **The subject detector inverted the guidance near a thirds line** —
+   found only after the browser test "passed". Picking the strongest
+   connected component (the fix for bug 3) breaks differently: spectral
+   residual answers on *edges*, so one object splits into separate
+   fragments and the winner's centroid sits off to one side, while the
+   dim background that survives thresholding drags it toward frame
+   centre. Synthetic subjects at x=0.22 and x=0.72 were reported at 0.40
+   and 0.53 — both close enough to centre to cross the nearest
+   rule-of-thirds line, so the arrow told the user to move the camera
+   **the wrong way**. The earlier browser test missed it because its
+   subject was far enough off-centre to survive the pull. Fixed by
+   keeping only the top few percent of saliency mass and taking a
+   saliency-weighted centroid: error against four known-position
+   subjects dropped to ≤1px per axis, and the directions came back
+   correct.
+
+Because the resulting film-stock margins are genuinely small, the
+response also carries `confident`; when the top two are within
+`CONFIDENT_MARGIN` the sentence says *"no strong preference here"* and
+the strip stops auto-applying, rather than dressing a coin flip up as a
+recommendation. The same principle drove exposing both `move_subject_*`
+and its inverse `pan_camera_*` explicitly: instructions read the latter,
+because rendering the former as an arrow is correct arithmetic turned
+into confidently backwards advice.
+
+Verified live in a browser against the real 3-node cluster. The sandbox
+has no webcam, so the camera was replaced with a canvas stream whose
+composition was known in advance — subject drawn hard left at x≈0.12,
+whose only correct instruction is "pan left". The overlay produced
+exactly that (plus TILT DOWN, also correct for the drawn centroid), and
+the subject box landed at centre (0.125, 0.471) against a drawn truth of
+(0.121, 0.469). The crop rectangle measured exactly 3:4 at 1.52×,
+matching its own label. Across the whole session all three nodes stayed
+at 109 events — the live preview traffic wrote nothing, as designed.
+Killing all three nodes cleared the overlay to *"GUIDANCE OFFLINE ·
+SHUTTER UNAFFECTED"* rather than leaving stale boxes on screen, the
+shutter still queued a frame to the outbox with the cluster down, and
+guidance resumed on its own when the nodes came back.
+
+**Phone testing (HTTPS).** `getUserMedia` needs a secure context and
+only `localhost` is exempt, so over plain HTTP the app loads on a phone
+and silently has no camera at all. `client-2/vite.config.ts` now serves
+dev HTTPS from a gitignored `certs/` pair (LAN IPs in `subjectAltName`,
+since CN hasn't been honoured for host matching in years) and proxies
+`/n1,/n2,/n3` to the three nodes — which also solves the two problems
+HTTPS creates on its own: an HTTPS page can't fetch `http://` (mixed
+content), and `127.0.0.1` means *the phone* when the page runs on one.
+The guest app follows `VITE_NODE_URLS`; the operator console is
+untouched because it reads `CLUSTER` directly. Real-camera behaviour is
+still unverified by this session — the sandbox has no webcam and the
+in-app browser won't accept a self-signed cert.
+
 ## Suggested pacing (8 weeks, solo, from here)
 
 | Week | Phase |

@@ -139,8 +139,14 @@ def main():
         r2 = analyze(8001, pid2, sunset_gradient_image())
         r3 = analyze(8001, pid3, flat_gray_image())
         print("sunset ->", r2["suggested_filter"], " | flat gray ->", r3["suggested_filter"])
-        if r2["suggested_filter"] != "golden_hour":
-            print(f"FAIL: sunset-gradient image should suggest golden_hour, got {r2['suggested_filter']}")
+        # Asserted as a set, not one exact key: a vivid orange gradient
+        # genuinely suits either colour-forward warm stock, and pinning the
+        # single winner would make this test fail on prompt wording rather
+        # than on the engine actually breaking.
+        WARM_COLOR_STOCKS = {"ektar_100", "gold_200"}
+        if r2["suggested_filter"] not in WARM_COLOR_STOCKS:
+            print(f"FAIL: vivid warm gradient should suggest one of {WARM_COLOR_STOCKS}, "
+                  f"got {r2['suggested_filter']}")
             return 1
         if r2["suggested_filter"] == r3["suggested_filter"]:
             print("FAIL: two very different images both got the same suggested_filter")
