@@ -498,30 +498,12 @@ function Capture() {
                     </div>
                   )}
 
-                  {/* Top banner: scanning until the first real reading lands,
-                      then the measured reason for the recommendation. */}
-                  <div className="absolute inset-x-0 top-0 flex justify-center p-2">
-                    {ai ? (
-                      <span className="max-w-[92%] rounded-sm bg-emulsion/85 px-2 py-1 text-center font-mono text-[0.55rem] leading-relaxed tracking-[0.1em] text-fixer">
-                        {ai.reason}
-                      </span>
-                    ) : !reachable ? (
-                      <span className="rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-stale">
-                        GUIDANCE OFFLINE · SHUTTER UNAFFECTED
-                      </span>
-                    ) : aiScanning ? (
-                      <span className="settling rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-drifting">
-                        READING THE LIGHT · HOLD STILL
-                      </span>
-                    ) : null}
-                  </div>
-
-                  {ai && (
-                    <span className="absolute bottom-2 left-2 rounded-sm bg-emulsion/80 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-fixer-dim">
-                      LOOKS {ai.aesthetic_score.toFixed(1)}/10
-                      {!ai.confident && " · NO STRONG STOCK"}
-                    </span>
-                  )}
+                  {/* The reason banner and the score readout are NOT here --
+                      see the container-level block below. Only things that
+                      must line up with frame coordinates (the subject box,
+                      the crop rect, the nudge) belong inside the viewfinder;
+                      text pinned to its edges lands underneath the camera's
+                      own chrome. */}
                 </div>
               )}
               {stamp && (
@@ -585,6 +567,40 @@ function Capture() {
               <div className="absolute inset-y-16 left-1/3 w-px bg-fixer/20" />
               <div className="absolute inset-y-16 left-2/3 w-px bg-fixer/20" />
             </>
+          )}
+
+          {/* AI compose text, anchored to the SCREEN rather than to the
+              viewfinder. The camera's own chrome -- the EI/FRAME readout at
+              top-0 and the zone chips at top-16 -- is positioned against the
+              container, so anything pinned to the viewfinder's top edge
+              renders underneath it: on a phone this clipped the reason
+              sentence mid-word ("...rops the color and leans on contrast").
+              At 375px wide the chips already wrap to two rows and end at
+              y=133; 10rem leaves room for a third row on a narrower phone
+              while still sitting well above the nudge at the viewfinder's
+              centre (y~345). */}
+          {aiOn && (
+            <div className="absolute inset-x-0 top-[10rem] flex flex-col items-center gap-1 px-4">
+              {ai ? (
+                <span className="max-w-full rounded-sm bg-emulsion/85 px-2 py-1 text-center font-mono text-[0.55rem] leading-relaxed tracking-[0.1em] text-fixer">
+                  {ai.reason}
+                </span>
+              ) : !reachable ? (
+                <span className="rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-stale">
+                  GUIDANCE OFFLINE · SHUTTER UNAFFECTED
+                </span>
+              ) : aiScanning ? (
+                <span className="settling rounded-sm bg-emulsion/85 px-2 py-1 font-mono text-[0.55rem] tracking-[0.16em] text-drifting">
+                  READING THE LIGHT · HOLD STILL
+                </span>
+              ) : null}
+              {ai && (
+                <span className="rounded-sm bg-emulsion/80 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-fixer-dim">
+                  LOOKS {ai.aesthetic_score.toFixed(1)}/10
+                  {!ai.confident && " · NO STRONG STOCK"}
+                </span>
+              )}
+            </div>
           )}
 
           {showNudge && topZone && topZone.zone !== zone && (
