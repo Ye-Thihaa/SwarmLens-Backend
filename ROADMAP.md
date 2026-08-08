@@ -258,32 +258,55 @@ it self-corrects.
 
 ---
 
-## Phase 5 — backend slice done, guest client not started
+## Phase 5 — done, including a guest client (functional scaffold, not the branded UI)
 
-The backend half only: `store.py`'s `events` table gained a `vclock`
-column (JSON text, envelope metadata alongside origin/seq/kind, not
-payload). `POST /photos` and `POST /likes` accept an optional `vclock:
-{device_id: counter}`; events created internally (job leases, recap,
-aesthetic_score) default to `{}` since there's no guest device behind
-them. `GET /photos` computes `concurrent_with` per photo: other
-photo_ids whose vclock neither dominates nor is dominated by this one,
-so a gallery UI can render them side by side instead of implying a false
-total order from arrival time. An empty vclock (no client attached one --
-true of every photo posted anywhere else in this repo, since no guest
-client exists yet) is never flagged concurrent with anything; that would
-assert causal knowledge that doesn't exist.
+Backend half: `store.py`'s `events` table gained a `vclock` column (JSON
+text, envelope metadata alongside origin/seq/kind, not payload).
+`POST /photos` and `POST /likes` accept an optional `vclock: {device_id:
+counter}`; events created internally (job leases, recap, aesthetic_score)
+default to `{}` since there's no guest device behind them. `GET /photos`
+computes `concurrent_with` per photo: other photo_ids whose vclock
+neither dominates nor is dominated by this one, so a gallery UI can
+render them side by side instead of implying a false total order from
+arrival time. An empty vclock (no client attached one) is never flagged
+concurrent with anything; that would assert causal knowledge that
+doesn't exist. Verified via `test_vclock.py` (simulated devices) --
+see below for the same mechanism verified again through a real client.
 
-The React/TS PWA (Dexie.js outbox, localStorage vector clock, Background
-Sync API service worker) is unbuilt -- that repo isn't attached alongside
-this backend, so there's nothing to wire it into yet. `test_vclock.py`
-simulates a couple of guest "devices" attaching clocks directly to
-`POST /photos` (since there's no real client to generate them) and
-confirms: two independent devices' photos are mutually concurrent; a
-photo whose clock causally includes an earlier one is correctly *not*
-flagged concurrent (happened-after, not simultaneous); a bare photo with
-no vclock is never flagged concurrent with anything; and the vclock
-field (plus the concurrency relationships it implies) survives gossip
-replication to the other two nodes unchanged.
+Guest half: `client/` -- React 19 + TypeScript PWA (Vite), Dexie.js
+`outbox` table, `localStorage` vector clock, a service worker with a
+real Background Sync handler (`vite-plugin-pwa`, `injectManifest`
+strategy). This is a functional reference implementation proving the
+offline-queue + causal-ordering mechanism end to end, not the polished,
+branded guest UI described elsewhere in the project's task list (AR
+reframe overlay, film-stock auto-selection from `POST /analyze`) --
+that's a separate frontend not attached to this working directory. See
+`client/README.md` for the full stack rationale.
+
+Verified live in a browser against the real 3-node cluster (not just
+unit tests): shutter capture writes to the outbox and renders
+optimistically; the sync engine picks a reachable node and POSTs with
+the device's vclock attached, returning a real `photo_id`; the gallery
+renders this device's own synced photos with their real local image
+(this backend has no photo-binary storage of its own -- see
+`ai_engine.py`'s `/analyze` docstring -- so only locally-captured photos
+have real bytes available; everything else renders as a metadata-only
+card); killing the backend mid-capture leaves the photo visibly queued;
+restarting the backend and waiting -- no manual action -- the periodic
+foreground retry picks it up automatically and syncs it; and three
+photos posted with mutually non-dominating vector clocks rendered as one
+concurrent cluster with a badge, not three separately-ordered items --
+the same `_concurrent` logic from `main.py`, now exercised through a
+real client instead of a simulated one.
+
+**Cross-browser note on Background Sync:** the spec's "Background Sync
+API retries the outbox whenever connectivity returns, without you
+polling manually" is real (`client/src/sw.ts`'s `sync` event handler),
+but Background Sync API is Chromium-only -- no Safari, no Firefox. The
+primary, universally-supported retry path is a foreground `online`
+listener + a 10s poll (`OutboxStatus.tsx`); Background Sync is a
+progressive enhancement on top of that (retries even with the tab
+closed, on browsers that support it), not the only mechanism.
 
 <details>
 <summary>Original spec</summary>

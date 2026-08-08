@@ -94,6 +94,17 @@ list and manual demo commands: [README.md](README.md).
   (gitignored). Found and fixed a real concurrency bug in `store.py`
   (see the Gotchas section) — see the full writeup and numbers from a
   real run in ROADMAP.md's Phase 8 section.
+- `client/` — Phase 5's guest client: React 19 + TypeScript PWA (Vite),
+  Dexie.js offline `outbox`, `localStorage` vector clock, a service
+  worker with a real Background Sync handler (`vite-plugin-pwa`,
+  `injectManifest` strategy — needed for a custom `sync` event handler,
+  which the default `generateSW` strategy doesn't support). A functional
+  reference implementation proving the offline+causal-ordering mechanism,
+  not the polished branded guest UI described elsewhere in the project's
+  task list — that's a separate, unattached frontend. See
+  `client/README.md` for the full stack breakdown and rationale, and the
+  Phase 5 writeup in ROADMAP.md for what was verified live in a browser
+  against the real backend.
 
 ## Run it
 
@@ -109,6 +120,12 @@ NODE_ID=node3 DB_PATH=./node3.db SELF_URL=http://127.0.0.1:8003 PEERS=http://127
 one that appears in *their* `PEERS` lists) — see the Gotchas section.
 
 Or `docker compose up --build` (nodes land on :8001-8003).
+
+Guest client (needs the backend already running): `cd client && npm
+install && npm run dev` — Vite dev server on :5173, talks to
+`localhost:8001-8003` by default (override with `VITE_NODE_URLS`). A
+`.claude/launch.json` entry (`swarmlens-client`) is already set up for
+`preview_start` if driving it through the Browser tool.
 
 Tests:
 - `python test_raft.py` — spins up 3 nodes itself, confirms leader
@@ -162,18 +179,19 @@ Tests:
 
 ## Current status
 
-All of Phases 0-8 are done from the backend side (gossip replication,
-worker leases, Raft election, consistent-hash zone ownership, quorum
-reads, vector clocks, cloud archive sync, chaos/metrics dashboard, load
-test), plus the AI analysis engine (`ai_engine.py`, `POST /analyze`) that
-sits outside the phase numbering. See ROADMAP.md for the full
-phase-by-phase writeup, including two real bugs Phase 8's load test
-found (one in `store.py`, described in the Gotchas section below) and
-the actual measured numbers. Not started, and can't be from this working
-directory: the guest client itself (Dexie.js outbox, localStorage vector
-clock, service worker -- Phase 5's other half), and wiring the guest UI
-+ operator console to this backend -- neither of those repos is attached
-alongside this one.
+All of Phases 0-8 are done (gossip replication, worker leases, Raft
+election, consistent-hash zone ownership, quorum reads, vector clocks —
+backend *and* a working guest client in `client/` — cloud archive sync,
+chaos/metrics dashboard, load test), plus the AI analysis engine
+(`ai_engine.py`, `POST /analyze`) that sits outside the phase numbering.
+See ROADMAP.md for the full phase-by-phase writeup, including two real
+bugs Phase 8's load test found (one in `store.py`, described in the
+Gotchas section below), the actual measured numbers, and what was
+verified live in a browser for the guest client. Not started, and can't
+be from this working directory: wiring the *actual* branded guest UI and
+operator console to this backend — neither of those repos is attached
+alongside this one (`client/` is a functional stand-in for the guest
+half, proving the offline+vclock mechanism, not that design).
 
 ## Gotchas hit so far (don't reintroduce these)
 

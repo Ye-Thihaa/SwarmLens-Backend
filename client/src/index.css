@@ -1,0 +1,271 @@
+:root {
+  --bg: #111318;
+  --surface: #1b1e26;
+  --border: #2a2e38;
+  --text: #e8e9ec;
+  --muted: #8b93a3;
+  --accent: #4a90d9;
+  --good: #2ecc71;
+  --bad: #e74c3c;
+  color-scheme: dark;
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  overscroll-behavior: none;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  max-width: 480px;
+  margin: 0 auto;
+  background: var(--bg);
+}
+
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.app-title {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.app-main {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.tab-bar {
+  display: flex;
+  border-top: 1px solid var(--border);
+}
+
+.tab-bar button {
+  flex: 1;
+  padding: 14px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.tab-bar button.active {
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+/* outbox status pill */
+.outbox-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.outbox-status .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--good);
+}
+
+.outbox-status.offline .dot {
+  background: var(--bad);
+}
+
+/* capture screen */
+.capture-screen {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  background: #000;
+}
+
+.viewfinder {
+  flex: 1;
+  width: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+.camera-error {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 24px;
+  color: var(--muted);
+}
+
+.flash {
+  position: absolute;
+  inset: 0;
+  background: #fff;
+  animation: flash-fade 150ms ease-out;
+  pointer-events: none;
+}
+
+@keyframes flash-fade {
+  from {
+    opacity: 0.8;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.capture-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.zone-picker {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+}
+
+.shutter {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: #fff;
+  border: 4px solid rgba(255, 255, 255, 0.4);
+  cursor: pointer;
+}
+
+.shutter:disabled {
+  opacity: 0.4;
+}
+
+/* gallery */
+.gallery-screen {
+  padding: 12px 16px 24px;
+}
+
+.gallery-screen h2 {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 18px 0 8px;
+}
+
+.node-tag {
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--good);
+  margin-left: 8px;
+}
+
+.node-tag.offline {
+  color: var(--bad);
+}
+
+.empty {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.photo-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.concurrent-cluster {
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.concurrent-badge {
+  font-size: 11px;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+
+.photo-card {
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.photo-card img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  display: block;
+}
+
+.photo-placeholder {
+  width: 100%;
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  padding: 8px;
+}
+
+.photo-meta {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.badge {
+  border-radius: 10px;
+  padding: 1px 6px;
+  font-size: 10px;
+}
+
+.badge.pending {
+  background: rgba(74, 144, 217, 0.2);
+  color: var(--accent);
+}
+
+.badge.error {
+  background: rgba(231, 76, 60, 0.2);
+  color: var(--bad);
+}

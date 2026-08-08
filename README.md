@@ -168,9 +168,9 @@ like. `GET /photos` uses it to compute `concurrent_with` per photo:
 other photo_ids whose clock neither dominates nor is dominated by this
 one, so the gallery can render them side by side instead of implying a
 false total order from network arrival timing. A photo posted with no
-vclock (everything in this repo today, since the guest client itself --
-Phase 5's other half -- doesn't exist yet) is never flagged concurrent
-with anything.
+vclock is never flagged concurrent with anything -- true of everything
+posted by curl, but not of photos from the guest client in `client/`
+(Phase 5's other half), which attaches a real one to every capture.
 
     curl -X POST localhost:8001/photos -H 'content-type: application/json' \
       -d '{"guest_id":"a","zone":"bar","vclock":{"deviceA":1}}'
@@ -277,10 +277,27 @@ not a bug. Throughput scaling with N (81 -> 220 uploads/sec) is the
 direct upside of the same fact: each additional node is another fully
 independent writer.
 
+## Guest client (client/)
+
+Phase 5's other half: a React + TypeScript PWA with an offline Dexie.js
+outbox and a `localStorage` vector clock, so guests can capture photos
+with no connectivity and have them sync -- in original causal order --
+once a node is reachable again.
+
+    cd client
+    npm install
+    npm run dev
+
+Defaults to talking to `localhost:8001,8002,8003`; override with
+`VITE_NODE_URLS` if your cluster runs elsewhere. See
+[`client/README.md`](client/README.md) for the full stack breakdown and
+how it fits together with the backend -- it's a functional reference
+implementation proving the offline+vclock mechanism, not the polished
+branded guest UI (that's a separate, unattached frontend).
+
 ## Next
 
-- guest client itself: Dexie.js offline outbox, localStorage vector
-  clock, Background Sync service worker (Phase 5's other half -- not
-  this repo)
-- wire the guest UI and operator console to this backend (needs those
-  repos attached alongside this one -- not present here yet)
+- wire the *actual* guest UI and operator console to this backend
+  (needs those repos attached alongside this one -- not present here
+  yet; `client/` above is a functional stand-in for the guest half,
+  not that design)
