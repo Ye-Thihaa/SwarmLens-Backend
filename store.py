@@ -138,6 +138,27 @@ class Store:
         row = await cur.fetchone()
         return row["n"] or 0
 
+    async def raw_events(self, kinds: tuple[str, ...]) -> list[dict]:
+        """Every event of the given kinds, undigested. Used by quorum reads,
+        which merge several nodes' partial views by union-ing raw events
+        (idempotent on (origin, seq), same as gossip) and recomputing --
+        not by picking one node's already-aggregated counts as 'the'
+        answer."""
+        placeholders = ",".join("?" for _ in kinds)
+        cur = await self.db.execute(
+            f"SELECT * FROM events WHERE kind IN ({placeholders})", kinds
+        )
+        return [
+            {
+                "origin": r["origin"],
+                "seq": r["seq"],
+                "kind": r["kind"],
+                "payload": json.loads(r["payload"]),
+                "created_at": r["created_at"],
+            }
+            for r in await cur.fetchall()
+        ]
+
     async def event_count(self) -> int:
         cur = await self.db.execute("SELECT COUNT(*) AS n FROM events")
         return (await cur.fetchone())["n"]

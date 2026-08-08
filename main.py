@@ -1,4 +1,5 @@
 import os
+import random
 import uuid
 from contextlib import asynccontextmanager
 
@@ -24,6 +25,7 @@ INTERVAL = float(os.getenv("GOSSIP_INTERVAL", "1.0"))
 # node to node. SELF_URL must be the address peers reach this node at.
 SELF_URL = os.getenv("SELF_URL", "")
 SELF_ID = SELF_URL or NODE_ID
+N = len(PEERS) + 1   # fixed cluster size (this node + its configured peers)
 
 store = Store(DB_PATH, NODE_ID)
 gossip = Gossip(NODE_ID, PEERS, store, INTERVAL)
@@ -61,6 +63,27 @@ async def _zone_scores_local() -> dict[str, dict]:
 
 def _rank(zones) -> list[dict]:
     return sorted(zones, key=lambda z: -(z["likes"] * 2 + z["photos"]))
+
+
+def _zone_scores_from_events(events) -> dict[str, dict]:
+    """Same derivation as _zone_scores_local, but over an arbitrary merged
+    event set instead of this node's own DB -- what /zones/quorum uses to
+    recompute from the union of several nodes' partial views."""
+    photo_zone: dict[str, str] = {}
+    like_guests: dict[str, set] = {}
+    for e in events:
+        p = e["payload"]
+        if e["kind"] == "photo":
+            photo_zone[p["photo_id"]] = p["zone"]
+        elif e["kind"] == "like":
+            like_guests.setdefault(p["photo_id"], set()).add(p["guest_id"])
+
+    scores: dict[str, dict] = {}
+    for photo_id, zone in photo_zone.items():
+        z = scores.setdefault(zone, {"zone": zone, "photos": 0, "likes": 0})
+        z["photos"] += 1
+        z["likes"] += len(like_guests.get(photo_id, ()))
+    return scores
 
 
 @asynccontextmanager
@@ -165,6 +188,71 @@ async def zones_ring():
     scores = await _zone_scores_local()
     owners = {zone: owner_of(zone, ring) for zone in scores}
     return {"node": NODE_ID, "members": members, "owners": owners}
+
+
+@app.get("/zones/events")
+async def zones_events():
+    """Raw photo/like events from this node's own replica, undigested.
+    Not for clients -- this is what /zones/quorum fetches from each node
+    it samples, so it can union events across nodes and recompute rather
+    than trust one node's already-aggregated counts."""
+    return {"node": NODE_ID, "events": await store.raw_events(("photo", "like"))}
+
+
+@app.get("/zones/quorum")
+async def zones_quorum(R: int = 2, W: int = 2):
+    """Quorum read: sample R of N nodes (this node is just one candidate
+    among them, not privileged), union their raw photo/like events --
+    deduped on (origin, seq), the same idempotence key gossip relies on
+    -- and recompute scores from the merge. Which R members get sampled
+    is random on every call, on purpose: that's what makes 'sometimes you
+    land on the stale node' an observable, repeatable demo rather than a
+    one-off.
+
+    With R > N/2, any sample is guaranteed to include at least one node
+    outside a single-node partition, so the union is always complete.
+    With R=1 a sample can land entirely on a partitioned/lagging node and
+    return an undercount until it's healed and gossip catches it up.
+
+    W is accepted and echoed back for the CAP-tradeoff narrative only --
+    this system's writes are always local + eventually gossiped, there's
+    no synchronous quorum write path for W to gate."""
+    R = max(1, min(R, N))
+    W = max(1, min(W, N))
+
+    members = [SELF_ID] + PEERS
+    chosen = random.sample(members, R)
+
+    merged: dict[tuple[str, int], dict] = {}
+    queried, unreachable = [], []
+    async with httpx.AsyncClient(timeout=1.0) as client:
+        for member in chosen:
+            if member == SELF_ID:
+                events = await store.raw_events(("photo", "like"))
+                queried.append(member)
+            else:
+                try:
+                    r = await client.get(f"{member}/zones/events")
+                    r.raise_for_status()
+                    events = r.json()["events"]
+                    queried.append(member)
+                except Exception:
+                    unreachable.append(member)
+                    continue
+            for e in events:
+                merged[(e["origin"], e["seq"])] = e
+
+    scores = _zone_scores_from_events(merged.values())
+    return {
+        "node": NODE_ID,
+        "N": N,
+        "R": R,
+        "W": W,
+        "strongly_consistent": R + W > N,
+        "queried": queried,
+        "unreachable": unreachable,
+        "zones": _rank(list(scores.values())),
+    }
 
 
 # ---------------------------- gossip API ----------------------------

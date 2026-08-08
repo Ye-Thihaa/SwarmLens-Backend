@@ -25,6 +25,12 @@ list and manual demo commands: [README.md](README.md).
   the currently alive cluster. `GET /zones` in `main.py` uses it to route
   each zone to its one owning node instead of every node scoring every
   zone from its own replica.
+- `GET /zones/quorum` (in `main.py`, no separate file — it's short
+  enough to live next to the other zone endpoints) — samples `R` of `N`
+  nodes at random, unions their raw photo/like events (`store.raw_events`
+  / `GET /zones/events`) deduped on `(origin, seq)`, and recomputes
+  scores from the merge. This is the CAP-tradeoff knob: `R` over `N/2`
+  is always fresh, `R=1` can land on a stale/partitioned node.
 
 ## Run it
 
@@ -49,6 +55,11 @@ Tests:
   running nodes needed. Confirms the mapping is deterministic and that
   adding a 4th node to a 3-node ring remaps ~1/4 of zones, not all of
   them.
+- `python test_quorum.py` — spins up 3 nodes, fully (bidirectionally)
+  partitions one, confirms `R=1` quorum reads sometimes return stale
+  data from the partitioned node while `R=2` never does, then heals and
+  confirms `R=1` goes back to reliably fresh. Self-contained like
+  `test_raft.py`.
 - No test file yet for gossip/worker phases — those were verified
   manually per the curl sequences in README.md. Same for the live
   `/zones` ownership/proxy/stale-fallback behavior — verified manually
@@ -56,9 +67,10 @@ Tests:
 
 ## Current status
 
-Phases 0-3 done (gossip replication, worker leases, Raft election,
-consistent-hash zone ownership). See ROADMAP.md for the full phase list
-and what's next (Phase 4: quorum reads).
+Phases 0-4 done (gossip replication, worker leases, Raft election,
+consistent-hash zone ownership, quorum reads). See ROADMAP.md for the
+full phase list and what's next (Phase 5: guest client with offline
+queue + vector clocks).
 
 ## Gotchas hit so far (don't reintroduce these)
 
@@ -92,6 +104,16 @@ and what's next (Phase 4: quorum reads).
   address this node's peers reach it at. If you add another feature that
   builds a member list from `gossip.alive_peers()` plus self, use
   `SELF_ID`, not `NODE_ID`.
+- **`POST /chaos/partition/{i}` only stops *this* node from initiating
+  gossip toward `PEERS[i]` — it does not block the receiving end.** A
+  partitioned peer can still successfully call *your* `/gossip/sync` and
+  `/gossip/push` and pull/push data that way, so a one-sided partition
+  self-heals within a gossip round or two instead of holding. To
+  actually isolate a node for a test (see `test_quorum.py`), partition
+  it in both directions from every other node: each of the other nodes
+  must stop initiating toward it, *and* it must stop initiating toward
+  each of them — 4 calls total to isolate one node in a 3-node cluster,
+  not 1.
 
 ## Conventions
 

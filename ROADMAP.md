@@ -188,6 +188,35 @@ all of them — that's the number for your report.
 
 ---
 
+## Phase 4 — done
+
+Quorum reads (`GET /zones/quorum?R=&W=`, in `main.py`). `N` is fixed at
+`len(PEERS) + 1`. Each call samples `R` of `N` members at random
+(self is just one candidate among them, not privileged), fetches raw
+photo/like events from each via the new `GET /zones/events`, unions them
+deduped on `(origin, seq)` — the same idempotence key gossip already
+relies on — and recomputes zone scores from the merge, rather than
+trusting any single node's already-aggregated counts. `W` is accepted
+and echoed back for the CAP-tradeoff narrative only: this system's
+writes are always local + eventually gossiped, so there's no synchronous
+quorum write path for `W` to actually gate.
+
+One thing the spec's pseudocode glossed over: sampling has to be
+*random* on every call for "sometimes you land on the stale node" to be
+an observable, repeatable demo rather than a coin flip you assert
+happened. `/zones/quorum` re-samples `R` members fresh each request.
+
+Verified (`test_quorum.py`, spins up and fully partitions its own
+3-node cluster): with node3 bidirectionally isolated and a write made
+after the partition, `R=1` against node1 lands on the stale node often
+enough to show real undercounts (21 fresh / 9 stale over 30 tries) while
+`R=2` was fresh 20/20 — any 2-of-3 sample is guaranteed to include a
+node outside a single-node partition. After healing and letting gossip
+catch up, `R=1` went back to consistently fresh (10/10).
+
+<details>
+<summary>Original spec</summary>
+
 ## Phase 4 — Quorum reads (the CAP knob)
 
 **Why.** Makes the consistency/availability tradeoff a parameter you can
@@ -208,6 +237,8 @@ Expose `R` and `W` as query params so you can demo `?R=1` vs `?R=2` live.
 excludes the stale node). With `R=1`, sometimes you land on the
 partitioned node and get stale data — show this live, then heal and show
 it self-corrects.
+
+</details>
 
 ---
 

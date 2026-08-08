@@ -29,6 +29,8 @@ the consistent-hashing ring matches how peers already refer to it.
 | GET  | `/zones`  | emergent aesthetic map, ranked; each zone's score comes from its owning node on the hash ring (`stale: true` if that node is unreachable) |
 | GET  | `/zones/local` | this node's own replica of every zone, no ownership filtering — what peers proxy to |
 | GET  | `/zones/ring` | debug: current ring membership and the zone → owner mapping |
+| GET  | `/zones/quorum?R=&W=` | quorum read: union raw events from R of N random nodes and recompute; W is echoed back for the CAP narrative only |
+| GET  | `/zones/events` | this node's raw photo/like events, undigested — what quorum reads fetch from each sampled peer |
 | GET  | `/health` | event count, version vector, gossip stats |
 | POST | `/gossip/sync` | peer-to-peer: exchange digest, return missing events |
 | POST | `/gossip/push` | peer-to-peer: deliver events the peer lacks |
@@ -81,6 +83,39 @@ test_hashing.py` is a pure unit test confirming the ring's remap
 property: adding a 4th node to a 3-node ring remaps roughly 1/4 of zones,
 not all of them.
 
+## Quorum reads (the CAP knob)
+
+`GET /zones/quorum?R=2&W=2` samples `R` of `N` nodes at random each call
+(`N = len(PEERS) + 1`, fixed), unions their raw photo/like events deduped
+on `(origin, seq)`, and recomputes zone scores from the merge -- more
+honest than trusting one node's already-aggregated counts. `W` is
+accepted and echoed back for the CAP-tradeoff narrative only; this
+system's writes are always local + eventually gossiped, so there's no
+synchronous write-quorum for `W` to gate.
+
+Demo the tradeoff live:
+
+    # fully isolate node3 (both directions, from both other nodes)
+    curl -X POST localhost:8001/chaos/partition/1
+    curl -X POST localhost:8002/chaos/partition/1
+    curl -X POST localhost:8003/chaos/partition/0
+    curl -X POST localhost:8003/chaos/partition/1
+
+    # write after the partition -- reaches node1 + node2, never node3
+    curl -X POST localhost:8001/photos -H 'content-type: application/json' \
+      -d '{"guest_id":"g1","zone":"new_zone","composition_score":93}'
+
+    curl 'localhost:8001/zones/quorum?R=1'   # sometimes lands on node3, undercounts
+    curl 'localhost:8001/zones/quorum?R=2'   # always fresh -- majority excludes node3
+
+    curl -X POST localhost:8001/chaos/heal
+    curl -X POST localhost:8002/chaos/heal
+    curl -X POST localhost:8003/chaos/heal   # R=1 becomes reliably fresh again
+
+`python test_quorum.py` runs this exact scenario automatically: R=1 over
+30 tries came back fresh 21 and stale 9 times, R=2 was fresh 20/20, and
+R=1 was fresh 10/10 again after healing.
+
 ## Next
 
-- quorum reads (W=2, R=2 of N=3) on /zones
+- guest client: offline queue + vector clocks (Phase 5)
