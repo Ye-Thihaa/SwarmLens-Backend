@@ -138,6 +138,20 @@ class Store:
         row = await cur.fetchone()
         return row["n"] or 0
 
+    async def aesthetic_scores(self) -> dict[str, float]:
+        """photo_id -> latest aesthetic_score. Deterministic given the same
+        image (CLIP inference), so duplicate events from re-analysis or two
+        nodes racing are expected to agree closely -- last-write-wins by
+        created_at is fine here, unlike likes which need a CRDT set."""
+        cur = await self.db.execute(
+            "SELECT payload FROM events WHERE kind='aesthetic_score' ORDER BY created_at"
+        )
+        out: dict[str, float] = {}
+        for r in await cur.fetchall():
+            p = json.loads(r["payload"])
+            out[p["photo_id"]] = p["score"]
+        return out
+
     async def raw_events(self, kinds: tuple[str, ...]) -> list[dict]:
         """Every event of the given kinds, undigested. Used by quorum reads,
         which merge several nodes' partial views by union-ing raw events

@@ -8,6 +8,18 @@ Each phase lists: what to build, which files change, the concept it
 demonstrates, and a concrete test that proves it works. Do them in order —
 each one depends on the log/gossip foundation from Phase 0.
 
+## AI analysis engine — done (outside the phase numbering)
+
+`ai_engine.py` / `POST /analyze` — saliency-based AR reframe guide, CLIP
+film-stock suggestion, and a CLIP + LAION-linear-head aesthetic score, all
+pretrained, nothing trained here. This isn't one of the numbered phases
+below (it's the "new piece" from the project proposal, feeding the
+`aesthetic_score` event that the zone CRDT in §5.3 depends on), so it's
+called out separately rather than slotted into the phase order. Full
+writeup, model sources/versions, and the live demo: see README.md's "AI
+analysis engine" section and CLAUDE.md's Files list. Tested via
+`test_ai_engine.py` against 3 live nodes.
+
 ---
 
 ## Phase 0 — done
@@ -114,7 +126,9 @@ Consistent hashing (`hashing.py`, wired into `main.py`'s `/zones`,
 `/zones/local`, `/zones/ring`). Each zone is owned by one node on the
 ring; `GET /zones` proxies each zone to its owner and only falls back to
 this node's own replica (marked `stale: true`) if the owner doesn't
-answer.
+answer. Each zone's score also carries `avg_aesthetic` (added when the AI
+engine landed, after this phase was first built — null until at least
+one photo in that zone has been through `POST /analyze`).
 
 One bug found and fixed during testing, not in the original spec below:
 a node's own ring identity must be the URL its peers already reach it at
@@ -193,13 +207,15 @@ all of them — that's the number for your report.
 Quorum reads (`GET /zones/quorum?R=&W=`, in `main.py`). `N` is fixed at
 `len(PEERS) + 1`. Each call samples `R` of `N` members at random
 (self is just one candidate among them, not privileged), fetches raw
-photo/like events from each via the new `GET /zones/events`, unions them
-deduped on `(origin, seq)` — the same idempotence key gossip already
-relies on — and recomputes zone scores from the merge, rather than
-trusting any single node's already-aggregated counts. `W` is accepted
-and echoed back for the CAP-tradeoff narrative only: this system's
-writes are always local + eventually gossiped, so there's no synchronous
-quorum write path for `W` to actually gate.
+photo/like/aesthetic_score events from each via the new `GET
+/zones/events`, unions them deduped on `(origin, seq)` — the same
+idempotence key gossip already relies on — and recomputes zone scores
+from the merge, rather than trusting any single node's already
+-aggregated counts. `W` is accepted and echoed back for the
+CAP-tradeoff narrative only: this system's writes are always local +
+eventually gossiped, so there's no synchronous quorum write path for
+`W` to actually gate. (`aesthetic_score` was added when the AI engine
+landed, after Phase 4 was first built — see the AI engine section above.)
 
 One thing the spec's pseudocode glossed over: sampling has to be
 *random* on every call for "sometimes you land on the stale node" to be

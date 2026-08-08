@@ -30,7 +30,8 @@ the consistent-hashing ring matches how peers already refer to it.
 | GET  | `/zones/local` | this node's own replica of every zone, no ownership filtering — what peers proxy to |
 | GET  | `/zones/ring` | debug: current ring membership and the zone → owner mapping |
 | GET  | `/zones/quorum?R=&W=` | quorum read: union raw events from R of N random nodes and recompute; W is echoed back for the CAP narrative only |
-| GET  | `/zones/events` | this node's raw photo/like events, undigested — what quorum reads fetch from each sampled peer |
+| GET  | `/zones/events` | this node's raw photo/like/aesthetic_score events, undigested — what quorum reads fetch from each sampled peer |
+| POST | `/analyze` | photo_id + image_base64 -> {ar_guide, suggested_filter, aesthetic_score}; writes an aesthetic_score event |
 | GET  | `/health` | event count, version vector, gossip stats |
 | POST | `/gossip/sync` | peer-to-peer: exchange digest, return missing events |
 | POST | `/gossip/push` | peer-to-peer: deliver events the peer lacks |
@@ -116,6 +117,48 @@ Demo the tradeoff live:
 30 tries came back fresh 21 and stale 9 times, R=2 was fresh 20/20, and
 R=1 was fresh 10/10 again after healing.
 
+## AI analysis engine
+
+`POST /analyze` (`ai_engine.py`) runs three pretrained, non-training
+models on a photo and returns the results, no training or fine-tuning
+anywhere:
+
+1. **AR reframe guide** -- OpenCV saliency
+   (`cv2.saliency.StaticSaliencySpectralResidual`) finds the subject,
+   compared against the nearest rule-of-thirds intersection.
+2. **Film-stock suggestion** -- CLIP ViT-B/32 (ONNX, int8-quantized),
+   cosine similarity against a fixed set of text prompts, one per film
+   stock (see `FILM_STOCKS` in `ai_engine.py`).
+3. **Aesthetic score (0-10)** -- reuses the same CLIP embedding from
+   step 2 with LAION's `aesthetic-predictor` v1 linear head (ViT-B/32
+   variant). See `ai_engine.py`'s module docstring for exact model
+   sources/versions.
+
+Models download on first use into `./models/` (~154MB, gitignored,
+cached after that) -- pre-warm before a demo with:
+
+    python -c "import ai_engine; ai_engine.warmup()"
+
+The resulting `aesthetic_score` is written to the event log exactly like
+a photo or like event (`store.append_local`) -- it gossips, merges, and
+feeds `/zones`/`/zones/quorum`'s new `avg_aesthetic` field the same way
+everything else already does, no second replication path.
+
+    curl -X POST localhost:8001/photos -H 'content-type: application/json' \
+      -d '{"guest_id":"g1","zone":"flower_arch","composition_score":93}'
+    # (grab the returned photo_id, then:)
+    curl -X POST localhost:8001/analyze -H 'content-type: application/json' \
+      -d '{"photo_id":"ph_xxx","image_base64":"<base64 png/jpeg>"}'
+    curl localhost:8001/zones   # avg_aesthetic now populated for that zone
+
+`python test_ai_engine.py` runs this end to end against 3 live nodes:
+confirms the AR guide direction is sane for an intentionally off-center
+subject, confirms suggested_filter differs between a sunset-gradient and
+a flat-gray image, and confirms the aesthetic_score event count matches
+across all three nodes' `.db` files after a gossip round.
+
 ## Next
 
 - guest client: offline queue + vector clocks (Phase 5)
+- wire the guest UI and operator console to this backend (needs those
+  repos attached alongside this one -- not present here yet)

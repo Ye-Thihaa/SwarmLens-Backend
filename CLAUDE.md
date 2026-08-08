@@ -27,10 +27,33 @@ list and manual demo commands: [README.md](README.md).
   zone from its own replica.
 - `GET /zones/quorum` (in `main.py`, no separate file — it's short
   enough to live next to the other zone endpoints) — samples `R` of `N`
-  nodes at random, unions their raw photo/like events (`store.raw_events`
-  / `GET /zones/events`) deduped on `(origin, seq)`, and recomputes
-  scores from the merge. This is the CAP-tradeoff knob: `R` over `N/2`
-  is always fresh, `R=1` can land on a stale/partitioned node.
+  nodes at random, unions their raw photo/like/aesthetic_score events
+  (`store.raw_events` / `GET /zones/events`) deduped on `(origin, seq)`,
+  and recomputes scores from the merge. This is the CAP-tradeoff knob:
+  `R` over `N/2` is always fresh, `R=1` can land on a stale/partitioned
+  node.
+- `ai_engine.py` — pretrained-only photo analysis (no training anywhere):
+  saliency subject detection, a rule-of-thirds AR reframe guide, CLIP
+  film-stock suggestion, and a CLIP-embedding aesthetic score. Wired up
+  as `POST /analyze` in `main.py`, which runs it on a thread (it's
+  synchronous CPU-bound ONNX/OpenCV work — awaiting it directly would
+  stall this node's asyncio loop, and gossip/raft both depend on that
+  loop staying responsive). Models are downloaded on first use into
+  `./models/` (gitignored, ~154MB) and cached after that:
+  - saliency: `cv2.saliency.StaticSaliencySpectralResidual` — ships in
+    `opencv-contrib-python`, no download, classical CV.
+  - filter suggestion + aesthetic embedding: CLIP ViT-B/32, int8-quantized
+    ONNX export by Xenova of `openai/clip-vit-base-patch32`
+    (huggingface.co/Xenova/clip-vit-base-patch32).
+  - aesthetic score: LAION `aesthetic-predictor` v1's ViT-B/32 linear
+    head (github.com/LAION-AI/aesthetic-predictor,
+    `sa_0_4_vit_b_32_linear.pth`) — the *original* repo, not
+    "improved-aesthetic-predictor" (that one is ViT-L/14 only, wrong
+    embedding dimension for our ViT-B/32 CLIP). See `ai_engine.py`'s
+    module docstring for the full reasoning and exact URLs.
+  - the `aesthetic_score` event feeds `avg_aesthetic` into `/zones` and
+    `/zones/quorum` the normal way (`store.append_local`, replicated by
+    gossip) — see the Conventions section, no second source of truth.
 
 ## Run it
 
@@ -60,6 +83,14 @@ Tests:
   data from the partitioned node while `R=2` never does, then heals and
   confirms `R=1` goes back to reliably fresh. Self-contained like
   `test_raft.py`.
+- `python test_ai_engine.py` — spins up 3 nodes, posts synthetic images
+  crafted to have an unambiguous right answer (an off-center circle for
+  the AR guide, a sunset gradient vs. flat gray for filter suggestion),
+  confirms the AR guide direction and that suggested_filter actually
+  differentiates, then confirms the resulting `aesthetic_score` event
+  count matches on all three nodes' own `.db` files after a gossip
+  round. First run downloads ~154MB of models into `./models/`
+  (gitignored) — cached after that, budget extra time for a cold run.
 - No test file yet for gossip/worker phases — those were verified
   manually per the curl sequences in README.md. Same for the live
   `/zones` ownership/proxy/stale-fallback behavior — verified manually
@@ -68,9 +99,14 @@ Tests:
 ## Current status
 
 Phases 0-4 done (gossip replication, worker leases, Raft election,
-consistent-hash zone ownership, quorum reads). See ROADMAP.md for the
-full phase list and what's next (Phase 5: guest client with offline
-queue + vector clocks).
+consistent-hash zone ownership, quorum reads), plus the AI analysis
+engine (`ai_engine.py`, `POST /analyze`) described above. See ROADMAP.md
+for the full phase list and what's next (Phase 5: guest client with
+offline queue + vector clocks). Not started: the guest UI and operator
+console wiring, Phase 6 (cloud archive), Phase 7 (chaos/metrics
+dashboard), Phase 8 (load test) -- the guest UI and operator console
+repos aren't present in this working directory, so that wiring can't
+happen from here until they're attached alongside the backend.
 
 ## Gotchas hit so far (don't reintroduce these)
 
@@ -114,6 +150,25 @@ queue + vector clocks).
   must stop initiating toward it, *and* it must stop initiating toward
   each of them — 4 calls total to isolate one node in a 3-node cluster,
   not 1.
+- **Any synchronous, CPU-bound call (ONNX inference, OpenCV, ...) in a
+  route handler must be offloaded with `asyncio.to_thread`, never
+  awaited directly.** This process has exactly one asyncio event loop,
+  and gossip's anti-entropy round and raft's 50ms heartbeat/election
+  timers both run as tasks on it. A multi-second synchronous call inside
+  a request handler (e.g. `POST /analyze`, see `ai_engine.py`) blocks
+  that whole loop for its duration — on any node still holding
+  leadership, that's long enough to miss heartbeats and get voted out by
+  a follower that never actually lost contact.
+- **Aesthetic-predictor checkpoints are keyed to a specific CLIP
+  backbone's embedding dimension, and the commonly-cited repo only
+  covers one of them.** LAION's "improved-aesthetic-predictor" ships
+  ViT-L/14 (768-dim) heads only; using it with ViT-B/32 (512-dim)
+  embeddings is a shape mismatch, not a "close enough" approximation.
+  The *original* `LAION-AI/aesthetic-predictor` repo has both `vit_b_32`
+  and `vit_l_14` linear heads — `ai_engine.py` uses the B/32 one to
+  match the B/32 CLIP backbone used for filter suggestion (so the
+  aesthetic head can reuse that embedding instead of re-running a second,
+  larger CLIP model just for one score).
 
 ## Conventions
 

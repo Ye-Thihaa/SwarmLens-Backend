@@ -1,18 +1,23 @@
+import asyncio
+import base64
 import os
 import random
 import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import ai_engine
 from store import Store
 from gossip import Gossip
 from worker import Worker
 from raft import Raft
 from hashing import ring_for, owner_of
+
+QUORUM_EVENT_KINDS = ("photo", "like", "aesthetic_score")
 
 NODE_ID = os.getenv("NODE_ID", "node1")
 DB_PATH = os.getenv("DB_PATH", f"./{NODE_ID}.db")
@@ -53,12 +58,25 @@ def cluster_members() -> list[str]:
 
 
 async def _zone_scores_local() -> dict[str, dict]:
-    scores: dict[str, dict] = {}
+    """Derived read: photos + CRDT like counts (store.photos()) plus the
+    average aesthetic_score per zone (store.aesthetic_scores()) for
+    whichever photos have been through /analyze so far -- None for a zone
+    with no scored photos yet, not 0, so it's distinguishable from 'scored
+    and bad'."""
+    aesthetic = await store.aesthetic_scores()
+    zones: dict[str, dict] = {}
+    scored: dict[str, list] = {}
     for p in await store.photos():
-        z = scores.setdefault(p["zone"], {"zone": p["zone"], "photos": 0, "likes": 0})
+        z = zones.setdefault(p["zone"], {"zone": p["zone"], "photos": 0, "likes": 0})
         z["photos"] += 1
         z["likes"] += p["likes"]
-    return scores
+        s = aesthetic.get(p["photo_id"])
+        if s is not None:
+            scored.setdefault(p["zone"], []).append(s)
+    for zone, z in zones.items():
+        vals = scored.get(zone)
+        z["avg_aesthetic"] = round(sum(vals) / len(vals), 2) if vals else None
+    return zones
 
 
 def _rank(zones) -> list[dict]:
@@ -71,19 +89,28 @@ def _zone_scores_from_events(events) -> dict[str, dict]:
     recompute from the union of several nodes' partial views."""
     photo_zone: dict[str, str] = {}
     like_guests: dict[str, set] = {}
-    for e in events:
+    aesthetic: dict[str, float] = {}
+    for e in sorted(events, key=lambda e: e["created_at"]):
         p = e["payload"]
         if e["kind"] == "photo":
             photo_zone[p["photo_id"]] = p["zone"]
         elif e["kind"] == "like":
             like_guests.setdefault(p["photo_id"], set()).add(p["guest_id"])
+        elif e["kind"] == "aesthetic_score":
+            aesthetic[p["photo_id"]] = p["score"]  # last write wins -- sorted by created_at above
 
-    scores: dict[str, dict] = {}
+    zones: dict[str, dict] = {}
+    scored: dict[str, list] = {}
     for photo_id, zone in photo_zone.items():
-        z = scores.setdefault(zone, {"zone": zone, "photos": 0, "likes": 0})
+        z = zones.setdefault(zone, {"zone": zone, "photos": 0, "likes": 0})
         z["photos"] += 1
         z["likes"] += len(like_guests.get(photo_id, ()))
-    return scores
+        if photo_id in aesthetic:
+            scored.setdefault(zone, []).append(aesthetic[photo_id])
+    for zone, z in zones.items():
+        vals = scored.get(zone)
+        z["avg_aesthetic"] = round(sum(vals) / len(vals), 2) if vals else None
+    return zones
 
 
 @asynccontextmanager
@@ -136,6 +163,59 @@ async def like_photo(body: LikeIn):
 @app.get("/photos")
 async def list_photos():
     return {"node": NODE_ID, "photos": await store.photos()}
+
+
+class AnalyzeIn(BaseModel):
+    photo_id: str
+    image_base64: str | None = None
+
+
+@app.post("/analyze")
+async def analyze_photo(body: AnalyzeIn):
+    """Saliency -> AR guide, CLIP -> filter suggestion, CLIP + a linear
+    head -> aesthetic score (ai_engine.py; all pretrained, nothing trained
+    here). Runs on a thread (ai_engine.analyze is synchronous, CPU-bound
+    ONNX/OpenCV work) so it never blocks this node's asyncio loop -- gossip
+    and raft both depend on that loop staying responsive.
+
+    image_base64 is the normal path: this backend has no photo-binary
+    storage, only zone/composition_score metadata (see PhotoIn), so
+    there's nowhere else to get pixels from a bare photo_id unless that
+    photo was uploaded with a real, externally-fetchable `url`.
+
+    The aesthetic_score is written with store.append_local exactly like a
+    photo or like event -- no second replication path. It gossips, merges
+    on (origin, seq), and feeds /zones and /zones/quorum the same way
+    everything else in the log already does."""
+    if body.image_base64:
+        try:
+            image_bytes = base64.b64decode(body.image_base64, validate=True)
+        except Exception:
+            raise HTTPException(400, "image_base64 is not valid base64")
+    else:
+        photo = next((p for p in await store.photos() if p["photo_id"] == body.photo_id), None)
+        if not photo or not photo.get("url"):
+            raise HTTPException(
+                400, "no image_base64 given, and this photo has no fetchable url"
+            )
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            r = await client.get(photo["url"])
+            r.raise_for_status()
+            image_bytes = r.content
+
+    result = await asyncio.to_thread(ai_engine.analyze, image_bytes)
+
+    await store.append_local("aesthetic_score", {
+        "photo_id": body.photo_id,
+        "score": result["aesthetic_score"],
+        "computed_by": NODE_ID,
+    })
+
+    return {
+        "ar_guide": result["ar_guide"],
+        "suggested_filter": result["suggested_filter"],
+        "aesthetic_score": result["aesthetic_score"],
+    }
 
 
 @app.get("/zones")
@@ -192,11 +272,11 @@ async def zones_ring():
 
 @app.get("/zones/events")
 async def zones_events():
-    """Raw photo/like events from this node's own replica, undigested.
-    Not for clients -- this is what /zones/quorum fetches from each node
-    it samples, so it can union events across nodes and recompute rather
-    than trust one node's already-aggregated counts."""
-    return {"node": NODE_ID, "events": await store.raw_events(("photo", "like"))}
+    """Raw photo/like/aesthetic_score events from this node's own replica,
+    undigested. Not for clients -- this is what /zones/quorum fetches from
+    each node it samples, so it can union events across nodes and
+    recompute rather than trust one node's already-aggregated counts."""
+    return {"node": NODE_ID, "events": await store.raw_events(QUORUM_EVENT_KINDS)}
 
 
 @app.get("/zones/quorum")
@@ -228,7 +308,7 @@ async def zones_quorum(R: int = 2, W: int = 2):
     async with httpx.AsyncClient(timeout=1.0) as client:
         for member in chosen:
             if member == SELF_ID:
-                events = await store.raw_events(("photo", "like"))
+                events = await store.raw_events(QUORUM_EVENT_KINDS)
                 queried.append(member)
             else:
                 try:

@@ -3,3 +3,12 @@ uvicorn[standard]==0.34.0
 aiosqlite==0.20.0
 httpx==0.28.1
 pydantic==2.10.4
+
+# ai_engine.py -- saliency (contrib, not base opencv-python, for cv2.saliency),
+# CLIP inference via ONNX Runtime, CLIP's tokenizer. See ai_engine.py's module
+# docstring for exact pretrained checkpoints used (downloaded on first use).
+opencv-contrib-python==5.0.0.93
+numpy==2.5.1
+pillow==12.3.0
+onnxruntime==1.28.0
+tokenizers==0.23.1
