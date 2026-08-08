@@ -16,6 +16,7 @@ from gossip import Gossip
 from worker import Worker
 from raft import Raft
 from hashing import ring_for, owner_of
+from cloud_sync import CloudSync
 
 QUORUM_EVENT_KINDS = ("photo", "like", "aesthetic_score")
 
@@ -46,6 +47,7 @@ async def send_event_recap():
 
 
 raft = Raft(NODE_ID, PEERS)
+cloud_sync = CloudSync(NODE_ID, store, raft)
 
 
 def cluster_members() -> list[str]:
@@ -119,7 +121,9 @@ async def lifespan(app: FastAPI):
     await gossip.start()
     await worker.start()
     await raft.start()
+    await cloud_sync.start()
     yield
+    await cloud_sync.stop()
     await raft.stop()
     await worker.stop()
     await gossip.stop()
@@ -430,6 +434,26 @@ async def recap_trigger():
     return {"triggered": False, "by": NODE_ID}
 
 
+# ---------------------------- cloud archive sync ----------------------------
+
+@app.post("/cloud_sync/trigger")
+async def cloud_sync_trigger():
+    """Force a sync tick now instead of waiting for CLOUD_SYNC_INTERVAL --
+    mainly for tests/demos. Same no-op rules as the background loop: 0
+    synced if this node isn't leader, or if SUPABASE_URL isn't configured
+    (cloud_sync.enabled is False), or if the cloud is unreachable (check
+    last_error, not an exception -- a network blip here should never 500
+    the request)."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        n = await cloud_sync.sync_once(client)
+    return {"synced": n, **cloud_sync.status()}
+
+
+@app.get("/cloud_sync/status")
+async def cloud_sync_status():
+    return cloud_sync.status()
+
+
 # ---------------------------- ops & chaos ----------------------------
 
 @app.get("/jobs/{photo_id}")
@@ -451,6 +475,7 @@ async def health():
         "digest": await store.digest(),
         "gossip": gossip.stats(),
         "raft": raft.status(),
+        "cloud_sync": cloud_sync.status(),
     }
 
 

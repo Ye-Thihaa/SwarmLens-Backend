@@ -19,8 +19,8 @@ list and manual demo commands: [README.md](README.md).
   `_concurrent`/`_vclock_leq`) instead of implying a false total order
   from arrival time. `get_meta`/`set_meta` are node-local scratch state
   (like `local_seq`) — never gossiped, safe only for values it's fine to
-  lose or recompute on a fresh process (cloud_sync's checkpoint uses
-  this; see the cloud_sync.py entry below for why that's still correct).
+  lose or recompute on a fresh process (`cloud_sync.py`'s checkpoint uses
+  this — see its entry below for why that's still correct).
 - `gossip.py` — anti-entropy loop: every `GOSSIP_INTERVAL` (default 1s),
   pick one random peer, exchange version-vector digests, pull/push
   whatever's missing.
@@ -63,6 +63,17 @@ list and manual demo commands: [README.md](README.md).
   - the `aesthetic_score` event feeds `avg_aesthetic` into `/zones` and
     `/zones/quorum` the normal way (`store.append_local`, replicated by
     gossip) — see the Conventions section, no second source of truth.
+- `cloud_sync.py` — leader-gated background loop (`POST
+  /cloud_sync/trigger`, `GET /cloud_sync/status` in `main.py`, folded
+  into `GET /health`) that pushes the event log to a Supabase/PostgREST
+  -style endpoint, one-way and append-only. Disabled entirely (loop never
+  starts) unless `SUPABASE_URL` is set — zero effect on any node that
+  doesn't configure it. Reuses `store.events_missing_from()` — the exact
+  primitive `gossip.py` already uses — treating "the cloud" as one more
+  peer whose digest is tracked, except sync only pushes. The local sync
+  checkpoint (`store.get_meta`/`set_meta`) is deliberately *not*
+  replicated or authoritative — see the Gotchas section for why that's
+  still correct across a Raft leadership change, not just convenient.
 
 ## Run it
 
@@ -107,6 +118,14 @@ Tests:
   concurrency for independent devices, no false concurrency once one
   clock causally dominates another, never concurrent for a bare photo
   with no vclock), and confirms it all survives gossip replication.
+- `python test_cloud_sync.py` — spins up 3 nodes plus a tiny in-process
+  fake-cloud HTTP server (no real Supabase project exists for this repo)
+  that dedups on `(origin, seq)` the way a real unique constraint would.
+  Confirms the cluster keeps working while the fake cloud isn't
+  listening ("no internet"), `/cloud_sync/trigger` fails softly instead
+  of 500ing, the full backlog syncs in one push once it starts listening
+  ("reconnect"), a no-op re-trigger creates no duplicates, a new event
+  afterward syncs incrementally, and only the Raft leader ever pushes.
 - No test file yet for gossip/worker phases — those were verified
   manually per the curl sequences in README.md. Same for the live
   `/zones` ownership/proxy/stale-fallback behavior — verified manually
@@ -116,15 +135,15 @@ Tests:
 
 Phases 0-4 done (gossip replication, worker leases, Raft election,
 consistent-hash zone ownership, quorum reads), the AI analysis engine
-(`ai_engine.py`, `POST /analyze`), and Phase 5's backend slice (vector
-clocks + `concurrent_with`) described above. See ROADMAP.md for the full
-phase list. Not started: the guest client itself (Dexie.js outbox,
-localStorage vector clock, service worker -- Phase 5's other half), the
-guest UI and operator console wiring, Phase 6 (cloud archive), Phase 7
-(chaos/metrics dashboard), Phase 8 (load test) -- the guest UI and
-operator console repos aren't present in this working directory, so
-that wiring can't happen from here until they're attached alongside the
-backend.
+(`ai_engine.py`, `POST /analyze`), Phase 5's backend slice (vector clocks
++ `concurrent_with`), and Phase 6 (cloud archive sync, `cloud_sync.py`)
+described above. See ROADMAP.md for the full phase list. Not started:
+the guest client itself (Dexie.js outbox, localStorage vector clock,
+service worker -- Phase 5's other half), the guest UI and operator
+console wiring, Phase 7 (chaos/metrics dashboard), Phase 8 (load test)
+-- the guest UI and operator console repos aren't present in this
+working directory, so that wiring can't happen from here until they're
+attached alongside the backend.
 
 ## Gotchas hit so far (don't reintroduce these)
 
@@ -147,6 +166,20 @@ backend.
   replicated event log (see `store.event_exists` / `send_event_recap` in
   `main.py`), not local in-memory state — local state doesn't survive
   the crash and isn't shared across nodes.
+- **...but a repeated, ongoing sync (not a one-time trigger) can safely
+  use a local, non-replicated checkpoint, IF the destination is itself
+  idempotent.** `cloud_sync.py`'s "what has the cloud already got"
+  checkpoint lives in `local_meta` (`store.get_meta`/`set_meta`) —
+  node-local, never gossiped, gone if that node dies. That's fine here,
+  unlike the recap case above: if Raft leadership moves to a different
+  node, the new leader's checkpoint doesn't know what the old leader
+  already pushed, so it just resends that overlap — and the Supabase
+  table's `UNIQUE(origin, seq)` constraint (`Prefer:
+  resolution=ignore-duplicates`) silently drops it. Correct, if wasteful
+  once. The dividing line: gate a *single, one-time* action on the
+  replicated log (recap); a *repeated, resumable* push can trust local
+  state as long as the far end dedups on the same key gossip already
+  uses.
 - **A node's ring identity must match how its peers already address it,
   not `NODE_ID`.** Peers only know each other by the URLs in `PEERS` —
   they never learn each other's `NODE_ID`. If a node computed its own

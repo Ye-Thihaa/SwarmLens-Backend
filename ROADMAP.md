@@ -320,6 +320,53 @@ in each event.
 
 ---
 
+## Phase 6 — done
+
+`cloud_sync.py`, wired into `main.py` (`POST /cloud_sync/trigger`, `GET
+/cloud_sync/status`, folded into `GET /health`). A background loop
+(`CLOUD_SYNC_INTERVAL`, default 15s) that only acts when `raft.role ==
+"leader"` -- using the leader election from Phase 2, exactly as the spec
+suggested. Disabled entirely (loop never even starts) unless
+`SUPABASE_URL` is set, so it has zero effect on any node that doesn't
+configure it -- including every other test in this repo.
+
+The interesting design choice: rather than inventing a new sync
+mechanism, it reuses `store.events_missing_from()` -- the exact primitive
+gossip already uses for anti-entropy -- treating "the cloud" as one more
+peer whose digest gets tracked, except the sync only pushes (no
+pull-back). The local "what's the cloud already got" checkpoint lives in
+`local_meta` (`store.get_meta`/`set_meta`, new this phase) and is
+explicitly *not* replicated or treated as authoritative: if Raft
+leadership moves to a different node, the new leader's checkpoint won't
+know what the old leader already pushed, so it just resends from
+scratch and the destination's own `UNIQUE(origin, seq)` constraint (+
+`Prefer: resolution=ignore-duplicates`, PostgREST's built-in dedup)
+silently drops the overlap. Correct, if wasteful once -- the same lesson
+as CLAUDE.md's recap gotcha: gate exactly-once behavior on the
+destination's idempotency, not on local state that can't survive a
+leadership change.
+
+No real Supabase project exists for this repo, so it's config-driven
+against any PostgREST-style endpoint (`SUPABASE_URL`, `SUPABASE_KEY`,
+`SUPABASE_EVENTS_TABLE`) rather than hardcoded -- point it at a real
+Supabase project by setting those three env vars once a table with the
+right schema and unique constraint exists (see `cloud_sync.py`'s module
+docstring for the exact column list).
+
+Verified via `test_cloud_sync.py` against a tiny in-process fake-cloud
+HTTP server (dedups on `(origin, seq)` the same way a real unique
+constraint would) standing in for Supabase: confirmed uploads, gossip,
+and `/health` all keep working while the fake cloud isn't listening yet
+("no internet"); confirmed `/cloud_sync/trigger` fails softly (`synced:
+0`, `last_error` set) rather than 500ing; confirmed the full backlog
+syncs in one push once the fake cloud starts listening ("reconnect");
+confirmed a no-op re-trigger pushes nothing and creates no duplicates;
+confirmed one new event afterward syncs incrementally, not a full
+resend; confirmed a follower's trigger is always a no-op.
+
+<details>
+<summary>Original spec</summary>
+
 ## Phase 6 — Cloud archive sync
 
 **Why.** Post-event permanent gallery. Deliberately last and deliberately
@@ -334,6 +381,8 @@ from Supabase during the live event.
 **Test.** Disconnect the whole cluster from the internet. Confirm
 uploads, likes, gossip, leases, and the zone map all continue working.
 Reconnect — confirm the backlog syncs without needing you to do anything.
+
+</details>
 
 ---
 

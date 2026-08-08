@@ -41,6 +41,8 @@ the consistent-hashing ring matches how peers already refer to it.
 | POST | `/raft/heartbeat` | peer-to-peer: leader keepalive |
 | GET  | `/raft/status` | this node's Raft role, term, current leader |
 | POST | `/recap/trigger` | fire the one-time recap; no-ops unless this node is leader |
+| POST | `/cloud_sync/trigger` | force a cloud archive sync tick now; no-ops unless leader + SUPABASE_URL configured |
+| GET  | `/cloud_sync/status` | enabled/role/last sync count/last error |
 
 ## Verified demo
 
@@ -178,6 +180,38 @@ with anything.
 `python test_vclock.py` simulates a couple of devices this way against 3
 live nodes and confirms the concurrency relationships are correct and
 survive gossip replication unchanged.
+
+## Cloud archive sync
+
+`cloud_sync.py` pushes the event log to a Supabase/PostgREST-style
+endpoint, one-way and append-only, on a leader-gated background loop
+(`CLOUD_SYNC_INTERVAL`, default 15s). Disabled entirely unless
+`SUPABASE_URL` is set -- zero effect on a node that doesn't configure it.
+It's config-driven, not hardcoded to a real project (none exists for
+this repo yet):
+
+    SUPABASE_URL=https://xxxx.supabase.co
+    SUPABASE_KEY=<service-role or scoped key>
+    SUPABASE_EVENTS_TABLE=events   # optional, this is the default
+
+The destination table needs columns matching the event shape (`origin
+text, seq int8, kind text, payload jsonb, created_at float8, vclock
+jsonb`) and a `UNIQUE(origin, seq)` constraint -- that's what makes
+repeated/overlapping pushes safe to dedup via `Prefer:
+resolution=ignore-duplicates`. See `cloud_sync.py`'s module docstring for
+the full reasoning, including why a *local, non-replicated* sync
+checkpoint is still correct even across a Raft leadership change.
+
+    curl -X POST localhost:8001/cloud_sync/trigger   # force a tick now
+    curl localhost:8001/cloud_sync/status
+
+`python test_cloud_sync.py` stands up a tiny in-process fake-cloud HTTP
+server (no real Supabase project needed) and confirms: the cluster keeps
+working while the fake cloud isn't listening ("no internet"); a trigger
+against it fails softly instead of 500ing; the full backlog syncs in one
+push once it starts listening ("reconnect"); re-triggering with nothing
+new is a true no-op with no duplicates; a new event afterward syncs
+incrementally; and only the Raft leader ever pushes.
 
 ## Next
 
