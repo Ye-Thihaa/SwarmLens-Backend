@@ -455,24 +455,75 @@ button press. This is what's on the projector during your demo.
 
 ---
 
-## Phase 8 — Load test and report numbers
+## Phase 8 — done
 
-**Why.** This is what separates a working demo from a graded result.
+`load_test.py`, plain `asyncio` + `httpx` (no locust, no new
+dependency). Fires real traffic at real clusters it spins up and tears
+down itself -- never mocks. `python load_test.py --quick` runs a fast,
+reduced-scale version of every measurement to validate the script;
+without `--quick` it runs the full spec'd numbers (200 uploads, 500
+likes, 20 election trials), which takes a few minutes end to end.
+Outputs `results.json` + `summary.csv` + 6 PNGs into
+`load_test_results/` (gitignored -- results from one run on one
+machine, not source).
 
-**What to build.** A `locust` or plain `asyncio` + `httpx` script that
-fires 200 concurrent photo uploads and 500 concurrent likes at random
-nodes, then measures:
+**A real, load-test-only bug was found and fixed before any numbers
+could be trusted.** `store.py`'s `_next_seq()` reads the local sequence
+counter, increments it in Python, then writes it back -- a read-modify
+-write spanning an `await`. Every prior test in this repo only ever
+awaited one write at a time, so this never mattered. The load test's
+first run threw `sqlite3.IntegrityError: UNIQUE constraint failed:
+events.origin, events.seq` under real concurrency: two requests both
+read the same counter value before either wrote back, assigned the same
+`seq`, and collided. Fixed with an `asyncio.Lock` around the whole
+"assign next seq + insert" critical section in `append_local`
+(`merge_remote` doesn't need it -- it inserts events whose `(origin,
+seq)` were already assigned by their origin node, via `INSERT OR
+IGNORE`, safe under concurrency on its own). 200 concurrent uploads at
+one node: 0 failures after the fix, reliably reproducing before it.
 
-- p50/p95/p99 upload latency
-- convergence time (max digest lag over time, sampled every 100ms)
-- recovery time after a node kill (time from kill to job reclaim to
-  job_done)
-- leader re-election latency (20 trials, kill leader each time)
-- throughput at N=1,2,3,4 nodes (add Phase 3's hashing to test this)
-- bandwidth used by gossip per round (log payload sizes)
+**A second methodology bug, in the load test itself, not the backend:**
+the first version of the recovery measurement polled only one node to
+detect "claimed", then killed the claimant. Since a node's own writes
+are visible to itself instantly but to an *observer* only after the
+next gossip round, that one-node-observer approach could detect the
+claim late enough that the claimant finished its whole 5-second
+fake-work window before the kill signal landed -- measuring "did the
+original worker finish before I managed to kill it" (5.0s, suspiciously
+exactly the fake-work duration) instead of a genuine kill-mid-work
+scenario. Fixed by polling all 3 nodes directly and in parallel, so the
+claim is caught via the claimant's own zero-lag self-report. After the
+fix: a clean, explainable 13.25s (8s lease expiry + 5s fake work +
+overhead) -- matching `worker.py`'s own `LEASE_SECONDS`/`work_seconds`
+constants almost exactly, which is exactly the kind of number that
+means the measurement is trustworthy, not lucky.
 
-Graph all of these. This is the difference between "it works" and "here
-is why it works, quantified."
+**Numbers from a full run** (this machine, one run -- see
+`load_test_results/summary.csv` for the raw numbers of any given run):
+
+| Metric | Value |
+|---|---|
+| Photo upload latency (200 concurrent) | p50 1.39s / p95 1.59s / p99 1.60s |
+| Like latency (500 concurrent) | p50 1.53s / p95 2.54s / p99 2.71s |
+| Convergence time after the burst | 1.89s |
+| Recovery (kill -> reclaim -> done) | 13.25s |
+| Leader re-election (20 trials) | min 0.19s / mean 0.29s / max 0.85s |
+| Throughput, N=1 / 2 / 3 / 4 | 81 / 132 / 164 / 220 uploads/sec |
+| Gossip `/sync` payload | cold (full backlog) 112KB / warm (steady state) 509B |
+
+**The interesting finding, not just the numbers:** upload/like latency
+under the full 200/500-concurrent burst (~1.4-2.7s) is far higher than
+under light load (~0.1-0.3s in `--quick` mode, 20/50 concurrent). This
+is the direct, honest cost of the concurrency fix above: `_write_lock`
+correctly serializes every write through one SQLite connection per
+node, so under a genuine 200-way concurrent burst, request #200 queues
+behind roughly 199 others. This is a real architectural ceiling (single
+-writer SQLite per node), not a bug -- and throughput scaling with N
+(81 -> 220 uploads/sec from N=1 to N=4) is the direct upside of the same
+fact: each additional node is another fully independent SQLite writer,
+so spreading writes across more nodes raises the cluster's aggregate
+write ceiling almost linearly. This is exactly the "why it works,
+quantified" the spec asked for, not just "it works."
 
 ---
 

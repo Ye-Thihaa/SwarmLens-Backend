@@ -20,7 +20,10 @@ list and manual demo commands: [README.md](README.md).
   from arrival time. `get_meta`/`set_meta` are node-local scratch state
   (like `local_seq`) — never gossiped, safe only for values it's fine to
   lose or recompute on a fresh process (`cloud_sync.py`'s checkpoint uses
-  this — see its entry below for why that's still correct).
+  this — see its entry below for why that's still correct). `append_local`
+  holds `self._write_lock` (an `asyncio.Lock`) around assigning the next
+  seq + inserting — see the Gotchas section for the real concurrency bug
+  this fixes.
 - `gossip.py` — anti-entropy loop: every `GOSSIP_INTERVAL` (default 1s),
   pick one random peer, exchange version-vector digests, pull/push
   whatever's missing.
@@ -81,6 +84,16 @@ list and manual demo commands: [README.md](README.md).
   alternative from Phase 7's "Prometheus/Grafana vs. lighter" fork — see
   ROADMAP.md's Phase 7 writeup for why, and for a real bug (every button
   was broken) this caught by actually clicking through it in a browser.
+- `load_test.py` — plain `asyncio` + `httpx` load test (no locust), spins
+  up and tears down its own real clusters (1/2/3/4 nodes as needed),
+  never mocks. Measures upload/like latency percentiles, convergence
+  time, node-kill recovery time, leader re-election latency (20 trials),
+  throughput vs. cluster size, and gossip bandwidth. `--quick` runs a
+  fast reduced-scale version for validating the script itself. Outputs
+  `results.json`/`summary.csv`/PNGs into `load_test_results/`
+  (gitignored). Found and fixed a real concurrency bug in `store.py`
+  (see the Gotchas section) — see the full writeup and numbers from a
+  real run in ROADMAP.md's Phase 8 section.
 
 ## Run it
 
@@ -133,6 +146,15 @@ Tests:
   of 500ing, the full backlog syncs in one push once it starts listening
   ("reconnect"), a no-op re-trigger creates no duplicates, a new event
   afterward syncs incrementally, and only the Raft leader ever pushes.
+- `python load_test.py [--quick]` — not a pass/fail test, a measurement
+  script. Spins up and tears down its own real clusters, fires real
+  concurrent traffic, reports p50/p95/p99 latency, convergence time,
+  node-kill recovery time, 20-trial election latency, throughput at
+  N=1..4, and gossip bandwidth. `--quick` uses reduced counts to
+  validate the script fast; full mode (the spec'd 200 uploads/500
+  likes/20 trials) takes a few minutes. See ROADMAP.md's Phase 8 section
+  for numbers from a real run and two real bugs this caught (one in
+  `store.py`, one in the load test's own recovery-measurement logic).
 - No test file yet for gossip/worker phases — those were verified
   manually per the curl sequences in README.md. Same for the live
   `/zones` ownership/proxy/stale-fallback behavior — verified manually
@@ -140,18 +162,18 @@ Tests:
 
 ## Current status
 
-Phases 0-4 done (gossip replication, worker leases, Raft election,
-consistent-hash zone ownership, quorum reads), the AI analysis engine
-(`ai_engine.py`, `POST /analyze`), Phase 5's backend slice (vector clocks
-+ `concurrent_with`), Phase 6 (cloud archive sync, `cloud_sync.py`), and
-Phase 7 (chaos + metrics dashboard, `dashboard.html` -- lighter
-alternative to Prometheus/Grafana, see its ROADMAP.md writeup) described
-above. See ROADMAP.md for the full phase list. Not started: the guest
-client itself (Dexie.js outbox, localStorage vector clock, service
-worker -- Phase 5's other half), the guest UI and operator console
-wiring, Phase 8 (load test) -- the guest UI and operator console repos
-aren't present in this working directory, so that wiring can't happen
-from here until they're attached alongside the backend.
+All of Phases 0-8 are done from the backend side (gossip replication,
+worker leases, Raft election, consistent-hash zone ownership, quorum
+reads, vector clocks, cloud archive sync, chaos/metrics dashboard, load
+test), plus the AI analysis engine (`ai_engine.py`, `POST /analyze`) that
+sits outside the phase numbering. See ROADMAP.md for the full
+phase-by-phase writeup, including two real bugs Phase 8's load test
+found (one in `store.py`, described in the Gotchas section below) and
+the actual measured numbers. Not started, and can't be from this working
+directory: the guest client itself (Dexie.js outbox, localStorage vector
+clock, service worker -- Phase 5's other half), and wiring the guest UI
++ operator console to this backend -- neither of those repos is attached
+alongside this one.
 
 ## Gotchas hit so far (don't reintroduce these)
 
@@ -228,6 +250,31 @@ from here until they're attached alongside the backend.
   match the B/32 CLIP backbone used for filter suggestion (so the
   aesthetic head can reuse that embedding instead of re-running a second,
   larger CLIP model just for one score).
+- **`store.append_local`'s "read the seq counter, +1, write it back" is
+  a race unless it's a single critical section.** It spans an `await`
+  (`SELECT` ... compute ... `UPDATE`), so two concurrent calls can both
+  read the same counter value before either writes back, both assign the
+  same `seq`, and collide on `events`' `(origin, seq)` UNIQUE constraint.
+  Every test/demo in this repo only ever awaited one write at a time
+  until `load_test.py` fired genuinely concurrent requests — 200 uploads
+  at one node threw `sqlite3.IntegrityError` reliably. Fixed with
+  `Store._write_lock` (`asyncio.Lock`) around the whole "assign next seq
+  + insert" section in `append_local`. If you add another code path that
+  writes local events, it must go through `append_local`, not reimplement
+  its own seq assignment.
+- **A load-test measurement that detects state via one "observer" node
+  is measuring gossip lag, not the thing it's trying to measure.** The
+  first version of `load_test.py`'s recovery measurement polled a single
+  node to detect when a job got claimed, then killed the claimant. A
+  node's own writes are visible to *itself* instantly; to an observer,
+  only after the next gossip round. That gap was large enough that the
+  claimant sometimes finished its whole 5-second fake-work window before
+  the kill signal landed — silently measuring "did the worker finish
+  before I noticed and killed it" (suspiciously exactly 5.0s) instead of
+  a genuine kill-mid-work scenario. Fixed by polling all nodes directly
+  and in parallel, catching the claim via the claimant's own zero-lag
+  self-report. If you write another measurement that needs to catch a
+  node in a specific state fast, poll every node, not one.
 
 ## Conventions
 

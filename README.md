@@ -238,6 +238,45 @@ ROADMAP.md's Phase 7 writeup for why that's a genuinely different risk
 (an HTTP endpoint that kills an OS process, on a backend with no auth at
 all) rather than scope creep.
 
+## Load test + numbers
+
+    python load_test.py --quick   # fast, reduced-scale, validates the script
+    python load_test.py           # full spec'd numbers (200 uploads, 500
+                                   # likes, 20 election trials) -- a few
+                                   # minutes end to end
+
+Plain `asyncio` + `httpx` (no locust), spins up and tears down its own
+real clusters, never mocks. Measures upload/like latency percentiles,
+convergence time, node-kill recovery time, leader re-election latency
+(20 trials), throughput at N=1,2,3,4, and gossip bandwidth per round.
+Outputs `results.json` + `summary.csv` + 6 PNGs into
+`load_test_results/` (gitignored -- results from one run on one
+machine, not committed source).
+
+**Numbers from a full run on this machine** (one run -- see
+`load_test_results/summary.csv` after your own run for current numbers):
+
+| Metric | Value |
+|---|---|
+| Photo upload latency (200 concurrent) | p50 1.39s / p95 1.59s / p99 1.60s |
+| Like latency (500 concurrent) | p50 1.53s / p95 2.54s / p99 2.71s |
+| Convergence time after the burst | 1.89s |
+| Recovery (kill -> reclaim -> done) | 13.25s |
+| Leader re-election (20 trials) | min 0.19s / mean 0.29s / max 0.85s |
+| Throughput, N=1 / 2 / 3 / 4 | 81 / 132 / 164 / 220 uploads/sec |
+| Gossip `/sync` payload | cold (full backlog) 112KB / warm (steady state) 509B |
+
+The latency numbers under full concurrent load are notably higher than
+under light load, and that's the honest cost of a real bug this script
+found and fixed: `store.py`'s sequence-number assignment wasn't atomic
+across concurrent writers (see ROADMAP.md's Phase 8 writeup and
+CLAUDE.md's Gotchas section for the full story). The fix correctly
+serializes every write through one SQLite connection per node, so a
+genuine 200-way concurrent burst queues -- a real architectural ceiling,
+not a bug. Throughput scaling with N (81 -> 220 uploads/sec) is the
+direct upside of the same fact: each additional node is another fully
+independent writer.
+
 ## Next
 
 - guest client itself: Dexie.js offline outbox, localStorage vector

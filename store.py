@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import aiosqlite
@@ -28,6 +29,18 @@ class Store:
         self.path = path
         self.node_id = node_id
         self.db: aiosqlite.Connection | None = None
+        # _next_seq is a read-then-write (SELECT the counter, compute
+        # +1, UPDATE it) spanning an `await` -- without this lock, two
+        # concurrent append_local calls can both read the same value
+        # before either writes back, assign the same seq, and collide on
+        # events' (origin, seq) UNIQUE constraint. Real bug, found by
+        # load_test.py firing genuinely concurrent requests at one node
+        # for the first time -- every prior test/demo only ever awaited
+        # one write at a time. merge_remote doesn't need this: it inserts
+        # events whose (origin, seq) were already assigned by their
+        # origin node, via INSERT OR IGNORE, which is safe under
+        # concurrent execution on its own.
+        self._write_lock = asyncio.Lock()
 
     async def open(self):
         self.db = await aiosqlite.connect(self.path)
@@ -60,21 +73,22 @@ class Store:
         they default to {} -- an empty clock carries no causal info and is
         never treated as concurrent with anything (see main.py's
         _concurrent)."""
-        seq = await self._next_seq()
         vclock = vclock or {}
-        event = {
-            "origin": self.node_id,
-            "seq": seq,
-            "kind": kind,
-            "payload": payload,
-            "created_at": time.time(),
-            "vclock": vclock,
-        }
-        await self.db.execute(
-            "INSERT INTO events (origin, seq, kind, payload, created_at, vclock) VALUES (?,?,?,?,?,?)",
-            (event["origin"], seq, kind, json.dumps(payload), event["created_at"], json.dumps(vclock)),
-        )
-        await self.db.commit()
+        async with self._write_lock:
+            seq = await self._next_seq()
+            event = {
+                "origin": self.node_id,
+                "seq": seq,
+                "kind": kind,
+                "payload": payload,
+                "created_at": time.time(),
+                "vclock": vclock,
+            }
+            await self.db.execute(
+                "INSERT INTO events (origin, seq, kind, payload, created_at, vclock) VALUES (?,?,?,?,?,?)",
+                (event["origin"], seq, kind, json.dumps(payload), event["created_at"], json.dumps(vclock)),
+            )
+            await self.db.commit()
         return event
 
     async def merge_remote(self, events: list[dict]) -> int:
