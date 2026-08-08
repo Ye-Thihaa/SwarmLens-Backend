@@ -101,6 +101,38 @@ def find_leader():
     return None, None
 
 
+def wait_for_stable_leader(timeout=30, stable_for=3, poll_interval=0.3):
+    """Poll every node's /raft/status until the same single leader shows up
+    on `stable_for` consecutive polls. A snapshot taken right after boot can
+    catch the cluster mid-election (concurrently starting 3 uvicorn
+    processes that each import ai_engine's heavy cv2/onnxruntime/tokenizers
+    stack takes several seconds on some machines -- long enough for the
+    first leader elected to already be gone by the time the next request
+    lands). Returns (leader_id, leader_port); raises on timeout."""
+    deadline = time.time() + timeout
+    last_leader = None
+    streak = 0
+    while time.time() < deadline:
+        statuses = {}
+        for nid, (p, port) in procs.items():
+            try:
+                r = httpx.get(f"http://127.0.0.1:{port}/raft/status", timeout=1.0, trust_env=False)
+                statuses[nid] = r.json()
+            except Exception:
+                statuses[nid] = None
+        leaders = [nid for nid, s in statuses.items() if s and s["role"] == "leader"]
+        current = leaders[0] if len(leaders) == 1 else None
+        if current is not None and current == last_leader:
+            streak += 1
+            if streak >= stable_for:
+                return current, procs[current][1]
+        else:
+            last_leader = current
+            streak = 1 if current is not None else 0
+        time.sleep(poll_interval)
+    raise RuntimeError(f"no stable single leader within {timeout}s (last statuses: {statuses})")
+
+
 def post_photo(port, zone):
     r = httpx.post(f"http://127.0.0.1:{port}/photos", json={
         "guest_id": "g1", "zone": zone, "composition_score": 90,
@@ -114,6 +146,24 @@ def trigger(port):
     return r.json()
 
 
+def trigger_leader(leader_id, leader_port, max_attempts=8):
+    """POST /cloud_sync/trigger against the current leader, re-resolving and
+    retrying if leadership moved since leader_port was last confirmed.
+    Raft's 50ms heartbeat / 150-300ms election timeout (see CLAUDE.md's
+    gotchas) is tight enough that scheduling jitter on a loaded machine can
+    trip a spurious re-election between one request and the next -- a
+    single point-in-time leader check isn't good enough for this test.
+    Returns (leader_id, leader_port, result), where the id/port are
+    whichever node actually served the leader-side response."""
+    result = None
+    for _ in range(max_attempts):
+        result = trigger(leader_port)
+        if result["role"] == "leader":
+            return leader_id, leader_port, result
+        leader_id, leader_port = wait_for_stable_leader(timeout=10)
+    raise RuntimeError(f"leadership kept changing across {max_attempts} attempts; last result: {result}")
+
+
 def main():
     # reserve a free port for the fake cloud but don't start it yet --
     # that's "disconnected from the internet"
@@ -124,10 +174,8 @@ def main():
 
     start_all(supabase_url, fake_port)
     try:
-        print("waiting for uvicorn to boot...")
-        time.sleep(2.0)
-
-        leader_id, leader_port = find_leader()
+        print("waiting for uvicorn to boot and Raft to settle on a stable leader...")
+        leader_id, leader_port = wait_for_stable_leader()
         print(f"leader is {leader_id} on :{leader_port}")
 
         post_photo(leader_port, "flower_arch")
@@ -136,7 +184,7 @@ def main():
 
         # --- disconnected: cluster keeps working, sync fails softly ---
         print("cloud is not listening yet (simulating no internet)...")
-        result = trigger(leader_port)
+        leader_id, leader_port, result = trigger_leader(leader_id, leader_port)
         print("trigger while disconnected:", result)
         if result["synced"] != 0 or not result["last_error"]:
             print(f"FAIL: expected a soft failure (synced=0, last_error set), got {result}")
@@ -153,7 +201,7 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
 
-        result = trigger(leader_port)
+        leader_id, leader_port, result = trigger_leader(leader_id, leader_port)
         print("trigger after reconnect:", result)
         if result["synced"] < 2 or result["last_error"]:
             print(f"FAIL: expected the backlog to sync cleanly, got {result}")
@@ -167,7 +215,7 @@ def main():
         print(f"PASS: backlog synced automatically on reconnect ({cloud_count} events)")
 
         # --- re-trigger with nothing new: 0 synced, no duplicates ---
-        result = trigger(leader_port)
+        leader_id, leader_port, result = trigger_leader(leader_id, leader_port)
         with fake_cloud_lock:
             cloud_count_after = len(fake_cloud_rows)
         if result["synced"] != 0 or cloud_count_after != cloud_count:
@@ -179,7 +227,7 @@ def main():
         # --- one more real event: incremental, not a full resend ---
         post_photo(leader_port, "dance_floor")
         time.sleep(0.2)
-        result = trigger(leader_port)
+        leader_id, leader_port, result = trigger_leader(leader_id, leader_port)
         if result["synced"] != 1:
             print(f"FAIL: expected exactly 1 new event synced incrementally, got {result['synced']}")
             return 1
