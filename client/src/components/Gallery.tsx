@@ -2,7 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { useLiveQuery } from "dexie-react-hooks";
 import { db } from "../db";
 import { pickNode } from "../nodes";
-import type { OutboxPhoto, RemotePhoto } from "../types";
+import { syncOutbox } from "../sync";
+import { tick } from "../vclock";
+import { currentGuestId } from "../guest";
+import type { OutboxItem, OutboxPhoto, RemotePhoto } from "../types";
 
 /** Groups photos into connected components by `concurrent_with` (an
  * undirected adjacency -- if A lists B, B lists A too, per main.py's
@@ -41,7 +44,7 @@ export function Gallery() {
   const outbox = useLiveQuery(
     () => db.outbox.orderBy("created_at").reverse().toArray(),
     [],
-    [] as OutboxPhoto[],
+    [] as OutboxItem[],
   );
 
   // photo_id -> local blob, for the subset of remote entries that are
@@ -52,9 +55,33 @@ export function Gallery() {
   // metadata-only card, honestly, instead of a broken image.
   const ownBlobs = useMemo(() => {
     const map = new Map<string, Blob>();
-    for (const o of outbox) if (o.photo_id) map.set(o.photo_id, o.blob);
+    for (const o of outbox) if (o.kind === "photo" && o.photo_id) map.set(o.photo_id, o.blob);
     return map;
   }, [outbox]);
+
+  // photo_ids this device has already tapped like on (queued or synced) --
+  // used to show the button as already-liked instead of letting it be
+  // tapped repeatedly. Not required for correctness (store.like_count is
+  // a set-union CRDT over guest_id, so a duplicate like is a no-op
+  // server-side), just to avoid firing pointless requests.
+  const likedPhotoIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const o of outbox) if (o.kind === "like") set.add(o.photo_id);
+    return set;
+  }, [outbox]);
+
+  async function likePhoto(photoId: string) {
+    await db.outbox.add({
+      local_id: crypto.randomUUID(),
+      kind: "like",
+      guest_id: currentGuestId(),
+      photo_id: photoId,
+      vclock: tick(),
+      created_at: Date.now(),
+      synced: 0,
+    });
+    void syncOutbox();
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -79,7 +106,7 @@ export function Gallery() {
     };
   }, []);
 
-  const queued = outbox.filter((o) => !o.synced);
+  const queued = outbox.filter((o): o is OutboxPhoto => o.kind === "photo" && !o.synced);
   const groups = groupConcurrent(remote);
 
   return (
@@ -109,7 +136,14 @@ export function Gallery() {
             )}
             <div className="photo-row">
               {group.map((p) => (
-                <RemoteCard key={p.photo_id} photo={p} blob={ownBlobs.get(p.photo_id)} />
+                <RemoteCard
+                  key={p.photo_id}
+                  photo={p}
+                  blob={ownBlobs.get(p.photo_id)}
+                  node={node}
+                  liked={likedPhotoIds.has(p.photo_id)}
+                  onLike={() => likePhoto(p.photo_id)}
+                />
               ))}
             </div>
           </div>
@@ -135,19 +169,48 @@ function QueuedCard({ item }: { item: OutboxPhoto }) {
   );
 }
 
-function RemoteCard({ photo, blob }: { photo: RemotePhoto; blob?: Blob }) {
-  const url = useMemo(() => (blob ? URL.createObjectURL(blob) : null), [blob]);
-  useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
+function RemoteCard({
+  photo,
+  blob,
+  node,
+  liked,
+  onLike,
+}: {
+  photo: RemotePhoto;
+  blob?: Blob;
+  node: string | null;
+  liked: boolean;
+  onLike: () => void;
+}) {
+  const localUrl = useMemo(() => (blob ? URL.createObjectURL(blob) : null), [blob]);
+  useEffect(() => () => { if (localUrl) URL.revokeObjectURL(localUrl); }, [localUrl]);
+
+  // No local blob (this device didn't capture it) -- fall back to
+  // fetching the image straight from a node, which can serve it because
+  // gossip already replicated the full photo event (bytes included) to
+  // every node. If that 404s (an older capture with no image_base64
+  // attached), fall back to the honest metadata-only placeholder instead
+  // of a broken image icon.
+  const [remoteFailed, setRemoteFailed] = useState(false);
+  const src = localUrl ?? (node && !remoteFailed ? `${node}/photos/${photo.photo_id}/image` : null);
+
   return (
     <div className="photo-card">
-      {url ? (
-        <img src={url} alt={photo.zone} />
+      {src ? (
+        <img src={src} alt={photo.zone} onError={() => setRemoteFailed(true)} />
       ) : (
         <div className="photo-placeholder">{photo.zone.replace("_", " ")}</div>
       )}
       <div className="photo-meta">
         <span>{photo.guest_id}</span>
-        <span>♥ {photo.likes}</span>
+        <button
+          className={`like-button ${liked ? "liked" : ""}`}
+          onClick={onLike}
+          disabled={liked}
+          aria-label={liked ? "Liked" : "Like this photo"}
+        >
+          ♥ {photo.likes}
+        </button>
       </div>
     </div>
   );

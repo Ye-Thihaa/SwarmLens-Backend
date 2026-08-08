@@ -149,11 +149,32 @@ class Store:
         photos = []
         for r in await cur.fetchall():
             p = json.loads(r["payload"])
+            p.pop("image_base64", None)  # kept out of the list view -- see
+            # photo_image_b64 below, which serves it separately so this
+            # endpoint (polled every few seconds by the client) doesn't
+            # ship every photo's full image bytes on every call.
             p["likes"] = await self.like_count(p["photo_id"])
             p["stored_on"] = r["origin"]
             p["vclock"] = json.loads(r["vclock"])
+            p["taken_at"] = r["created_at"]  # already on the event, just not exposed until now
             photos.append(p)
         return photos
+
+    async def photo_image_b64(self, photo_id: str) -> str | None:
+        """Raw image bytes for one photo, base64-encoded, straight from the
+        event log -- no second storage path, same source of truth gossip
+        already replicated everywhere. None if this photo was never
+        uploaded with image_base64 (metadata-only test photos, or captures
+        from a guest client that predates this field)."""
+        cur = await self.db.execute(
+            "SELECT payload FROM events WHERE kind='photo' "
+            "AND json_extract(payload,'$.photo_id')=? LIMIT 1",
+            (photo_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        return json.loads(row["payload"]).get("image_base64")
 
     async def like_count(self, photo_id: str) -> int:
         """Set-union CRDT: one guest liking twice still counts once, in any order."""

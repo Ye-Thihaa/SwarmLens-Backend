@@ -1,8 +1,8 @@
 import Dexie, { type Table } from "dexie";
-import type { OutboxPhoto } from "./types";
+import type { OutboxItem } from "./types";
 
 class SwarmLensDB extends Dexie {
-  outbox!: Table<OutboxPhoto, string>;
+  outbox!: Table<OutboxItem, string>;
 
   constructor() {
     super("swarmlens-guest");

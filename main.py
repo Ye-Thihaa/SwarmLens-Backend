@@ -2,13 +2,14 @@ import asyncio
 import base64
 import os
 import random
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 import ai_engine
@@ -33,6 +34,13 @@ INTERVAL = float(os.getenv("GOSSIP_INTERVAL", "1.0"))
 SELF_URL = os.getenv("SELF_URL", "")
 SELF_ID = SELF_URL or NODE_ID
 N = len(PEERS) + 1   # fixed cluster size (this node + its configured peers)
+# Gates the chaos endpoints (see require_operator_token below). Fails
+# open -- same as always -- when unset, so test_quorum.py, load_test.py
+# and dashboard.html, none of which ever set this, keep working exactly
+# as before. Set it to actually protect a real running cluster; the
+# operator console (client-2) sends it as X-Operator-Token once its own
+# password gate (a separate secret, see client-2/.env) has been passed.
+OPERATOR_TOKEN = os.getenv("OPERATOR_TOKEN", "")
 
 store = Store(DB_PATH, NODE_ID)
 gossip = Gossip(NODE_ID, PEERS, store, INTERVAL)
@@ -145,6 +153,7 @@ class PhotoIn(BaseModel):
     url: str = ""
     composition_score: int = 0
     vclock: dict[str, int] = {}
+    image_base64: str | None = None
 
 
 class LikeIn(BaseModel):
@@ -199,6 +208,26 @@ async def list_photos():
             if q["photo_id"] != p["photo_id"] and _concurrent(p["vclock"], q["vclock"])
         ]
     return {"node": NODE_ID, "photos": photos}
+
+
+@app.get("/photos/{photo_id}/image")
+async def photo_image(photo_id: str):
+    """Serves one photo's actual image bytes, decoded from the same event
+    log entry gossip already replicated to every node -- no separate media
+    storage or CDN, this repo has none (see ai_engine.py's /analyze
+    docstring). Split out from GET /photos so the list endpoint (polled
+    every few seconds by the client) stays light instead of shipping every
+    photo's full bytes on every poll. 404 if this photo has no
+    image_base64 attached (metadata-only test photos, or captures from a
+    guest client older than this endpoint)."""
+    b64 = await store.photo_image_b64(photo_id)
+    if not b64:
+        raise HTTPException(404, "no image stored for this photo")
+    try:
+        image_bytes = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise HTTPException(500, "corrupt stored image")
+    return Response(content=image_bytes, media_type="image/jpeg")
 
 
 class AnalyzeIn(BaseModel):
@@ -462,6 +491,17 @@ async def cloud_sync_status():
 
 # ---------------------------- ops & chaos ----------------------------
 
+async def require_operator_token(x_operator_token: str = Header(default="")):
+    """Gate for the chaos endpoints. secrets.compare_digest avoids a
+    timing side-channel that would otherwise let an attacker guess the
+    token one byte at a time. No-op (open) when OPERATOR_TOKEN isn't
+    configured on this node -- see the constant's own comment for why."""
+    if not OPERATOR_TOKEN:
+        return
+    if not secrets.compare_digest(x_operator_token, OPERATOR_TOKEN):
+        raise HTTPException(401, "invalid or missing X-Operator-Token")
+
+
 @app.get("/jobs/{photo_id}")
 async def job_status(photo_id: str):
     return await store.job_state(photo_id)
@@ -486,7 +526,7 @@ async def health():
 
 
 @app.post("/chaos/partition/{peer_index}")
-async def partition(peer_index: int):
+async def partition(peer_index: int, _: None = Depends(require_operator_token)):
     """Simulate a network split without touching Docker or iptables."""
     peer = PEERS[peer_index]
     gossip.partitioned.add(peer)
@@ -494,7 +534,7 @@ async def partition(peer_index: int):
 
 
 @app.post("/chaos/heal")
-async def heal():
+async def heal(_: None = Depends(require_operator_token)):
     gossip.partitioned.clear()
     return {"partitioned_from": []}
 

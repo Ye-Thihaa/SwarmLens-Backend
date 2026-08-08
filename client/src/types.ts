@@ -23,6 +23,24 @@ export interface OutboxPhoto {
   error?: string;
 }
 
+/** A pending "like" tap -- same offline-outbox treatment as a photo
+ * capture (write immediately, sync in the background). Unlike
+ * OutboxPhoto.photo_id (assigned by the backend once synced), this
+ * photo_id is the like's target and is always known up front. */
+export interface OutboxLike {
+  local_id: string;
+  kind: "like";
+  guest_id: string;
+  photo_id: string;
+  vclock: VClock;
+  created_at: number;
+  synced: 0 | 1;
+  synced_at?: number;
+  error?: string;
+}
+
+export type OutboxItem = OutboxPhoto | OutboxLike;
+
 /** Shape returned by GET /photos on a node -- see main.py's list_photos. */
 export interface RemotePhoto {
   photo_id: string;
