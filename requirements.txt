@@ -2,7 +2,15 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 aiosqlite==0.20.0
 httpx==0.28.1
-pydantic==2.10.4
+# pydantic-core only publishes a Windows cp314 (Python 3.14) wheel from
+# 2.40.0 onward -- 2.27.0 and 2.33.0 confirmed do NOT have one. Below
+# that floor, pip falls back to compiling pydantic-core from source
+# (Rust + the MSVC linker), which fails on a machine without Visual
+# Studio Build Tools installed. The explicit pydantic-core floor (not
+# just a pydantic floor) is what actually pins the fix -- pydantic's own
+# version number doesn't move in lockstep with pydantic-core's.
+pydantic>=2.11,<3
+pydantic-core>=2.40
 
 # ai_engine.py -- saliency (contrib, not base opencv-python, for cv2.saliency),
 # CLIP inference via ONNX Runtime, CLIP's tokenizer. See ai_engine.py's module
