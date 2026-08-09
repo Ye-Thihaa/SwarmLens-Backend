@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { GuestTabs, PerfRail } from "@/guest/ui";
 import { CLUSTER_SIZE, prettyZone, replicaAcks } from "@/lib/api";
@@ -83,8 +83,25 @@ function Mine() {
           </p>
         </section>
       ) : (
-        <section className="film-edge overflow-x-auto bg-emulsion-lift py-4 [scrollbar-width:none]">
-          <div className="flex gap-3 px-4">
+        <>
+          <div className="px-5 pt-5 pb-2">
+            <Link
+              to="/album"
+              className="block rounded-sm border border-drifting/50 bg-drifting/10 px-4 py-3 text-center font-mono text-[0.7rem] font-bold tracking-widest text-drifting active:scale-[0.98]"
+            >
+              MAKE A PRINTABLE STRIP →
+            </Link>
+          </div>
+
+          {/* Profile-grid arrangement, newest first (roll is already sorted
+              that way) -- scroll down for earlier frames instead of the old
+              horizontal swipe strip that only ever showed one row at a time.
+              Two columns, not three: each tile keeps the full card (frame ID,
+              time, zone, perf rail, status) the strip version always had --
+              a bare thumbnail loses exactly the information that makes "on
+              the roll" legible, so the grid had to earn its width back
+              rather than trade detail for density. */}
+          <section className="grid grid-cols-2 gap-3 px-4">
             {roll.map((p) => {
               const ackCount = p.synced && p.photo_id ? (acks[p.photo_id] ?? 0) : 0;
               const held = p.synced && ackCount === CLUSTER_SIZE;
@@ -92,35 +109,35 @@ function Mine() {
               return (
                 <figure
                   key={p.local_id}
-                  className={`w-44 shrink-0 rounded-sm border bg-card p-2 ${
+                  className={`rounded-sm border bg-card p-2 ${
                     held ? "border-converged/50" : "border-drifting/40"
                   }`}
                 >
                   <img
                     src={url}
                     alt={prettyZone(p.zone)}
-                    className={`aspect-[3/4] w-full object-cover ${held ? "" : "settling"}`}
+                    className={`aspect-[3/4] w-full rounded-[2px] object-cover ${held ? "" : "settling"}`}
                   />
                   <figcaption className="mt-2">
-                    <p className="font-mono text-[0.62rem] tracking-widest text-fixer-dim">
+                    <p className="truncate font-mono text-[0.58rem] tracking-widest text-fixer-dim">
                       {(p.photo_id ?? p.local_id.slice(0, 8)).toUpperCase()} ·{" "}
                       {new Date(p.created_at).toLocaleTimeString("en-GB", { hour12: false })}
                     </p>
-                    <p className="mt-0.5 text-[0.78rem] leading-tight font-semibold capitalize">
+                    <p className="mt-0.5 truncate text-[0.78rem] leading-tight font-semibold capitalize">
                       {prettyZone(p.zone)}
                     </p>
                     <div className="mt-2 flex items-center justify-between">
                       <PerfRail acks={p.synced ? Math.max(ackCount, 1) : 0} total={CLUSTER_SIZE} />
                       <span
-                        className={`font-mono text-[0.58rem] tracking-widest ${
+                        className={`font-mono text-[0.52rem] tracking-widest ${
                           held ? "text-converged" : "text-drifting"
                         }`}
                       >
-                        {!p.synced ? "ON THE ROLL" : held ? "IN THE ROOM" : "GOSSIPING…"}
+                        {!p.synced ? "ROLL" : held ? "ROOM" : "…"}
                       </span>
                     </div>
                     {p.error && (
-                      <p className="mt-1 font-mono text-[0.55rem] tracking-widest text-safelight">
+                      <p className="mt-1 font-mono text-[0.5rem] tracking-widest text-safelight">
                         RETRY PENDING
                       </p>
                     )}
@@ -128,8 +145,8 @@ function Mine() {
                 </figure>
               );
             })}
-          </div>
-        </section>
+          </section>
+        </>
       )}
 
       <section className="px-5 py-7">
