@@ -285,10 +285,21 @@ function Capture() {
 
   // camera settings — the "doca cam" panel (all cosmetic, local to this phone)
   const [iso, setIso] = useState(2);
-  const [shutter, setShutter] = useState(3);
+  // Defaults to the FASTEST setting (index 0, no simulated blur) -- shutter
+  // now drives a real blur on both the live view and the saved photo (see
+  // applyExposure), so defaulting to index 3 meant the camera opened
+  // permanently soft, which read as "the resolution is bad" rather than
+  // "a deliberate shutter-speed effect is on by default". A camera app
+  // should open sharp.
+  const [shutter, setShutter] = useState(0);
   const [ev, setEv] = useState(4);
   const [ratio, setRatio] = useState(0);
   const [flash, setFlash] = useState(false);
+  // A brief full-screen white pulse at the moment of capture, same visual
+  // cue every real camera app uses -- without it, flash's only effect was a
+  // 10% brightness bump baked quietly into the file, which reads as "flash
+  // does nothing" even though it technically did something.
+  const [flashPulse, setFlashPulse] = useState(false);
   const [grid, setGrid] = useState(true);
   const [stamp, setStamp] = useState(true);
   const [timer, setTimer] = useState(0); // 0 | 3 | 10
@@ -337,7 +348,15 @@ function Capture() {
     let cancelled = false;
     setCameraError(null);
     navigator.mediaDevices
-      .getUserMedia({ video: { facingMode: facing }, audio: false })
+      .getUserMedia({
+        // No width/height here means "whatever the browser feels like",
+        // which on plenty of devices is a low default (640x480-ish) rather
+        // than the camera's actual capability -- ideal (not exact/min) so a
+        // phone without a sensor this large still gets its best available
+        // resolution instead of failing the constraint outright.
+        video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1920 } },
+        audio: false,
+      })
       .then((s) => {
         if (cancelled) {
           s.getTracks().forEach((t) => t.stop());
@@ -597,14 +616,17 @@ function Capture() {
   function shootOnce() {
     const raw = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
     if (!raw) return;
+    const exposed = applyExposure(raw, { ev: EV[ev]!, flash, shutterIndex: shutter, isoIndex: iso });
     const stockKey = filmStocks[stock]!.key;
     const preset = STOCK_PRESETS[stockKey] ?? DEFAULT_PRESET;
     const canvas = document.createElement("canvas");
-    canvas.width = raw.width;
-    canvas.height = raw.height;
+    canvas.width = exposed.width;
+    canvas.height = exposed.height;
     const ctx = canvas.getContext("2d")!;
     ctx.filter = buildFilterCss(stockKey, preset.tone, preset.color, preset.palette);
-    ctx.drawImage(raw, 0, 0);
+    ctx.drawImage(exposed, 0, 0);
+    ctx.filter = "none";
+    if (stamp) drawStamp(canvas, today);
     canvas.toBlob(
       async (blob) => {
         if (!blob) return;
@@ -631,12 +653,22 @@ function Capture() {
    * guest hasn't touched the strip), so the review opens already looking
    * like a reasonable default rather than flat/neutral. */
   function shoot() {
+    if (flash) {
+      setFlashPulse(true);
+      setTimeout(() => setFlashPulse(false), 180);
+    }
     if (burst) {
       for (let i = 0; i < 3; i++) shootOnce();
       return;
     }
-    const canvas = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
-    if (!canvas) return;
+    const raw = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
+    if (!raw) return;
+    // Exposure (ISO/EV/flash/shutter) is baked in here, before the film
+    // stock the review sheet lets the guest choose -- same order a real
+    // camera works in: exposure happens at the sensor, the stock's color
+    // response is a separate, later step. The review preview shows exactly
+    // this already-exposed frame with the stock filter layered on top live.
+    const canvas = applyExposure(raw, { ev: EV[ev]!, flash, shutterIndex: shutter, isoIndex: iso });
     const preset = STOCK_PRESETS[filmStocks[stock]!.key] ?? DEFAULT_PRESET;
     setReviewing({
       canvas,
@@ -674,6 +706,8 @@ function Capture() {
     const ctx = out.getContext("2d")!;
     ctx.filter = filterCss;
     ctx.drawImage(reviewing.canvas, 0, 0);
+    ctx.filter = "none";
+    if (stamp) drawStamp(out, today);
     out.toBlob(
       async (blob) => {
         if (!blob) return;
@@ -737,17 +771,24 @@ function Capture() {
   // framing is now what they'll actually get, for every stock, not just
   // the two that happened to get bespoke Tailwind classes.
   //
-  // flash's brightness bump is folded into this same string rather than
-  // left as a separate Tailwind `brightness-110` class: an inline
-  // style.filter (below) overrides a class's `filter` entirely rather than
-  // composing with it, so a class-based brightness would silently stop
-  // doing anything the moment this was added.
+  // EV/flash/shutter are folded into this same string too (matching
+  // applyExposure's shot-time math) rather than left as separate classes:
+  // an inline style.filter (below) overrides a class's `filter` entirely
+  // rather than composing with it, so a class-based brightness would
+  // silently stop doing anything the moment this was added. ISO's vignette
+  // is the one exposure control NOT here -- it's a spatial gradient, not a
+  // filter function, so it stays the separate boxShadow div below, same as
+  // it always has been.
   const liveStockKey = filmStocks[stock]!.key;
   const livePreset = STOCK_PRESETS[liveStockKey] ?? DEFAULT_PRESET;
   const liveFilterCss = buildFilterCss(liveStockKey, livePreset.tone, livePreset.color, livePreset.palette);
+  const liveBrightness = evBrightness(EV[ev]!) * (flash ? 1.35 : 1);
+  const liveBlurPx = shutter * 0.5;
 
   const videoStyle: React.CSSProperties = {
-    filter: flash ? `${liveFilterCss} brightness(1.1)` : liveFilterCss,
+    filter: [liveFilterCss, `brightness(${liveBrightness.toFixed(3)})`, liveBlurPx > 0 ? `blur(${liveBlurPx}px)` : ""]
+      .filter(Boolean)
+      .join(" "),
   };
   if (videoTransformParts.length) videoStyle.transform = videoTransformParts.join(" ");
 
@@ -1053,10 +1094,18 @@ function Capture() {
         {/* scrim so the controls stay legible over a bright room */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-72 bg-gradient-to-t from-emulsion via-emulsion/85 to-transparent" />
 
-        {/* SETTINGS PANEL — the "advanced" drawer of a retro cam */}
+        {/* SETTINGS PANEL — the "advanced" drawer of a retro cam.
+            Deliberately NOT near-opaque: ratio, zoom and film-stock changes
+            are visible live in the viewfinder behind this panel, and a
+            solid bg-emulsion/90 + full backdrop-blur made that impossible
+            to see -- adjusting a setting and having no visual feedback that
+            it did anything (until closing the panel) reads as "broken",
+            same failure shape as a control with no effect at all. Individual
+            Dial/Toggle controls keep their own bg-emulsion/60-70, so text
+            stays legible even with the outer panel this much lighter. */}
         {panel && (
           <div className="absolute inset-x-0 bottom-[16.5rem] px-4">
-            <div className="film-edge rounded-sm border border-fixer/20 bg-emulsion/90 px-3 py-5 backdrop-blur">
+            <div className="film-edge rounded-sm border border-fixer/20 bg-emulsion/45 px-3 py-5 backdrop-blur-sm">
               <div className="flex gap-2">
                 <Dial label="ISO" values={ISO} index={iso} onChange={setIso} />
                 <Dial label="SHUTTER" values={SHUTTER} index={shutter} onChange={setShutter} />
@@ -1303,6 +1352,18 @@ function Capture() {
             </div>
           </div>
         )}
+
+        {/* Flash pulse: last in DOM order (and z-50, belt and suspenders)
+            so it's never hidden behind the review sheet even if a burst
+            shot's timing overlaps it. transition rather than a keyframe
+            animation -- flashPulse is only ever true for 180ms, so a plain
+            opacity transition already gives the fast-in/slow-out shape a
+            real flash has without needing to hand-tune easing curves. */}
+        <div
+          className={`pointer-events-none absolute inset-0 z-50 bg-white transition-opacity ${
+            flashPulse ? "opacity-90 duration-75" : "opacity-0 duration-150"
+          }`}
+        />
       </div>
 
       <GuestTabs active="capture" />
@@ -1352,6 +1413,75 @@ function captureFrame(
   canvas.height = sh;
   canvas.getContext("2d")!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
   return canvas;
+}
+
+/** EV compensation as an actual brightness multiplier -- "+0.3" of real EV
+ * roughly doubles perceived exposure per stop, but a literal doubling per
+ * dial click reads as a lighting switch flipping rather than a compensation
+ * dial, so this is a gentler, still-monotonic mapping rather than a
+ * physically exact one: +-1.0 EV covers roughly +-40% brightness. */
+function evBrightness(evLabel: string): number {
+  return 1 + parseFloat(evLabel) * 0.4;
+}
+
+/** Bakes ISO (vignette), EV + FLASH (brightness), and SHUTTER (blur, standing
+ * in for motion blur at a slower simulated shutter speed) into real pixels on
+ * a fresh canvas -- the "exposure" stage of the shot, applied once right
+ * after the raw frame is grabbed and before any film-stock look is chosen.
+ * Real camera settings work in that order (exposure happens at the sensor;
+ * a film stock's color response is a separate, later step), and the review
+ * sheet's whole premise -- pick a stock, adjust after the fact -- only makes
+ * sense if what it's adjusting is already-exposed pixels, not a live filter
+ * that quietly vanishes the moment you leave the viewfinder. */
+function applyExposure(
+  raw: HTMLCanvasElement,
+  opts: { ev: string; flash: boolean; shutterIndex: number; isoIndex: number },
+): HTMLCanvasElement {
+  const out = document.createElement("canvas");
+  out.width = raw.width;
+  out.height = raw.height;
+  const ctx = out.getContext("2d")!;
+
+  const brightness = evBrightness(opts.ev) * (opts.flash ? 1.35 : 1);
+  const filterParts = [`brightness(${brightness.toFixed(3)})`];
+  // Scaled to the actual capture resolution, not a fixed px count: the live
+  // preview's blur reads fine at a few px because it's displayed at maybe
+  // 350-400 CSS px wide, but a real capture can be several thousand pixels
+  // wide, where a flat 0-2.5px blur would be completely invisible.
+  const blurPx = opts.shutterIndex * (out.width / 800);
+  if (blurPx > 0) filterParts.push(`blur(${blurPx.toFixed(2)}px)`);
+  ctx.filter = filterParts.join(" ");
+  ctx.drawImage(raw, 0, 0);
+  ctx.filter = "none";
+
+  const vignetteStrength = opts.isoIndex * 0.06; // index 0 (ISO 100) -> none ... index 5 (3200) -> 0.3 alpha
+  if (vignetteStrength > 0) {
+    const w = out.width, h = out.height;
+    const cx = w / 2, cy = h / 2;
+    const outerR = Math.hypot(cx, cy);
+    const grad = ctx.createRadialGradient(cx, cy, outerR * 0.55, cx, cy, outerR);
+    grad.addColorStop(0, "rgba(0,0,0,0)");
+    grad.addColorStop(1, `rgba(0,0,0,${vignetteStrength.toFixed(3)})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+  }
+  return out;
+}
+
+/** Burns the date-stamp text into the corner, same font/color/position
+ * language as the live overlay -- drawn last (after the film-stock filter),
+ * so it stays legible instead of picking up e.g. Tri-X's grayscale. */
+function drawStamp(canvas: HTMLCanvasElement, label: string) {
+  const ctx = canvas.getContext("2d")!;
+  const fontSize = Math.max(12, Math.round(canvas.width * 0.035));
+  const pad = fontSize * 0.7;
+  ctx.font = `700 ${fontSize}px "JetBrains Mono", monospace`;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.shadowColor = "rgba(0,0,0,0.65)";
+  ctx.shadowBlur = fontSize * 0.35;
+  ctx.fillStyle = "oklch(0.55 0.18 30)"; // --safelight
+  ctx.fillText(label, canvas.width - pad, canvas.height - pad);
 }
 
 /** Center-crops the live video to `ar` -- exactly how the viewfinder shows
