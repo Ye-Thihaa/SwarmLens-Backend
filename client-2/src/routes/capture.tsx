@@ -245,6 +245,20 @@ function Capture() {
   // panel never shows a zoom level that disagrees with what's on screen.
   const [zoomIndex, setZoomIndex] = useState(0);
 
+  // Auto-zoom stability (see the tick effect for the two-rule shape:
+  // engaging from nothing is immediate, only CHANGING or RELEASING an
+  // already-applied zoom is debounced). RECT_JITTER_TOL has to be loose
+  // enough to absorb ordinary tick-to-tick sensor noise -- autofocus
+  // hunting, exposure settling, JPEG artifacts -- or two consecutive real
+  // reads essentially never agree and auto-zoom silently never commits
+  // anything, which is exactly what a first, stricter version of this did.
+  const ZOOM_STABLE_TICKS = 2;
+  const RECT_JITTER_TOL = 0.15;
+  const zoomCandidateRef = useRef<{ rect: { x: number; y: number; w: number; h: number }; zoom: number } | null>(
+    null,
+  );
+  const zoomStableCountRef = useRef(0);
+
   const [stock, setStock] = useState(0);
 
   // Post-capture review: the shutter no longer queues straight to the
@@ -300,6 +314,8 @@ function Capture() {
     setDigitalZoom(null);
     setZoomIndex(0);
     setAutoZoom(true);
+    zoomCandidateRef.current = null;
+    zoomStableCountRef.current = 0;
   }, [ratio, aiOn, facing]);
 
   /** Drives digitalZoom from the manual ZOOM dial: a plain centered crop at
@@ -446,18 +462,73 @@ function Capture() {
                 const i = filmStocks.findIndex((f) => f.key === result.suggested_filter);
                 if (i >= 0) setStock(i);
               }
-              // Real auto-zoom: apply (or release) every tick, no tap
-              // needed. Absolute against the full frame (see above), so
-              // this replaces digitalZoom wholesale rather than composing
-              // with whatever was there -- a subject walking closer should
-              // loosen the crop just as readily as a distant one tightens it.
+              // Real auto-zoom. Absolute against the full frame (see
+              // above), so a committed rect replaces digitalZoom wholesale
+              // rather than composing with whatever was there -- a subject
+              // walking closer loosens the crop just as readily as a
+              // distant one tightens it.
+              //
+              // Two different rules for two different moments, not one
+              // stability gate for both: engaging FROM NOTHING applies
+              // immediately -- any delay there just reads as "auto-zoom
+              // isn't working". CHANGING or RELEASING an already-applied
+              // zoom is what needs debouncing, since that's what flickers
+              // when consecutive reads disagree by sensor noise alone
+              // (autofocus hunting, exposure settling, JPEG artifacts --
+              // real cameras are noisier tick to tick than a static test
+              // image). RECT_JITTER_TOL is deliberately generous: it only
+              // needs to catch "basically the same framing", not exact
+              // agreement, or ordinary noise defeats it exactly like the
+              // stricter version did (this shipped once already and simply
+              // never committed on a real phone).
               if (autoZoomRef.current) {
-                if (result.reframe.worth_it) {
-                  setDigitalZoom({ rect: result.reframe.rect, zoom: result.reframe.zoom });
-                  setZoomIndex(nearestZoomStep(result.reframe.zoom));
+                const candidate = result.reframe.worth_it
+                  ? { rect: result.reframe.rect, zoom: result.reframe.zoom }
+                  : null;
+                const current = digitalZoomRef.current;
+
+                if (candidate && current && rectsSimilar(candidate.rect, current.rect, RECT_JITTER_TOL)) {
+                  // Same framing as what's already applied -- nothing to do,
+                  // and this is also the natural point to stop counting
+                  // toward some earlier, now-stale pending change.
+                  zoomCandidateRef.current = null;
+                  zoomStableCountRef.current = 0;
+                } else if (current === null) {
+                  // Nothing applied yet: engage on the very first worth_it
+                  // reading, no debounce. A guest should see the zoom react
+                  // as soon as they point at something, not after a pause.
+                  if (candidate) {
+                    setDigitalZoom(candidate);
+                    setZoomIndex(nearestZoomStep(candidate.zoom));
+                  }
+                  zoomCandidateRef.current = null;
+                  zoomStableCountRef.current = 0;
                 } else {
-                  setDigitalZoom(null);
-                  setZoomIndex(0);
+                  // Something's already applied and this reading disagrees
+                  // with it (a real change, or the subject's gone) -- only
+                  // commit once the SAME alternative has been read
+                  // ZOOM_STABLE_TICKS times in a row, so a guest actively
+                  // panning or tilting never gets fought with mid-move.
+                  const prevPending = zoomCandidateRef.current;
+                  const pendingAgrees =
+                    (candidate === null && prevPending === null) ||
+                    (candidate !== null &&
+                      prevPending !== null &&
+                      rectsSimilar(candidate.rect, prevPending.rect, RECT_JITTER_TOL));
+                  zoomStableCountRef.current = pendingAgrees ? zoomStableCountRef.current + 1 : 1;
+                  zoomCandidateRef.current = candidate;
+
+                  if (zoomStableCountRef.current >= ZOOM_STABLE_TICKS) {
+                    if (candidate) {
+                      setDigitalZoom(candidate);
+                      setZoomIndex(nearestZoomStep(candidate.zoom));
+                    } else {
+                      setDigitalZoom(null);
+                      setZoomIndex(0);
+                    }
+                    zoomCandidateRef.current = null;
+                    zoomStableCountRef.current = 0;
+                  }
                 }
               }
             }
@@ -800,6 +871,8 @@ function Capture() {
                         setDigitalZoom(null);
                         setZoomIndex(0);
                         setAutoZoom(true);
+                        zoomCandidateRef.current = null;
+                        zoomStableCountRef.current = 0;
                       }}
                       className="pointer-events-auto absolute right-2 bottom-2 rounded-sm border border-safelight/60 bg-emulsion/85 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-safelight active:scale-95"
                     >
@@ -1013,11 +1086,18 @@ function Capture() {
                   on={autoZoom}
                   onClick={() =>
                     setAutoZoom((v) => {
-                      // Turning auto off: freeze the ZOOM dial at wherever
-                      // auto-zoom currently has it, so switching to manual
-                      // doesn't jump the frame. Turning it back on: the next
-                      // tick takes over, nothing to sync here.
-                      if (v) setZoomIndex(digitalZoom ? nearestZoomStep(digitalZoom.zoom) : 0);
+                      if (v) {
+                        // Turning auto off: freeze the ZOOM dial at wherever
+                        // auto-zoom currently has it, so switching to manual
+                        // doesn't jump the frame.
+                        setZoomIndex(digitalZoom ? nearestZoomStep(digitalZoom.zoom) : 0);
+                      } else {
+                        // Turning auto back on: start the stability count
+                        // fresh rather than resuming whatever it was mid-way
+                        // through when auto got switched off.
+                        zoomCandidateRef.current = null;
+                        zoomStableCountRef.current = 0;
+                      }
                       return !v;
                     })
                   }
@@ -1372,6 +1452,22 @@ function nearestZoomStep(zoom: number): number {
     }
   });
   return best;
+}
+
+/** "Close enough to call the same framing" for auto-zoom's stability check
+ * (see zoomCandidateRef) -- position within 6% of the frame and size within
+ * 6% counts as the guest holding roughly still, not a new recommendation. */
+function rectsSimilar(
+  a: { x: number; y: number; w: number; h: number },
+  b: { x: number; y: number; w: number; h: number },
+  tol = 0.06,
+): boolean {
+  return (
+    Math.abs(a.x - b.x) < tol &&
+    Math.abs(a.y - b.y) < tol &&
+    Math.abs(a.w - b.w) < tol &&
+    Math.abs(a.h - b.h) < tol
+  );
 }
 
 /** TONE/COLOR/PALETTE -> a real canvas `filter` string, applied both live
