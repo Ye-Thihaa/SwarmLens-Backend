@@ -198,21 +198,13 @@ export type ArGuide = {
 /** rect/subject_box are normalized 0..1 against the frame that was sent,
  * so they overlay the viewfinder directly -- which is why the client must
  * send the frame cropped the way it's displayed (see grabPreviewFrame in
- * routes/capture.tsx), not the raw uncropped sensor image.
- *
- * `basis` distinguishes a real detected subject from ai_engine.py's
- * aesthetic-score fallback (used when no single subject was found but a
- * tighter crop still measurably scores better) -- the UI should not call
- * the latter a "subject" or imply anything was detected, just that a crop
- * measurably helped. `null` means neither found anything worth suggesting. */
+ * routes/capture.tsx), not the raw uncropped sensor image. */
 export type Reframe = {
   rect: Rect;
   subject_box: Rect;
   zoom: number;
   worth_it: boolean;
   subject_found: boolean;
-  basis: "subject" | "aesthetic" | null;
-  aesthetic_gain?: number;
 };
 
 export type ComposePreview = {

@@ -212,20 +212,36 @@ function Capture() {
     [],
   );
 
-  // Tap-to-zoom: "ZOOM IN 2.3x" turns the passive crop-rectangle label into
-  // an actual digital zoom, the same move doca cam's viewfinder does. `rect`
-  // is always absolute against the ar-cropped full frame, in the SAME
-  // coordinate space grabPreviewFrame already mirrors into when facing the
-  // selfie camera (composeRect folds a second tap's rect, itself relative
-  // to the already-zoomed view, into that same absolute space) so shootOnce
-  // can crop straight from it without knowing how many taps got it there or
-  // which camera is active.
+  // Auto-zoom: when on (the default), the viewfinder zooms itself into
+  // whatever crop ai_engine.py's saliency-based subject detection
+  // recommends, every tick -- no tap required. `rect` is always absolute
+  // against the ar-cropped full frame, in the SAME coordinate space
+  // grabPreviewFrame already mirrors into when facing the selfie camera, so
+  // shootOnce can crop straight from it without caring which camera is
+  // active. Read via digitalZoomRef (below) inside the preview tick, NOT as
+  // a dependency of that effect -- see the ref's own comment for why.
   const [digitalZoom, setDigitalZoom] = useState<{
     rect: { x: number; y: number; w: number; h: number };
     zoom: number;
   } | null>(null);
+  const digitalZoomRef = useRef(digitalZoom);
+  useEffect(() => {
+    digitalZoomRef.current = digitalZoom;
+  }, [digitalZoom]);
+
+  // Touching the manual ZOOM dial (or the reset chip) takes over from
+  // auto-zoom; the AUTO ZOOM toggle in settings hands control back. Kept as
+  // a ref, read inside the same tick that would otherwise auto-apply a new
+  // rect, so flipping it takes effect on the very next frame rather than
+  // waiting for the polling effect to notice a stale closure.
+  const [autoZoom, setAutoZoom] = useState(true);
+  const autoZoomRef = useRef(autoZoom);
+  useEffect(() => {
+    autoZoomRef.current = autoZoom;
+  }, [autoZoom]);
+
   // The manual ZOOM dial's own position -- kept in sync with digitalZoom
-  // (see the AI-tap handler and the reset effect below) so the settings
+  // (see the auto-zoom tick and the reset effect below) so the settings
   // panel never shows a zoom level that disagrees with what's on screen.
   const [zoomIndex, setZoomIndex] = useState(0);
 
@@ -276,16 +292,22 @@ function Capture() {
   // The zoom rect's coordinate space is tied to both the frame ratio and
   // which camera is active (mirrored or not -- see grabPreviewFrame). Either
   // changing invalidates it. Turning AI off removes the only control that
-  // can reset it, so treat that as a reset too rather than leaving the guest
-  // stuck zoomed in with no way back.
+  // can drive it, so treat that as a reset too rather than leaving the guest
+  // stuck zoomed in with no way back. Also hands control back to auto-zoom,
+  // matching "changed something major, start fresh" rather than silently
+  // staying in whatever manual/auto state was active before.
   useEffect(() => {
     setDigitalZoom(null);
     setZoomIndex(0);
+    setAutoZoom(true);
   }, [ratio, aiOn, facing]);
 
   /** Drives digitalZoom from the manual ZOOM dial: a plain centered crop at
-   * the selected step, overriding whatever the AI's tap-to-zoom had set. */
+   * the selected step. Touching this dial is a deliberate "I'll drive"
+   * action, so it takes over from auto-zoom rather than being overwritten
+   * by the very next tick's recommendation. */
   function onManualZoomChange(i: number) {
+    setAutoZoom(false);
     setZoomIndex(i);
     const z = ZOOM_STEPS[i]!;
     setDigitalZoom(z <= 1 ? null : { rect: centeredZoomRect(z), zoom: z });
@@ -390,14 +412,20 @@ function Capture() {
       const node = video && canvas && video.videoWidth > 0 ? await pickNode() : null;
 
       if (!stopped && node) {
-        // Crop to the applied zoom rect (if any) so the AI reads the same
-        // tightened frame the guest is actually looking at, not the full
-        // scene it already recommended zooming out of. Mirroring happens
-        // inside grabPreviewFrame too, and must -- the zoom rect itself is
-        // expressed in mirrored space when facing the selfie camera (see
-        // digitalZoom's docstring above), so the two have to agree on
-        // orientation or every box lands on the wrong side of its subject.
-        const frame = grabPreviewFrame(video!, canvas!, ar, mirrored, digitalZoom?.rect);
+        // In auto-zoom mode, always analyze the FULL frame, not whatever
+        // digitalZoom currently holds: each tick proposes a fresh absolute
+        // crop, so a subject that moves -- or stops needing as tight a
+        // crop -- is tracked continuously instead of ratcheting in via
+        // composed rects and never loosening back up. In manual mode
+        // (the guest is driving the ZOOM dial), analyze whatever's
+        // actually on screen instead, so the pan arrows react to what the
+        // guest is really looking at. Mirroring happens inside
+        // grabPreviewFrame either way, and must -- the zoom rect is
+        // expressed in mirrored space when facing the selfie camera, so
+        // the two have to agree on orientation or every box lands on the
+        // wrong side of its subject.
+        const zoomRectForAnalysis = autoZoomRef.current ? undefined : digitalZoomRef.current?.rect;
+        const frame = grabPreviewFrame(video!, canvas!, ar, mirrored, zoomRectForAnalysis);
         if (frame) {
           setAiScanning(true);
           try {
@@ -418,6 +446,20 @@ function Capture() {
                 const i = filmStocks.findIndex((f) => f.key === result.suggested_filter);
                 if (i >= 0) setStock(i);
               }
+              // Real auto-zoom: apply (or release) every tick, no tap
+              // needed. Absolute against the full frame (see above), so
+              // this replaces digitalZoom wholesale rather than composing
+              // with whatever was there -- a subject walking closer should
+              // loosen the crop just as readily as a distant one tightens it.
+              if (autoZoomRef.current) {
+                if (result.reframe.worth_it) {
+                  setDigitalZoom({ rect: result.reframe.rect, zoom: result.reframe.zoom });
+                  setZoomIndex(nearestZoomStep(result.reframe.zoom));
+                } else {
+                  setDigitalZoom(null);
+                  setZoomIndex(0);
+                }
+              }
             }
           } catch {
             if (!stopped) setAi(null); // aborted, or the node went away
@@ -437,44 +479,21 @@ function Capture() {
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-    // digitalZoom is intentionally a dep, not just read from a ref: applying
-    // or resetting zoom should trigger an immediate re-read of the new view
-    // instead of waiting up to PREVIEW_INTERVAL_MS for the next scheduled tick.
-  }, [aiOn, cameraError, ratio, mirrored, digitalZoom, isReviewing]);
+    // digitalZoom is read via a ref (digitalZoomRef), NOT listed as a dep
+    // here: auto-zoom sets it on nearly every tick, and depending on it
+    // directly would abort and restart this whole polling loop -- and its
+    // in-flight request -- every single time, faster than any request
+    // could ever complete. autoZoom itself IS a dep: it only changes via a
+    // deliberate tap (the dial, the reset chip, the settings toggle), so
+    // restarting the loop there is rare and gives an immediate re-read
+    // instead of waiting up to PREVIEW_INTERVAL_MS for the next tick.
+  }, [aiOn, cameraError, ratio, mirrored, isReviewing, autoZoom]);
 
   useEffect(() => {
     return () => {
       if (composeTimer.current) clearTimeout(composeTimer.current);
     };
   }, []);
-
-  // Guidance settle: the pan arrows re-render on every ~1.5s tick for as
-  // long as the frame isn't exactly on a thirds line, which without this
-  // never stops firing -- reading as nagging rather than help, and leaving
-  // no room for the guest to make their own compositional call. After the
-  // SAME direction has held for NUDGE_QUIET_MS, go quiet and trust the
-  // guest; a NEW direction (they moved, or the scene changed) resets the
-  // clock and speaks up again immediately.
-  const NUDGE_QUIET_MS = 4000;
-  const [nudgeQuiet, setNudgeQuiet] = useState(false);
-  const nudgeKeyRef = useRef<string | null>(null);
-  const nudgeSinceRef = useRef(0);
-
-  useEffect(() => {
-    if (!ai || !ai.ar_guide.subject_found || ai.ar_guide.well_composed) {
-      nudgeKeyRef.current = null;
-      setNudgeQuiet(false);
-      return;
-    }
-    const key = `${ai.ar_guide.pan_camera_x}-${ai.ar_guide.pan_camera_y}`;
-    if (key !== nudgeKeyRef.current) {
-      nudgeKeyRef.current = key;
-      nudgeSinceRef.current = Date.now();
-      setNudgeQuiet(false);
-    } else if (Date.now() - nudgeSinceRef.current > NUDGE_QUIET_MS) {
-      setNudgeQuiet(true);
-    }
-  }, [ai]);
 
   useEffect(() => {
     if (count === null) return;
@@ -755,36 +774,32 @@ function Capture() {
                     </div>
                   )}
 
-                  {ai?.reframe.worth_it && (
-                    <div
-                      className="settling absolute rounded-lg border-2 border-safelight/85"
-                      style={pct(ai.reframe.rect)}
+                  {/* Auto-zoom already applied this rect to the video's own
+                      transform the moment the tick that found it landed (see
+                      the preview effect) -- no tap needed, so there's no
+                      separate crop-rectangle-plus-button here to keep in
+                      sync with it. Just a status chip, and a way to hand
+                      control back and forth with the manual ZOOM dial. */}
+                  {autoZoom && digitalZoom && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAutoZoom(false);
+                        setZoomIndex(nearestZoomStep(digitalZoom.zoom));
+                      }}
+                      className="pointer-events-auto absolute right-2 bottom-2 rounded-sm border border-safelight/60 bg-emulsion/85 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-safelight active:scale-95"
                     >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const rect = digitalZoom
-                            ? composeRect(digitalZoom.rect, ai.reframe.rect)
-                            : ai.reframe.rect;
-                          const zoom = (digitalZoom?.zoom ?? 1) * ai.reframe.zoom;
-                          const rounded = Math.round(zoom * 100) / 100;
-                          setDigitalZoom({ rect, zoom: rounded });
-                          setZoomIndex(nearestZoomStep(rounded));
-                        }}
-                        className="pointer-events-auto absolute -bottom-6 right-0 rounded-sm border border-safelight/70 bg-safelight/90 px-2 py-1 font-mono text-[0.55rem] font-bold tracking-[0.16em] text-emulsion active:scale-95"
-                      >
-                        {ai.reframe.basis === "aesthetic" ? "TRY THIS CROP" : "ZOOM IN"}{" "}
-                        {ai.reframe.zoom}× →
-                      </button>
-                    </div>
+                      AUTO-ZOOMED {digitalZoom.zoom}× · TAP FOR MANUAL
+                    </button>
                   )}
 
-                  {digitalZoom && (
+                  {!autoZoom && digitalZoom && (
                     <button
                       type="button"
                       onClick={() => {
                         setDigitalZoom(null);
                         setZoomIndex(0);
+                        setAutoZoom(true);
                       }}
                       className="pointer-events-auto absolute right-2 bottom-2 rounded-sm border border-safelight/60 bg-emulsion/85 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-safelight active:scale-95"
                     >
@@ -802,7 +817,6 @@ function Capture() {
                   {ai &&
                     ai.ar_guide.subject_found &&
                     !ai.ar_guide.well_composed &&
-                    !nudgeQuiet &&
                     (() => {
                       const nudge = panInstruction(ai.ar_guide, mirrored);
                       if (!nudge) return null;
@@ -826,16 +840,13 @@ function Capture() {
                     </div>
                   )}
 
-                  {/* Say why there's nothing to show -- but only when there's
-                      genuinely nothing: a diffuse scene (~1 frame in 3 on real
-                      photos) with no single subject AND no aesthetic-crop
-                      recommendation either (ai_engine.py's fallback, gated on
-                      the crop rectangle above being worth_it). Silent absence
-                      reads as the feature being broken; but a guest
-                      deliberately shooting something with no single focal
-                      point -- a landscape, a mood shot, a texture -- isn't a
-                      failure case, so this says so instead of implying one. */}
-                  {ai && !ai.ar_guide.subject_found && !ai.reframe.worth_it && (
+                  {/* Say why there's nothing to show. Saliency genuinely finds
+                      no single subject in a diffuse scene (~1 frame in 3 on
+                      real photos); a guest deliberately shooting something
+                      with no single focal point -- a landscape, a mood shot,
+                      a texture -- isn't a failure case, so this says so
+                      instead of implying one. */}
+                  {ai && !ai.ar_guide.subject_found && (
                     <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 justify-center">
                       <span className="rounded-sm bg-emulsion/80 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-stale">
                         OPEN SCENE · SHOOT FREELY
@@ -997,6 +1008,21 @@ function Capture() {
                 </Toggle>
                 <Toggle on={aiOn} onClick={() => setAiOn((v) => !v)}>
                   AI COMPOSE {aiOn ? "ON" : "OFF"}
+                </Toggle>
+                <Toggle
+                  on={autoZoom}
+                  onClick={() =>
+                    setAutoZoom((v) => {
+                      // Turning auto off: freeze the ZOOM dial at wherever
+                      // auto-zoom currently has it, so switching to manual
+                      // doesn't jump the frame. Turning it back on: the next
+                      // tick takes over, nothing to sync here.
+                      if (v) setZoomIndex(digitalZoom ? nearestZoomStep(digitalZoom.zoom) : 0);
+                      return !v;
+                    })
+                  }
+                >
+                  AUTO ZOOM {autoZoom ? "ON" : "OFF"}
                 </Toggle>
                 <Toggle on={stamp} onClick={() => setStamp((v) => !v)}>
                   DATE STAMP
@@ -1321,27 +1347,11 @@ function pct(r: { x: number; y: number; w: number; h: number }) {
   };
 }
 
-/** Folds a rect expressed relative to `outer` (e.g. a second "zoom in" tap,
- * whose ai.reframe.rect is normalized against the already-zoomed view) into
- * the same absolute space `outer` itself is expressed in -- so a chain of
- * taps composes into one rect instead of each tap only knowing about the
- * one before it. */
-function composeRect(
-  outer: { x: number; y: number; w: number; h: number },
-  inner: { x: number; y: number; w: number; h: number },
-) {
-  return {
-    x: outer.x + inner.x * outer.w,
-    y: outer.y + inner.y * outer.h,
-    w: inner.w * outer.w,
-    h: inner.h * outer.h,
-  };
-}
-
-/** A plain centered crop at `zoom`, for the manual ZOOM dial -- unlike the
- * AI's composeRect chain, this doesn't try to preserve any earlier off-center
- * framing. Manually dialing zoom is a deliberate reset to "just make it
- * tighter/looser from the middle", not a refinement of the AI's guess. */
+/** A plain centered crop at `zoom`, for the manual ZOOM dial -- unlike
+ * auto-zoom's absolute-against-the-full-frame rect (see the preview tick),
+ * this doesn't try to track any subject, just centers on whatever's already
+ * in the middle. Manually dialing zoom is a deliberate "just make it
+ * tighter/looser" action, not a refinement of the AI's guess. */
 function centeredZoomRect(zoom: number) {
   const size = 1 / zoom;
   const off = (1 - size) / 2;
