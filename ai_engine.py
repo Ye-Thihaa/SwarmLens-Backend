@@ -45,6 +45,7 @@ nothing is committed to the repo, see the .gitignore entry for models/):
 
 import io
 import os
+import threading
 from functools import lru_cache
 
 import cv2
@@ -272,6 +273,35 @@ FACE_MIN_WIDTH = 0.04     # ignore faces narrower than this fraction of the fram
 FACE_GROUP_RATIO = 0.25   # keep faces at least this fraction of the largest one's area
 
 
+# The face models are single shared instances that are NOT safe to call from
+# two threads at once, and this process genuinely does. main.py runs both
+# ai_engine.analyze (a full-resolution capture) and ai_engine.preview (a 224px
+# viewfinder frame) on asyncio.to_thread, and PREVIEW_CONCURRENCY allows two
+# previews at a time -- client-2 posts /analyze the moment a photo syncs, while
+# the capture screen's 1.5s preview loop is still running, so the two overlap
+# in ordinary use rather than under some contrived load.
+#
+# Measured with two threads, 150 iterations each (see test_face_concurrency.py):
+# different frame sizes threw "Unknown C++ exception from OpenCV code" on the
+# very first iteration, and even identical sizes hit "(-215:Assertion failed)
+# buf.shape() == m.shape() in forwardGraph" -- and once in 150 runs returned
+# *zero* faces for a frame that has two. The crash is the good outcome. The
+# quiet empty result is the dangerous one: no faces is exactly the signal that
+# means "fall back to saliency", so a corrupted read is indistinguishable from
+# a real answer, which is the failure this whole face-first path exists to
+# avoid.
+#
+# A lock rather than thread-local detectors: detection is ~3ms against a ~70ms
+# preview frame, so serializing costs nothing measurable, whereas per-thread
+# instances would build one net for every thread in the default pool -- and
+# applied to the 3.7MB landmarker below, that multiplies. Holding the lock
+# across construction too means two cold threads can't race on downloading the
+# same file to the same path. Separate locks for detector and mesh so one
+# thread's landmark pass doesn't block another thread's detection.
+_FACE_DET_LOCK = threading.Lock()
+_FACE_MESH_LOCK = threading.Lock()
+
+
 @lru_cache(maxsize=1)
 def _face_detector():
     path = _cached("face_detection_yunet_2023mar.onnx", FACE_MODEL_URL)
@@ -290,9 +320,13 @@ def _detect_faces(bgr: np.ndarray) -> list[np.ndarray]:
     left mouth corner -- then the confidence score. "Right" is the
     subject's right, which appears on the *left* of the image."""
     h, w = bgr.shape[:2]
-    det = _face_detector()
-    det.setInputSize((w, h))
-    ok, faces = det.detect(bgr)
+    # setInputSize and detect are one critical section, not two: the input
+    # size is state on the shared detector, so another thread setting its own
+    # size in between would have this frame decoded against the wrong priors.
+    with _FACE_DET_LOCK:
+        det = _face_detector()
+        det.setInputSize((w, h))
+        ok, faces = det.detect(bgr)
     if not ok or faces is None or len(faces) == 0:
         return []
     rows = [f for f in faces if float(f[2]) / w >= FACE_MIN_WIDTH]
@@ -361,9 +395,15 @@ def face_expression(bgr: np.ndarray) -> dict | None:
     Only runs when YuNet has already found a face, so the common no-face
     frame (a room, a table, a view) never pays for it.
     """
-    Image, ImageFormat, landmarker = _face_landmarker()
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    res = landmarker.detect(Image(image_format=ImageFormat.SRGB, data=rgb))
+    # Same shared-instance hazard as the detector above -- see _FACE_DET_LOCK.
+    # Not reproduced here (the mesh needs a face far larger than a venue frame
+    # provides, so concurrent calls are hard to stage), but it is the same
+    # shape of object used the same way, and a lock this cheap is not worth
+    # withholding until it has crashed once in front of a guest.
+    with _FACE_MESH_LOCK:
+        Image, ImageFormat, landmarker = _face_landmarker()
+        res = landmarker.detect(Image(image_format=ImageFormat.SRGB, data=rgb))
     if not res.face_landmarks or not res.face_blendshapes:
         return None
 

@@ -291,6 +291,13 @@ same paths the demo cluster uses):
   endpoint must persist **no** events, and the input guards must return
   413/400. Written after both of this endpoint's real bugs reached a
   phone.
+- `python test_face_concurrency.py` — pure in-process test of the shared
+  face models under two threads. Starts **no** nodes and touches no
+  `node*.db`, so unlike every other test here it is safe to run while the
+  demo cluster is up (it does need `./models/` populated). Confirms
+  concurrent `_detect_faces` calls agree with the single-threaded result,
+  at both mixed and identical frame sizes; fails loudly without the locks
+  described in the Gotchas section.
 - `python test_vclock.py` — spins up 3 nodes, simulates a couple of
   guest "devices" attaching `{device_id: counter}` clocks directly to
   `POST /photos` (no real guest client exists to generate these yet),
@@ -608,6 +615,32 @@ instead of `client/`'s Dexie/service-worker one).
   (absolute URLs) rather than `NODES`, because `/chaos/partition`
   indexes positionally into a specific node's own `PEERS` list. Missing
   cert files fall back to HTTP rather than failing to boot.
+- **A cached OpenCV/MediaPipe model object is shared mutable state, and
+  `asyncio.to_thread` means two requests really do reach it at once.**
+  `ai_engine._face_detector()` is `lru_cache(maxsize=1)`, so one
+  `FaceDetectorYN` serves the whole process, and `_detect_faces` sets its
+  input size on that shared object before every call. `POST /analyze`
+  (full-resolution capture) and `POST /analyze/preview` (224px frame) both
+  run on `to_thread`, and `PREVIEW_CONCURRENCY` allows two previews at
+  once — `client-2` posts `/analyze` the instant a photo syncs while the
+  capture screen's 1.5s preview loop is still ticking, so this overlaps in
+  ordinary use, not under contrived load. Two threads, 150 iterations
+  each: *different* frame sizes threw `Unknown C++ exception from OpenCV
+  code` on the first iteration, and *identical* sizes hit
+  `(-215:Assertion failed) buf.shape() == m.shape()` in `forwardGraph`
+  **and** once returned zero faces for a frame containing two. The
+  assertion is the harmless outcome; the empty result is the dangerous
+  one, because no-faces is exactly the signal `find_subject` reads as
+  "fall back to saliency", so a corrupted read is indistinguishable from
+  a real answer. Fixed with `_FACE_DET_LOCK`/`_FACE_MESH_LOCK` around the
+  whole "fetch instance + set size + infer" section — a `threading.Lock`,
+  not an `asyncio.Lock`, since these run in threads, and it covers
+  construction too so two cold threads can't race on downloading the same
+  model to the same path. Detection is ~3ms against a ~70ms preview frame,
+  so serializing measures as free. ONNX Runtime sessions (CLIP) are safe
+  under concurrent `Run` and are deliberately *not* locked; if you cache
+  another cv2 or mediapipe model, assume it needs the same treatment until
+  measured otherwise. Regression test: `test_face_concurrency.py`.
 - **A dev server bound with `--host` on a port that's already taken
   silently moves to the next one, and the old process on the old port
   doesn't stop just because you meant to replace it.** Running
