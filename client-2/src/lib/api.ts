@@ -192,6 +192,10 @@ export type ArGuide = {
   pan_camera_y: "up" | "down" | "centered";
   strength: "none" | "slight" | "moderate" | "large";
   subject_found: boolean;
+  /** Which detector actually answered. "face" is YuNet and is far more
+   * trustworthy about *what the photo is of*; "saliency" only knows what
+   * is visually unusual, so it can box a bright lamp beside the guest. */
+  subject_source: "face" | "saliency";
   well_composed: boolean;
 };
 

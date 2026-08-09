@@ -881,7 +881,7 @@ function Capture() {
                       style={pct(ai.reframe.subject_box)}
                     >
                       <span className="absolute -top-4 left-0 rounded-sm bg-emulsion/85 px-1 font-mono text-[0.5rem] tracking-[0.16em] text-drifting">
-                        SUBJECT
+                        {ai.ar_guide.subject_source === "face" ? "FACE" : "SUBJECT"}
                       </span>
                     </div>
                   )}

@@ -55,6 +55,13 @@ from PIL import Image
 MODEL_DIR = os.getenv("MODEL_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
 CLIP_BASE = "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main"
 AESTHETIC_URL = "https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/sa_0_4_vit_b_32_linear.pth"
+# YuNet face detector (OpenCV Zoo, ~230KB). Note the media.githubusercontent
+# host: opencv_zoo stores model weights in Git LFS, and the ordinary raw.
+# host returns a 131-byte LFS *pointer* that loads as a corrupt model.
+FACE_MODEL_URL = (
+    "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/"
+    "models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
 
 CLIP_IMAGE_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 CLIP_IMAGE_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
@@ -260,6 +267,83 @@ SUBJECT_BOX_SD = 1.2        # box half-width, in weighted standard deviations
 SUBJECT_DIFFUSE_MAX = 0.30
 
 
+FACE_SCORE_MIN = 0.6      # YuNet confidence floor
+FACE_MIN_WIDTH = 0.04     # ignore faces narrower than this fraction of the frame
+FACE_GROUP_RATIO = 0.25   # keep faces at least this fraction of the largest one's area
+
+
+@lru_cache(maxsize=1)
+def _face_detector():
+    path = _cached("face_detection_yunet_2023mar.onnx", FACE_MODEL_URL)
+    # Input size is set per-frame in _detect_faces; (320, 320) is just a
+    # placeholder so the net can be constructed once and reused.
+    return cv2.FaceDetectorYN.create(path, "", (320, 320), FACE_SCORE_MIN, 0.3, 5000)
+
+
+def _detect_faces(bgr: np.ndarray) -> list[tuple[float, float, float, float]]:
+    """Face boxes as (x0, y0, x1, y1), largest first. Empty when there are
+    none -- which is the common case for a room, a table, a view, so this
+    must stay a cheap early-out rather than something the caller depends on."""
+    h, w = bgr.shape[:2]
+    det = _face_detector()
+    det.setInputSize((w, h))
+    ok, faces = det.detect(bgr)
+    if not ok or faces is None or len(faces) == 0:
+        return []
+    boxes = []
+    for f in faces:
+        fx, fy, fw, fh = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+        if fw / w < FACE_MIN_WIDTH:
+            continue  # a face this small is a bystander in the background
+        boxes.append((max(0.0, fx), max(0.0, fy), min(float(w), fx + fw), min(float(h), fy + fh)))
+    boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    return boxes
+
+
+def _face_subject(bgr: np.ndarray) -> tuple[float, float, tuple[float, float, float, float], bool] | None:
+    """The union of the foreground faces, or None if there are none.
+
+    Why the union rather than the biggest face: at an event the subject is
+    usually a group, and composing on one person's face while cropping
+    their friend out of frame is worse than not helping at all. Faces
+    smaller than FACE_GROUP_RATIO of the largest are excluded so someone
+    twenty feet behind the group doesn't stretch the box to include them.
+    """
+    boxes = _detect_faces(bgr)
+    if not boxes:
+        return None
+    biggest = (boxes[0][2] - boxes[0][0]) * (boxes[0][3] - boxes[0][1])
+    keep = [b for b in boxes if (b[2] - b[0]) * (b[3] - b[1]) >= biggest * FACE_GROUP_RATIO]
+    x0 = min(b[0] for b in keep)
+    y0 = min(b[1] for b in keep)
+    x1 = max(b[2] for b in keep)
+    y1 = max(b[3] for b in keep)
+    return (x0 + x1) / 2, (y0 + y1) / 2, (x0, y0, x1, y1), True
+
+
+def find_subject(bgr: np.ndarray) -> tuple[float, float, tuple[float, float, float, float], bool, str]:
+    """(centroid_x, centroid_y, bbox, found, source) -- faces first, saliency
+    second.
+
+    Saliency answers "what is visually unusual here", which is genuinely not
+    the same question as "what is this photo of". Measured on a real phone,
+    it boxed RGB-lit headphones correctly and would just as happily box a
+    bright light fixture standing next to the guest you meant to shoot. At
+    an event the subject is a person the overwhelming majority of the time,
+    so when a face is actually present it is a far better answer than the
+    most salient blob -- and when there isn't one, saliency is still the
+    right fallback for a room, a table or a view.
+
+    `source` is returned so callers can be honest about which ran; the two
+    are not equally trustworthy and the reframe sizes them differently."""
+    face = _face_subject(bgr)
+    if face is not None:
+        cx, cy, bbox, found = face
+        return cx, cy, bbox, found, "face"
+    cx, cy, bbox, found = _saliency_subject(bgr)
+    return cx, cy, bbox, found, "saliency"
+
+
 def _saliency_subject(bgr: np.ndarray) -> tuple[float, float, tuple[float, float, float, float], bool]:
     """One saliency pass -> (centroid_x, centroid_y, bbox, found).
 
@@ -371,8 +455,8 @@ def compute_ar_guide(img: Image.Image, subject: tuple | None = None) -> dict:
     of paying for a second saliency pass."""
     if subject is None:
         bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-        subject = _saliency_subject(bgr)
-    cx, cy, _bbox, found = subject
+        subject = find_subject(bgr)
+    cx, cy, _bbox, found, source = subject
     w, h = img.size
 
     tx = min((w / 3, 2 * w / 3), key=lambda t: abs(t - cx))
@@ -395,13 +479,15 @@ def compute_ar_guide(img: Image.Image, subject: tuple | None = None) -> dict:
         "pan_camera_y": _OPPOSITE[move_y],
         "strength": _strength(max(abs(dx), abs(dy))),
         "subject_found": found,
+        "subject_source": source,
         "well_composed": well_composed,
     }
 
 
 # ---- reframe: a crop rectangle + how much tighter it is ----
 
-SUBJECT_SHARE = 0.38   # subject's long edge should fill this much of the crop
+SUBJECT_SHARE = 0.38       # subject's long edge should fill this much of the crop
+FACE_SUBJECT_SHARE = 0.20  # a face box is just the head -- leave room for shoulders
 MAX_ZOOM = 4.0         # never recommend a crop tighter than this
 MIN_USEFUL_ZOOM = 1.15  # below this the crop isn't worth telling anyone about
 
@@ -427,16 +513,20 @@ def compute_reframe(img: Image.Image, aspect: float | None = None,
     w, h = img.size
     if subject is None:
         bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-        subject = _saliency_subject(bgr)
-    cx, cy, (sx0, sy0, sx1, sy1), found = subject
+        subject = find_subject(bgr)
+    cx, cy, (sx0, sy0, sx1, sy1), found, source = subject
     aspect = aspect or (w / h)
+    # A face box is the head alone, so filling SUBJECT_SHARE of the crop with
+    # it would frame a portrait as a tight head shot. Faces get a smaller
+    # target share, which leaves the shoulders and some air in frame.
+    share = FACE_SUBJECT_SHARE if source == "face" else SUBJECT_SHARE
 
     # Largest crop of this aspect that still fits inside the frame.
     max_w = min(float(w), h * aspect)
     max_h = max_w / aspect
 
     sw, sh = max(sx1 - sx0, 1.0), max(sy1 - sy0, 1.0)
-    crop_w = max(sw / SUBJECT_SHARE, (sh / SUBJECT_SHARE) * aspect)
+    crop_w = max(sw / share, (sh / share) * aspect)
     crop_w = min(crop_w, max_w)                 # never larger than fits
     crop_w = max(crop_w, max_w / MAX_ZOOM)      # never tighter than MAX_ZOOM
     crop_h = crop_w / aspect
@@ -462,6 +552,7 @@ def compute_reframe(img: Image.Image, aspect: float | None = None,
         "zoom": round(float(zoom), 2),
         "worth_it": bool(found and zoom >= MIN_USEFUL_ZOOM),
         "subject_found": found,
+        "subject_source": source,
     }
 
 
@@ -622,7 +713,7 @@ def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
     img = Image.open(io.BytesIO(image_bytes))
     img.load()
     bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-    subject = _saliency_subject(bgr)
+    subject = find_subject(bgr)
 
     ar_guide = compute_ar_guide(img, subject=subject)
     reframe = compute_reframe(img, aspect=aspect, subject=subject)
@@ -661,4 +752,5 @@ def warmup():
     _text_session()
     _tokenizer()
     _aesthetic_head()
+    _face_detector()
     _film_stock_text_embeddings()

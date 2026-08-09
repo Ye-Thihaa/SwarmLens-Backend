@@ -74,7 +74,13 @@ list and manual demo commands: [README.md](README.md).
   `R` over `N/2` is always fresh, `R=1` can land on a stale/partitioned
   node.
 - `ai_engine.py` — pretrained-only photo analysis (no training anywhere):
-  saliency subject detection, a rule-of-thirds AR reframe guide, CLIP
+  **face-first** subject detection (`find_subject`: YuNet face detector,
+  falling back to saliency when no face is present — saliency answers
+  "what is visually unusual", which is not the same question as "what is
+  this a photo of", and at an event it will box a bright lamp beside the
+  guest; the response carries `subject_source` so callers can be honest
+  about which ran, and `compute_reframe` sizes a face box with
+  `FACE_SUBJECT_SHARE` so a portrait isn't cropped to a head shot), a rule-of-thirds AR reframe guide, CLIP
   film-stock suggestion, and a CLIP-embedding aesthetic score. Two entry
   points that differ in *persistence, not computation*: `analyze()` is the
   post-capture path whose `aesthetic_score` is written to the event log,
@@ -96,6 +102,10 @@ list and manual demo commands: [README.md](README.md).
   stall this node's asyncio loop, and gossip/raft both depend on that
   loop staying responsive). Models are downloaded on first use into
   `./models/` (gitignored, ~154MB) and cached after that:
+  - faces: YuNet (`face_detection_yunet_2023mar.onnx`, ~230KB) from
+    OpenCV Zoo. Must be fetched from `media.githubusercontent.com`, not
+    `raw.` — the zoo keeps weights in Git LFS and the raw host returns a
+    131-byte LFS *pointer* that loads as a corrupt model.
   - saliency: `cv2.saliency.StaticSaliencySpectralResidual` — ships in
     `opencv-contrib-python`, no download, classical CV.
   - filter suggestion + aesthetic embedding: CLIP ViT-B/32, int8-quantized
