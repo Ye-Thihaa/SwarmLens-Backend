@@ -39,7 +39,7 @@ export const Route = createFileRoute("/event/$slug")({
   component: EventGallery,
 });
 
-type Tab = "people" | "sheet" | "popular" | "map";
+type Tab = "people" | "sheet" | "popular" | "map" | "booth";
 
 /** Photobooth strip trims — each guest's roll gets its own printed strip. */
 const trims = [
@@ -155,6 +155,16 @@ function EventGallery() {
 
   const ranked = useMemo(() => [...photos].sort((a, b) => b.likes - a.likes), [photos]);
 
+  // Posted strips (routes/album.tsx's "POST TO PUBLIC ALBUM") are ordinary
+  // photo events tagged zone "photo_booth" -- one of the five zones this
+  // backend already knows about -- so no new endpoint or event kind exists
+  // for them; this tab is just that zone filtered back out of the same
+  // GET /photos every other tab already reads.
+  const boothPhotos = useMemo(
+    () => [...photos.filter((p) => p.zone === "photo_booth")].sort((a, b) => b.taken_at - a.taken_at),
+    [photos],
+  );
+
   const maxEngagement = Math.max(1, ...zones.map((z) => z.likes * 2 + z.photos));
 
   async function like(photoId: string) {
@@ -189,6 +199,7 @@ function EventGallery() {
         {(
           [
             ["people", "Strips"],
+            ["booth", "Photo booth"],
             ["sheet", "Contact sheet"],
             ["popular", "Most liked"],
             ["map", "The room"],
@@ -277,6 +288,47 @@ function EventGallery() {
               );
             })}
           </div>
+        </section>
+      )}
+
+      {/* (a2) PHOTO BOOTH — strips guests composited in Make a Strip and
+          chose to post, not the raw contact-sheet feed. Rendered at each
+          strip's own aspect via object-contain, never cropped to the fixed
+          4:3 the other tabs assume -- a strip's proportions are part of
+          what its creator actually designed. */}
+      {tab === "booth" && (
+        <section className="px-5 py-6">
+          <h2 className="text-lg font-bold">The public album</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Strips guests composed themselves — a layout, a frame, a filter, their own words — and
+            chose to post here for the whole room to see.
+          </p>
+
+          {boothPhotos.length === 0 ? (
+            <p className="mt-5 font-mono text-[0.62rem] tracking-widest text-stale">
+              NOBODY HAS POSTED A STRIP YET. MAKE ONE FROM YOUR ROLL.
+            </p>
+          ) : (
+            <div className="mt-5 grid grid-cols-2 gap-3">
+              {boothPhotos.map((p) => (
+                <button
+                  key={p.photo_id}
+                  onClick={() => setOpen(p)}
+                  className="overflow-hidden rounded-sm border border-border bg-card p-1.5 text-left"
+                >
+                  <PhotoImg
+                    photo={p}
+                    node={node}
+                    localSrc={localSrcByPhotoId.get(p.photo_id)}
+                    className={`w-full object-contain ${p.concurrent_with.length > 0 ? "settling" : ""}`}
+                  />
+                  <p className="mt-1.5 truncate font-mono text-[0.55rem] tracking-widest text-fixer-dim">
+                    {p.guest_id} · {timeOf(p)}
+                  </p>
+                </button>
+              ))}
+            </div>
+          )}
         </section>
       )}
 

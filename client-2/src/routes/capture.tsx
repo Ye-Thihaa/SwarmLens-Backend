@@ -11,6 +11,7 @@ import {
   type ZoneScore,
   getZones,
 } from "@/lib/api";
+import { buildFilterCss, DEFAULT_PRESET, STOCK_PRESETS } from "@/lib/filmStock";
 import { currentGuestId, tick } from "@/lib/guest";
 import { addPhoto, syncOutbox, useOutbox } from "@/lib/outbox";
 
@@ -42,19 +43,9 @@ const RATIOS = [
   { key: "strip", cls: "aspect-[1/3]", ar: 1 / 3 },
 ] as const;
 
-/** Per-stock starting point for the review sheet's TONE/COLOR/PALETTE
- * sliders -- picking a different stock on the strip resets to its own
- * preset rather than keeping whatever the previous stock's sliders were
- * left at, matching a real film swap more than a shared global edit. Keyed
- * by the same filmStocks[].key contract ai_engine.py's FILM_STOCKS uses. */
-const STOCK_PRESETS: Record<string, { tone: number; color: number; palette: number }> = {
-  portra_400: { tone: -10, color: 85, palette: 65 },
-  cinestill_800t: { tone: -20, color: 100, palette: 80 },
-  tri_x_400: { tone: 0, color: 0, palette: 100 },
-  ektar_100: { tone: 10, color: 130, palette: 60 },
-  gold_200: { tone: 5, color: 90, palette: 70 },
-};
-const DEFAULT_PRESET = { tone: 0, color: 100, palette: 50 };
+// STOCK_PRESETS/DEFAULT_PRESET/buildFilterCss moved to @/lib/filmStock --
+// album.tsx's strip composer needs the exact same formula, and this route
+// no longer owns it alone.
 
 /** Discrete stops for the manual ZOOM dial in the settings panel -- deliberately
  * separate from the AI's tap-to-zoom, which can recommend an off-center rect.
@@ -1619,46 +1610,6 @@ function rectsSimilar(
   );
 }
 
-/** TONE/COLOR/PALETTE -> a real canvas `filter` string, applied both live
- * (the review sheet's <img> style, for instant feedback) and baked into
- * the saved photo (confirmReview draws through this same string) -- one
- * formula, not a preview effect that quietly doesn't survive the save.
- *
- * TONE drives brightness/contrast around neutral; COLOR is a direct
- * saturation percentage (0 = grayscale, 100 = unchanged); PALETTE (0..100)
- * scales each stock's own characteristic secondary treatment, so turning
- * it down fades toward "no particular stock" rather than toward black. */
-function buildFilterCss(stockKey: string, tone: number, color: number, palette: number): string {
-  const brightness = 1 + tone / 250;
-  const contrast = 1 + Math.abs(tone) / 400;
-  const saturate = color / 100;
-  const p = palette / 100;
-
-  const parts = [
-    `brightness(${brightness.toFixed(3)})`,
-    `contrast(${contrast.toFixed(3)})`,
-    `saturate(${saturate.toFixed(3)})`,
-  ];
-
-  switch (stockKey) {
-    case "tri_x_400":
-      parts.push(`grayscale(${p.toFixed(3)})`, `contrast(${(1 + 0.25 * p).toFixed(3)})`);
-      break;
-    case "cinestill_800t":
-      parts.push(`hue-rotate(${(-6 * p).toFixed(1)}deg)`, `saturate(${(1 + 0.3 * p).toFixed(3)})`);
-      break;
-    case "ektar_100":
-      parts.push(`saturate(${(1 + 0.4 * p).toFixed(3)})`);
-      break;
-    case "gold_200":
-      parts.push(`sepia(${(0.25 * p).toFixed(3)})`);
-      break;
-    case "portra_400":
-      parts.push(`sepia(${(0.12 * p).toFixed(3)})`, `saturate(${(1 - 0.1 * p).toFixed(3)})`);
-      break;
-  }
-  return parts.join(" ");
-}
 
 const STRENGTH_COPY: Record<string, string> = {
   slight: "slightly",

@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AlbumRouteImport } from './routes/album'
 import { Route as CaptureRouteImport } from './routes/capture'
 import { Route as ConsoleRouteImport } from './routes/console'
 import { Route as MineRouteImport } from './routes/mine'
@@ -18,6 +19,11 @@ import { Route as EventSlugRouteImport } from './routes/event.$slug'
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AlbumRoute = AlbumRouteImport.update({
+  id: '/album',
+  path: '/album',
   getParentRoute: () => rootRouteImport,
 } as any)
 const CaptureRoute = CaptureRouteImport.update({
@@ -43,6 +49,7 @@ const EventSlugRoute = EventSlugRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/album': typeof AlbumRoute
   '/capture': typeof CaptureRoute
   '/console': typeof ConsoleRoute
   '/mine': typeof MineRoute
@@ -50,6 +57,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/album': typeof AlbumRoute
   '/capture': typeof CaptureRoute
   '/console': typeof ConsoleRoute
   '/mine': typeof MineRoute
@@ -58,6 +66,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/album': typeof AlbumRoute
   '/capture': typeof CaptureRoute
   '/console': typeof ConsoleRoute
   '/mine': typeof MineRoute
@@ -65,14 +74,22 @@ export interface FileRoutesById {
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/capture' | '/console' | '/mine' | '/event/$slug'
+  fullPaths: '/' | '/album' | '/capture' | '/console' | '/mine' | '/event/$slug'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/capture' | '/console' | '/mine' | '/event/$slug'
-  id: '__root__' | '/' | '/capture' | '/console' | '/mine' | '/event/$slug'
+  to: '/' | '/album' | '/capture' | '/console' | '/mine' | '/event/$slug'
+  id:
+    | '__root__'
+    | '/'
+    | '/album'
+    | '/capture'
+    | '/console'
+    | '/mine'
+    | '/event/$slug'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AlbumRoute: typeof AlbumRoute
   CaptureRoute: typeof CaptureRoute
   ConsoleRoute: typeof ConsoleRoute
   MineRoute: typeof MineRoute
@@ -86,6 +103,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/album': {
+      id: '/album'
+      path: '/album'
+      fullPath: '/album'
+      preLoaderRoute: typeof AlbumRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/capture': {
@@ -121,6 +145,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AlbumRoute: AlbumRoute,
   CaptureRoute: CaptureRoute,
   ConsoleRoute: ConsoleRoute,
   MineRoute: MineRoute,
