@@ -249,7 +249,10 @@ above need the matching `OPERATOR_TOKEN` env var set too (optional —
 `/chaos/*` fails open without it). A `.claude/launch.json` entry
 (`swarmlens-client-2`) is set up for `preview_start`.
 
-Tests:
+Tests (all the cluster-spinning ones call `testutil.ensure_safe_to_run()`
+first, which refuses to start if ports 8001-8003 are busy or `node*.db`
+already exists — they delete those files on the way out, and they are the
+same paths the demo cluster uses):
 - `python test_raft.py` — spins up 3 nodes itself, confirms leader
   election, `kill -9`s the leader, confirms re-election + exactly-once
   recap. Self-contained, cleans up its own processes and `.db` files.
@@ -270,6 +273,14 @@ Tests:
   count matches on all three nodes' own `.db` files after a gossip
   round. First run downloads ~154MB of models into `./models/`
   (gitignored) — cached after that, budget extra time for a cold run.
+- `python test_ai_preview.py` — spins up one node and exercises `POST
+  /analyze/preview`: subjects at six known positions must produce the
+  direction computed independently from the truth (including 0.28 and
+  0.72, the modestly-off-centre cases a centre-biased detector flips),
+  `move_subject_*` and `pan_camera_*` must stay exact opposites, the
+  endpoint must persist **no** events, and the input guards must return
+  413/400. Written after both of this endpoint's real bugs reached a
+  phone.
 - `python test_vclock.py` — spins up 3 nodes, simulates a couple of
   guest "devices" attaching `{device_id: counter}` clocks directly to
   `POST /photos` (no real guest client exists to generate these yet),

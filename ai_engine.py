@@ -280,24 +280,90 @@ def _face_detector():
     return cv2.FaceDetectorYN.create(path, "", (320, 320), FACE_SCORE_MIN, 0.3, 5000)
 
 
-def _detect_faces(bgr: np.ndarray) -> list[tuple[float, float, float, float]]:
-    """Face boxes as (x0, y0, x1, y1), largest first. Empty when there are
-    none -- which is the common case for a room, a table, a view, so this
-    must stay a cheap early-out rather than something the caller depends on."""
+def _detect_faces(bgr: np.ndarray) -> list[np.ndarray]:
+    """Raw YuNet rows, largest face first. Empty when there are none --
+    the common case for a room, a table, a view, so this must stay a cheap
+    early-out rather than something callers depend on.
+
+    Each row is 15 floats: x, y, w, h, then five landmarks as (x, y) pairs
+    in this order -- right eye, left eye, nose tip, right mouth corner,
+    left mouth corner -- then the confidence score. "Right" is the
+    subject's right, which appears on the *left* of the image."""
     h, w = bgr.shape[:2]
     det = _face_detector()
     det.setInputSize((w, h))
     ok, faces = det.detect(bgr)
     if not ok or faces is None or len(faces) == 0:
         return []
-    boxes = []
-    for f in faces:
-        fx, fy, fw, fh = float(f[0]), float(f[1]), float(f[2]), float(f[3])
-        if fw / w < FACE_MIN_WIDTH:
-            continue  # a face this small is a bystander in the background
-        boxes.append((max(0.0, fx), max(0.0, fy), min(float(w), fx + fw), min(float(h), fy + fh)))
-    boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-    return boxes
+    rows = [f for f in faces if float(f[2]) / w >= FACE_MIN_WIDTH]
+    rows.sort(key=lambda f: float(f[2]) * float(f[3]), reverse=True)
+    return rows
+
+
+def _box_of(f: np.ndarray, w: int, h: int) -> tuple[float, float, float, float]:
+    fx, fy, fw, fh = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+    return (max(0.0, fx), max(0.0, fy), min(float(w), fx + fw), min(float(h), fy + fh))
+
+
+# Head tilt beyond this is worth mentioning. Validated by rotating a real
+# face through known angles: reported roll tracks the rotation to within
+# ~0.3-1.5 degrees out to +/-10, degrading to ~5 degrees at +/-20 as
+# landmark localisation gets harder on a rotated face. Comfortably inside
+# what this threshold needs.
+LEVEL_ROLL_DEG = 7.0
+
+# Nose offset from the eye midpoint, as a fraction of interocular distance.
+# Deliberately loose: this is a coarse proxy for yaw, not a pose estimate,
+# and on the one real face available for checking, a roughly-frontal
+# portrait already measured 0.25 -- so a tighter bound flags people who are
+# looking straight at the camera. Reported as data, but not surfaced as an
+# instruction in the UI, because "turned away" has not been validated
+# across enough faces to be worth telling a guest.
+FRONTAL_YAW_MAX = 0.35
+
+
+def face_pose(f: np.ndarray) -> dict:
+    """Head roll and yaw from the five landmarks.
+
+    What is NOT here, deliberately: eyes-open/closed. That needs the
+    eyelid contour (the standard eye-aspect-ratio measure wants ~6 points
+    per eye); YuNet gives one point per eye -- its *centre* -- which is in
+    exactly the same place whether the eye is open or shut. Any "blink
+    detector" built on these five points would be inventing a signal that
+    isn't in the data, which is worse than not offering the feature.
+
+    Roll and yaw genuinely are in the data:
+      - roll  = the angle of the line between the two eye centres.
+      - yaw   = how far the nose sits from the midpoint between the eyes,
+                normalised by the distance between them so it doesn't
+                change with how close the subject is to the camera.
+    """
+    rx, ry = float(f[4]), float(f[5])    # subject's right eye
+    lx, ly = float(f[6]), float(f[7])    # subject's left eye
+    nx, ny = float(f[8]), float(f[9])    # nose tip
+
+    roll = float(np.degrees(np.arctan2(ly - ry, lx - rx)))
+    # Normalise to (-90, 90]: a face is never meaningfully "upside down"
+    # here, and 179 degrees should read as -1, not as a huge tilt.
+    if roll > 90:
+        roll -= 180
+    elif roll <= -90:
+        roll += 180
+
+    interocular = float(np.hypot(lx - rx, ly - ry)) or 1.0
+    mid_x, mid_y = (rx + lx) / 2.0, (ry + ly) / 2.0
+    # Project the nose offset onto the eye-line direction, so a tilted head
+    # doesn't read as a turned one.
+    ux, uy = (lx - rx) / interocular, (ly - ry) / interocular
+    yaw = ((nx - mid_x) * ux + (ny - mid_y) * uy) / interocular
+
+    return {
+        "roll_deg": round(roll, 1),
+        "level": abs(roll) <= LEVEL_ROLL_DEG,
+        "yaw_ratio": round(float(yaw), 3),
+        "facing_camera": abs(yaw) <= FRONTAL_YAW_MAX,
+        "turned": "none" if abs(yaw) <= FRONTAL_YAW_MAX else ("left" if yaw > 0 else "right"),
+    }
 
 
 def _face_subject(bgr: np.ndarray) -> tuple[float, float, tuple[float, float, float, float], bool] | None:
@@ -309,9 +375,11 @@ def _face_subject(bgr: np.ndarray) -> tuple[float, float, tuple[float, float, fl
     smaller than FACE_GROUP_RATIO of the largest are excluded so someone
     twenty feet behind the group doesn't stretch the box to include them.
     """
-    boxes = _detect_faces(bgr)
-    if not boxes:
+    h, w = bgr.shape[:2]
+    rows = _detect_faces(bgr)
+    if not rows:
         return None
+    boxes = [_box_of(f, w, h) for f in rows]
     biggest = (boxes[0][2] - boxes[0][0]) * (boxes[0][3] - boxes[0][1])
     keep = [b for b in boxes if (b[2] - b[0]) * (b[3] - b[1]) >= biggest * FACE_GROUP_RATIO]
     x0 = min(b[0] for b in keep)
@@ -727,9 +795,16 @@ def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
     margin = scores[ranked[0]] - scores[ranked[1]]
     confident = margin >= CONFIDENT_MARGIN
 
+    # Pose of the dominant face, when there is one. Reported only for the
+    # largest face: in a group shot, "someone is turned away" is almost
+    # always true and telling the guest so on every frame is noise.
+    faces = _detect_faces(bgr) if ar_guide["subject_source"] == "face" else []
+    face_block = face_pose(faces[0]) if faces else None
+
     return {
         "ar_guide": ar_guide,
         "reframe": reframe,
+        "face": face_block,
         "scene": scene,
         "suggested_filter": best,
         "confident": confident,

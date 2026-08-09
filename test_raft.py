@@ -5,6 +5,8 @@ import os
 import sqlite3
 import httpx
 
+from testutil import ensure_safe_to_run
+
 NODES = [
     ("node1", 8001, "http://127.0.0.1:8002,http://127.0.0.1:8003"),
     ("node2", 8002, "http://127.0.0.1:8001,http://127.0.0.1:8003"),
@@ -68,6 +70,7 @@ def recap_count_in_db(db_path):
 
 
 def main():
+    ensure_safe_to_run()
     start_all()
     try:
         print("waiting for uvicorn to boot...")
