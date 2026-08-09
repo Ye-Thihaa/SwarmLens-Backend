@@ -322,6 +322,68 @@ LEVEL_ROLL_DEG = 7.0
 FRONTAL_YAW_MAX = 0.35
 
 
+FACE_MESH_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+BLINK_SCORE = 0.5   # blendshape midpoint; open eyes measure ~0.003
+SMILE_SCORE = 0.35  # deliberately below the midpoint -- a polite half-smile counts
+
+
+@lru_cache(maxsize=1)
+def _face_landmarker():
+    """MediaPipe FaceLandmarker (Tasks API). Note mediapipe 1.0 dropped the
+    legacy `mp.solutions.face_mesh` entry point entirely, so this is the
+    only route -- and it needs the .task bundle fetched separately."""
+    import mediapipe as mp
+    from mediapipe.tasks.python import vision, BaseOptions
+    path = _cached("face_landmarker.task", FACE_MESH_URL)
+    opts = vision.FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=path),
+        output_face_blendshapes=True,
+        num_faces=1,          # only the dominant face is ever reported on
+    )
+    return mp.Image, mp.ImageFormat, vision.FaceLandmarker.create_from_options(opts)
+
+
+def face_expression(bgr: np.ndarray) -> dict | None:
+    """Eyes-open and smiling for the dominant face, or None if the mesh
+    finds nothing.
+
+    This is what YuNet's five landmarks could not answer. Those give one
+    point per eye -- its *centre* -- which sits in the same place whether
+    the eye is open or shut, so an eye-aspect-ratio measure is simply not
+    computable from them. The face mesh has the eyelid contour, and better
+    still it emits blendshapes: `eyeBlink*` and `mouthSmile*` are trained
+    outputs with a natural 0..1 range, so the thresholds here are a
+    model's own calibration rather than numbers hand-fitted to one photo.
+
+    Only runs when YuNet has already found a face, so the common no-face
+    frame (a room, a table, a view) never pays for it.
+    """
+    Image, ImageFormat, landmarker = _face_landmarker()
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    res = landmarker.detect(Image(image_format=ImageFormat.SRGB, data=rgb))
+    if not res.face_landmarks or not res.face_blendshapes:
+        return None
+
+    bs = {b.category_name: float(b.score) for b in res.face_blendshapes[0]}
+    blink_l = bs.get("eyeBlinkLeft", 0.0)
+    blink_r = bs.get("eyeBlinkRight", 0.0)
+    smile = max(bs.get("mouthSmileLeft", 0.0), bs.get("mouthSmileRight", 0.0))
+
+    # "Both eyes open" is the useful question -- one eye shut is a wink or a
+    # detection wobble, and telling a guest to reshoot for it would be noise.
+    eyes_open = blink_l < BLINK_SCORE and blink_r < BLINK_SCORE
+    return {
+        "eyes_open": eyes_open,
+        "blink_left": round(blink_l, 3),
+        "blink_right": round(blink_r, 3),
+        "smiling": smile >= SMILE_SCORE,
+        "smile_score": round(smile, 3),
+    }
+
+
 def face_pose(f: np.ndarray) -> dict:
     """Head roll and yaw from the five landmarks.
 
@@ -799,7 +861,18 @@ def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
     # largest face: in a group shot, "someone is turned away" is almost
     # always true and telling the guest so on every frame is noise.
     faces = _detect_faces(bgr) if ar_guide["subject_source"] == "face" else []
-    face_block = face_pose(faces[0]) if faces else None
+    face_block = None
+    if faces:
+        face_block = face_pose(faces[0])
+        try:
+            expr = face_expression(bgr)
+        except Exception:
+            # The mesh is an enhancement, not load-bearing: if its model is
+            # missing or it throws on an odd frame, the pose half and every
+            # other part of the preview must still come back.
+            expr = None
+        if expr:
+            face_block.update(expr)
 
     return {
         "ar_guide": ar_guide,
@@ -828,4 +901,5 @@ def warmup():
     _tokenizer()
     _aesthetic_head()
     _face_detector()
+    _face_landmarker()
     _film_stock_text_embeddings()

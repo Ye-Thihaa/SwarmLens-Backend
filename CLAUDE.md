@@ -106,6 +106,16 @@ list and manual demo commands: [README.md](README.md).
     OpenCV Zoo. Must be fetched from `media.githubusercontent.com`, not
     `raw.` — the zoo keeps weights in Git LFS and the raw host returns a
     131-byte LFS *pointer* that loads as a corrupt model.
+  - eyes-open / smiling: MediaPipe FaceLandmarker (`face_landmarker.task`,
+    ~3.7MB). Runs only when YuNet already found a face, adding ~10ms;
+    a no-face frame never pays for it. Uses the *blendshapes*
+    (`eyeBlinkLeft/Right`, `mouthSmile*`) rather than a hand-rolled
+    eye-aspect ratio — they're trained 0..1 outputs, so the thresholds
+    are the model's own calibration. This is the capability YuNet's five
+    landmarks fundamentally could not provide: one point per eye, its
+    *centre*, which sits in the same place open or shut. Note mediapipe
+    1.0 removed `mp.solutions.face_mesh`, so the Tasks API is the only
+    route.
   - saliency: `cv2.saliency.StaticSaliencySpectralResidual` — ships in
     `opencv-contrib-python`, no download, classical CV.
   - filter suggestion + aesthetic embedding: CLIP ViT-B/32, int8-quantized

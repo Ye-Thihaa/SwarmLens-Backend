@@ -211,9 +211,27 @@ export type Reframe = {
   subject_found: boolean;
 };
 
+/** Dominant face only, null when there isn't one. eyes_open/smiling come
+ * from MediaPipe blendshapes (trained 0..1 outputs); roll/yaw come from
+ * YuNet's landmarks. `turned` is returned but deliberately not surfaced --
+ * it hasn't been validated across enough faces to tell a guest. */
+export type FaceState = {
+  roll_deg: number;
+  level: boolean;
+  yaw_ratio: number;
+  facing_camera: boolean;
+  turned: "none" | "left" | "right";
+  eyes_open?: boolean;
+  blink_left?: number;
+  blink_right?: number;
+  smiling?: boolean;
+  smile_score?: number;
+};
+
 export type ComposePreview = {
   ar_guide: ArGuide;
   reframe: Reframe;
+  face: FaceState | null;
   scene: {
     colors: string[];
     saturation: "low" | "medium" | "high";
