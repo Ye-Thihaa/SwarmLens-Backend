@@ -20,7 +20,12 @@ from raft import Raft
 from hashing import ring_for, owner_of
 from cloud_sync import CloudSync, TRUST_ENV as CLOUD_SYNC_TRUST_ENV
 
-QUORUM_EVENT_KINDS = ("photo", "like", "aesthetic_score")
+QUORUM_EVENT_KINDS = ("photo", "like", "aesthetic_score", "photo_delete")
+# How many of a single guest's own photos can sit in the cross-guest public
+# gallery (GET /photos/public) at once -- a deliberate curation cap, not a
+# technical one. Enforced server-side in POST /photos/public so it holds
+# regardless of which node a guest's toggle happens to land on.
+PUBLIC_LIMIT_PER_GUEST = 25
 
 NODE_ID = os.getenv("NODE_ID", "node1")
 DB_PATH = os.getenv("DB_PATH", f"./{NODE_ID}.db")
@@ -101,6 +106,7 @@ def _zone_scores_from_events(events) -> dict[str, dict]:
     photo_zone: dict[str, str] = {}
     like_guests: dict[str, set] = {}
     aesthetic: dict[str, float] = {}
+    deleted: set[str] = set()
     for e in sorted(events, key=lambda e: e["created_at"]):
         p = e["payload"]
         if e["kind"] == "photo":
@@ -109,10 +115,14 @@ def _zone_scores_from_events(events) -> dict[str, dict]:
             like_guests.setdefault(p["photo_id"], set()).add(p["guest_id"])
         elif e["kind"] == "aesthetic_score":
             aesthetic[p["photo_id"]] = p["score"]  # last write wins -- sorted by created_at above
+        elif e["kind"] == "photo_delete":
+            deleted.add(p["photo_id"])
 
     zones: dict[str, dict] = {}
     scored: dict[str, list] = {}
     for photo_id, zone in photo_zone.items():
+        if photo_id in deleted:
+            continue
         z = zones.setdefault(zone, {"zone": zone, "photos": 0, "likes": 0})
         z["photos"] += 1
         z["likes"] += len(like_guests.get(photo_id, ()))
@@ -157,6 +167,19 @@ class PhotoIn(BaseModel):
 
 
 class LikeIn(BaseModel):
+    guest_id: str
+    photo_id: str
+    vclock: dict[str, int] = {}
+
+
+class PublicMarkIn(BaseModel):
+    guest_id: str
+    photo_id: str
+    public: bool
+    vclock: dict[str, int] = {}
+
+
+class PhotoDeleteIn(BaseModel):
     guest_id: str
     photo_id: str
     vclock: dict[str, int] = {}
@@ -228,6 +251,75 @@ async def photo_image(photo_id: str):
     except Exception:
         raise HTTPException(500, "corrupt stored image")
     return Response(content=image_bytes, media_type="image/jpeg")
+
+
+@app.post("/photos/public")
+async def mark_photo_public(body: PublicMarkIn):
+    """Opts one of THIS guest's own photos into (or out of) the
+    cross-guest public gallery (GET /photos/public below) -- individual
+    photos a guest hand-picks, not the composited strips routes/album.tsx
+    already posts to zone "photo_booth". Ownership is checked against the
+    photo event's own guest_id, not the caller-supplied one, so the
+    per-guest cap below can't be bypassed by mislabeling whose photo it
+    is. Appends a public_mark event -- gossips, replicates and converges
+    exactly like every other event kind, no new distributed mechanism."""
+    photo = await store.photo_by_id(body.photo_id)
+    if not photo:
+        raise HTTPException(404, "unknown photo")
+    if photo["guest_id"] != body.guest_id:
+        raise HTTPException(403, "only a photo's own guest can change its public status")
+    if body.public:
+        state = await store.public_state()
+        already_public = state.get(body.photo_id, {}).get("public", False)
+        if not already_public:
+            count = sum(
+                1 for v in state.values() if v["public"] and v["guest_id"] == body.guest_id
+            )
+            if count >= PUBLIC_LIMIT_PER_GUEST:
+                raise HTTPException(
+                    409, f"already at the {PUBLIC_LIMIT_PER_GUEST}-photo public limit for this event"
+                )
+    await store.append_local("public_mark", body.model_dump(exclude={"vclock"}), vclock=body.vclock)
+    return {"ok": True, "public": body.public}
+
+
+@app.get("/photos/public")
+async def public_photos():
+    """The cross-guest public gallery: every photo whose own guest has
+    opted it in via POST /photos/public above, latest toggle wins --
+    derived from the log the same way every other read here is, no
+    second "is_public" column living outside the event stream. GET
+    /photos already carries everything a gallery card needs (guest_id,
+    likes, taken_at, zone); this just filters that down to the public
+    subset instead of introducing a parallel shape."""
+    state = await store.public_state()
+    photos = await store.photos()
+    public = [p for p in photos if state.get(p["photo_id"], {}).get("public")]
+    return {"node": NODE_ID, "photos": public}
+
+
+@app.post("/photos/delete")
+async def delete_photo(body: PhotoDeleteIn):
+    """Retracts one of THIS guest's own photos everywhere: the room feed
+    (GET /photos), zone scores (local and quorum), likes, and the public
+    gallery, on every node once gossip catches up. A photo that was never
+    made public doesn't come through here at all -- client-2's mine.tsx
+    only calls this endpoint for a photo currently in the public gallery;
+    a private roll photo is deleted by the guest's own device splicing it
+    out of localStorage, since the event log never replicated it anywhere
+    that needs telling. Appends photo_delete, a tombstone every derived
+    read filters on (store.deleted_photo_ids) -- one choke point, same
+    pattern as public_mark, not a second flag column. Ownership is
+    checked against the photo event's own guest_id, never the
+    caller-supplied one. Idempotent: deleting an already-deleted photo_id
+    just appends a second, harmless tombstone."""
+    photo = await store.photo_by_id(body.photo_id)
+    if not photo:
+        raise HTTPException(404, "unknown photo")
+    if photo["guest_id"] != body.guest_id:
+        raise HTTPException(403, "only a photo's own guest can delete it")
+    await store.append_local("photo_delete", body.model_dump(exclude={"vclock"}), vclock=body.vclock)
+    return {"ok": True}
 
 
 class AnalyzeIn(BaseModel):

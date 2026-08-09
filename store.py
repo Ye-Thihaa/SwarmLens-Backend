@@ -142,13 +142,31 @@ class Store:
 
     # ---- derived read models: rebuilt from the log, never written directly ----
 
+    async def deleted_photo_ids(self) -> set[str]:
+        """photo_ids with a photo_delete tombstone -- a guest retracting
+        one of their own *public* photos (see main.py's POST
+        /photos/delete). A non-public delete never reaches here at all;
+        it's handled purely client-side by splicing the local outbox,
+        since the event log never knew about a photo nobody outside this
+        guest's own device needed to see yet. Once tombstoned, a photo_id
+        is filtered out of every derived read below (photos(),
+        photo_image_b64()) -- one choke point, not a flag checked
+        separately in each caller."""
+        cur = await self.db.execute(
+            "SELECT DISTINCT json_extract(payload,'$.photo_id') AS pid FROM events WHERE kind='photo_delete'"
+        )
+        return {r["pid"] for r in await cur.fetchall()}
+
     async def photos(self) -> list[dict]:
+        deleted = await self.deleted_photo_ids()
         cur = await self.db.execute(
             "SELECT * FROM events WHERE kind='photo' ORDER BY created_at"
         )
         photos = []
         for r in await cur.fetchall():
             p = json.loads(r["payload"])
+            if p["photo_id"] in deleted:
+                continue
             p.pop("image_base64", None)  # kept out of the list view -- see
             # photo_image_b64 below, which serves it separately so this
             # endpoint (polled every few seconds by the client) doesn't
@@ -165,7 +183,11 @@ class Store:
         event log -- no second storage path, same source of truth gossip
         already replicated everywhere. None if this photo was never
         uploaded with image_base64 (metadata-only test photos, or captures
-        from a guest client that predates this field)."""
+        from a guest client that predates this field), or if it's been
+        tombstoned by photo_delete -- "deleted from everywhere" has to
+        include the raw bytes, not just the listing."""
+        if photo_id in await self.deleted_photo_ids():
+            return None
         cur = await self.db.execute(
             "SELECT payload FROM events WHERE kind='photo' "
             "AND json_extract(payload,'$.photo_id')=? LIMIT 1",
@@ -198,6 +220,41 @@ class Store:
         for r in await cur.fetchall():
             p = json.loads(r["payload"])
             out[p["photo_id"]] = p["score"]
+        return out
+
+    async def photo_by_id(self, photo_id: str) -> dict | None:
+        """Single photo's own event payload (minus image bytes), straight
+        from the log -- used by /photos/public to check the *real* owner
+        of a photo server-side rather than trusting whatever guest_id a
+        client sends alongside a publish toggle."""
+        cur = await self.db.execute(
+            "SELECT payload FROM events WHERE kind='photo' "
+            "AND json_extract(payload,'$.photo_id')=? LIMIT 1",
+            (photo_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        p = json.loads(row["payload"])
+        p.pop("image_base64", None)
+        return p
+
+    async def public_state(self) -> dict[str, dict]:
+        """photo_id -> {"public": bool, "guest_id": str}, replayed from
+        public_mark events (a guest opting one of their own photos into
+        the cross-guest public gallery, or opting it back out). Last
+        write wins by created_at -- same pattern as aesthetic_scores,
+        fine here because a guest toggling their own photo (or two of
+        their devices racing) is expected to converge on whichever
+        toggle actually happened last, not merge as a set the way likes
+        do."""
+        cur = await self.db.execute(
+            "SELECT payload FROM events WHERE kind='public_mark' ORDER BY created_at"
+        )
+        out: dict[str, dict] = {}
+        for r in await cur.fetchall():
+            p = json.loads(r["payload"])
+            out[p["photo_id"]] = {"public": p["public"], "guest_id": p["guest_id"]}
         return out
 
     async def raw_events(self, kinds: tuple[str, ...]) -> list[dict]:

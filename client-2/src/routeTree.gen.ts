@@ -14,6 +14,7 @@ import { Route as AlbumRouteImport } from './routes/album'
 import { Route as CaptureRouteImport } from './routes/capture'
 import { Route as ConsoleRouteImport } from './routes/console'
 import { Route as MineRouteImport } from './routes/mine'
+import { Route as PublicRouteImport } from './routes/public'
 import { Route as EventSlugRouteImport } from './routes/event.$slug'
 
 const IndexRoute = IndexRouteImport.update({
@@ -41,6 +42,11 @@ const MineRoute = MineRouteImport.update({
   path: '/mine',
   getParentRoute: () => rootRouteImport,
 } as any)
+const PublicRoute = PublicRouteImport.update({
+  id: '/public',
+  path: '/public',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const EventSlugRoute = EventSlugRouteImport.update({
   id: '/event/$slug',
   path: '/event/$slug',
@@ -53,6 +59,7 @@ export interface FileRoutesByFullPath {
   '/capture': typeof CaptureRoute
   '/console': typeof ConsoleRoute
   '/mine': typeof MineRoute
+  '/public': typeof PublicRoute
   '/event/$slug': typeof EventSlugRoute
 }
 export interface FileRoutesByTo {
@@ -61,6 +68,7 @@ export interface FileRoutesByTo {
   '/capture': typeof CaptureRoute
   '/console': typeof ConsoleRoute
   '/mine': typeof MineRoute
+  '/public': typeof PublicRoute
   '/event/$slug': typeof EventSlugRoute
 }
 export interface FileRoutesById {
@@ -70,13 +78,28 @@ export interface FileRoutesById {
   '/capture': typeof CaptureRoute
   '/console': typeof ConsoleRoute
   '/mine': typeof MineRoute
+  '/public': typeof PublicRoute
   '/event/$slug': typeof EventSlugRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/album' | '/capture' | '/console' | '/mine' | '/event/$slug'
+  fullPaths:
+    | '/'
+    | '/album'
+    | '/capture'
+    | '/console'
+    | '/mine'
+    | '/public'
+    | '/event/$slug'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/album' | '/capture' | '/console' | '/mine' | '/event/$slug'
+  to:
+    | '/'
+    | '/album'
+    | '/capture'
+    | '/console'
+    | '/mine'
+    | '/public'
+    | '/event/$slug'
   id:
     | '__root__'
     | '/'
@@ -84,6 +107,7 @@ export interface FileRouteTypes {
     | '/capture'
     | '/console'
     | '/mine'
+    | '/public'
     | '/event/$slug'
   fileRoutesById: FileRoutesById
 }
@@ -93,6 +117,7 @@ export interface RootRouteChildren {
   CaptureRoute: typeof CaptureRoute
   ConsoleRoute: typeof ConsoleRoute
   MineRoute: typeof MineRoute
+  PublicRoute: typeof PublicRoute
   EventSlugRoute: typeof EventSlugRoute
 }
 
@@ -133,6 +158,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof MineRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/public': {
+      id: '/public'
+      path: '/public'
+      fullPath: '/public'
+      preLoaderRoute: typeof PublicRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/event/$slug': {
       id: '/event/$slug'
       path: '/event/$slug'
@@ -149,6 +181,7 @@ const rootRouteChildren: RootRouteChildren = {
   CaptureRoute: CaptureRoute,
   ConsoleRoute: ConsoleRoute,
   MineRoute: MineRoute,
+  PublicRoute: PublicRoute,
   EventSlugRoute: EventSlugRoute,
 }
 export const routeTree = rootRouteImport

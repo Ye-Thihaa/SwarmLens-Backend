@@ -1,9 +1,18 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { GuestTabs, PerfRail } from "@/guest/ui";
-import { CLUSTER_SIZE, prettyZone, replicaAcks } from "@/lib/api";
-import { currentDeviceId, currentGuestId } from "@/lib/guest";
-import { syncOutbox, useOutbox, type OutboxPhoto } from "@/lib/outbox";
+import {
+  CLUSTER_SIZE,
+  deletePhoto,
+  getPublicPhotos,
+  pickNode,
+  prettyZone,
+  PUBLIC_LIMIT_PER_GUEST,
+  replicaAcks,
+  setPhotoPublic,
+} from "@/lib/api";
+import { currentDeviceId, currentGuestId, tick } from "@/lib/guest";
+import { removePhoto, syncOutbox, useOutbox, type OutboxPhoto } from "@/lib/outbox";
 
 export const Route = createFileRoute("/mine")({
   head: () => ({
@@ -28,6 +37,19 @@ function Mine() {
   const [who, setWho] = useState<{ guest: string; device: string } | null>(null);
   const [acks, setAcks] = useState<Record<string, number>>({});
   const [syncing, setSyncing] = useState(false);
+  const [node, setNode] = useState<string | null>(null);
+  // photo_ids of THIS guest's own photos currently in the public gallery --
+  // polled from the cluster (the source of truth) rather than kept purely
+  // optimistic, so a toggle made from a second device shows up here too.
+  const [publicIds, setPublicIds] = useState<Set<string>>(new Set());
+  const [publicBusyId, setPublicBusyId] = useState<string | null>(null);
+  const [limitHit, setLimitHit] = useState(false);
+  // Two-tap delete: first tap arms it, second tap (within the same card)
+  // confirms -- a destructive action that can retract a photo everywhere
+  // shouldn't fire on a single mis-tap.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const outbox = useOutbox();
   const roll = useMemo(
     () =>
@@ -61,6 +83,92 @@ function Mine() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roll.map((p) => p.photo_id).join(",")]);
 
+  // This guest's own slice of GET /photos/public, polled the same way
+  // everything else on this page is -- so a device that goes public from
+  // a second phone, or gets bumped by a room-wide toggle, still converges
+  // here without a manual refresh.
+  useEffect(() => {
+    if (!who) return;
+    let cancelled = false;
+    async function poll() {
+      const n = await pickNode();
+      if (cancelled) return;
+      setNode(n);
+      if (!n) return;
+      try {
+        const pub = await getPublicPhotos(n);
+        if (!cancelled) {
+          setPublicIds(new Set(pub.filter((p) => p.guest_id === who!.guest).map((p) => p.photo_id)));
+        }
+      } catch {
+        // stay on the last known-good read
+      }
+    }
+    void poll();
+    const id = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [who]);
+
+  async function togglePublic(p: OutboxPhoto) {
+    if (!node || !p.photo_id || !who) return;
+    const makePublic = !publicIds.has(p.photo_id);
+    setPublicBusyId(p.local_id);
+    const res = await setPhotoPublic(node, {
+      guest_id: who.guest,
+      photo_id: p.photo_id,
+      public: makePublic,
+      vclock: tick(),
+    });
+    if (res.ok) {
+      setLimitHit(false);
+      setPublicIds((s) => {
+        const next = new Set(s);
+        if (makePublic) next.add(p.photo_id!);
+        else next.delete(p.photo_id!);
+        return next;
+      });
+    } else if (res.reason === "limit") {
+      setLimitHit(true);
+    }
+    setPublicBusyId(null);
+  }
+
+  /** A photo that was never made public was never shared beyond this
+   * device -- deleting it is purely local, no network call at all. A
+   * photo currently in the public gallery needs the real tombstone
+   * first (see api.ts's deletePhoto docstring), and only comes out of
+   * the roll once that's actually confirmed -- if the cluster is
+   * unreachable, the photo stays put rather than vanishing locally
+   * while the room still has it. */
+  async function deleteRollPhoto(p: OutboxPhoto) {
+    const isPublic = Boolean(p.photo_id && publicIds.has(p.photo_id));
+    if (isPublic && p.photo_id && who) {
+      const n = node ?? (await pickNode());
+      if (!n) {
+        setDeleteError("Can't reach the room to remove this everywhere — try again in a moment.");
+        return;
+      }
+      setDeletingId(p.local_id);
+      const res = await deletePhoto(n, { guest_id: who.guest, photo_id: p.photo_id, vclock: tick() });
+      setDeletingId(null);
+      if (!res.ok) {
+        setDeleteError("Couldn't delete it from the room — try again.");
+        return;
+      }
+      setPublicIds((s) => {
+        const next = new Set(s);
+        next.delete(p.photo_id!);
+        return next;
+      });
+    }
+    setDeleteError(null);
+    setConfirmDeleteId(null);
+    removePhoto(p.local_id);
+  }
+
   const heldCount = roll.filter(
     (p) => p.synced && p.photo_id && (acks[p.photo_id] ?? 0) === CLUSTER_SIZE,
   ).length;
@@ -74,6 +182,34 @@ function Mine() {
           {roll.length} frames tonight. {heldCount} {heldCount === 1 ? "has" : "have"} joined the
           room's picture.
         </p>
+        <div className="mt-3 flex items-center justify-between rounded-sm border border-border bg-card px-3 py-2.5">
+          <div>
+            <p className="font-mono text-[0.55rem] tracking-widest text-fixer-dim">PUBLIC GALLERY</p>
+            <p className="mt-0.5 text-sm">
+              <span className={publicIds.size >= PUBLIC_LIMIT_PER_GUEST ? "text-drifting" : ""}>
+                {publicIds.size} / {PUBLIC_LIMIT_PER_GUEST}
+              </span>{" "}
+              of your shots picked
+            </p>
+          </div>
+          <Link
+            to="/public"
+            className="rounded-sm border border-converged/50 bg-converged/10 px-3 py-2 font-mono text-[0.6rem] font-bold tracking-widest text-converged active:scale-95"
+          >
+            VIEW →
+          </Link>
+        </div>
+        {limitHit && (
+          <p className="mt-2 rounded-sm border border-drifting/40 bg-drifting/10 px-3 py-2 text-sm text-drifting">
+            You've picked {PUBLIC_LIMIT_PER_GUEST} already — take one off the public gallery before
+            adding another.
+          </p>
+        )}
+        {deleteError && (
+          <p className="mt-2 rounded-sm border border-safelight/40 bg-safelight/10 px-3 py-2 text-sm text-safelight">
+            {deleteError}
+          </p>
+        )}
       </header>
 
       {roll.length === 0 ? (
@@ -140,6 +276,55 @@ function Mine() {
                       <p className="mt-1 font-mono text-[0.5rem] tracking-widest text-safelight">
                         RETRY PENDING
                       </p>
+                    )}
+                    {/* Only a synced photo has a real photo_id to publish --
+                        a still-queued shot has nothing on the cluster yet
+                        for a public_mark event to point at. */}
+                    {p.synced && p.photo_id && (
+                      <button
+                        onClick={() => togglePublic(p)}
+                        disabled={publicBusyId === p.local_id}
+                        aria-pressed={publicIds.has(p.photo_id)}
+                        className={`mt-2 w-full rounded-sm border py-1.5 font-mono text-[0.52rem] font-bold tracking-widest disabled:opacity-50 ${
+                          publicIds.has(p.photo_id)
+                            ? "border-converged bg-converged/15 text-converged"
+                            : "border-fixer/25 text-fixer-dim"
+                        }`}
+                      >
+                        {publicBusyId === p.local_id
+                          ? "…"
+                          : publicIds.has(p.photo_id)
+                            ? "★ PUBLIC"
+                            : "MAKE PUBLIC"}
+                      </button>
+                    )}
+                    {confirmDeleteId === p.local_id ? (
+                      <div className="mt-1.5 flex gap-1.5">
+                        <button
+                          onClick={() => deleteRollPhoto(p)}
+                          disabled={deletingId === p.local_id}
+                          className="flex-1 rounded-sm border border-safelight bg-safelight/20 py-1.5 font-mono text-[0.48rem] font-bold tracking-widest text-safelight disabled:opacity-50"
+                        >
+                          {deletingId === p.local_id
+                            ? "…"
+                            : p.synced && p.photo_id && publicIds.has(p.photo_id)
+                              ? "DELETE EVERYWHERE?"
+                              : "CONFIRM DELETE"}
+                        </button>
+                        <button
+                          onClick={() => setConfirmDeleteId(null)}
+                          className="rounded-sm border border-fixer/25 px-2.5 py-1.5 font-mono text-[0.48rem] tracking-widest text-fixer-dim"
+                        >
+                          CANCEL
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmDeleteId(p.local_id)}
+                        className="mt-1.5 w-full rounded-sm border border-safelight/25 py-1.5 font-mono text-[0.5rem] tracking-widest text-safelight/70"
+                      >
+                        DELETE
+                      </button>
                     )}
                   </figcaption>
                 </figure>

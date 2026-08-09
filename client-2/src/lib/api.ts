@@ -280,6 +280,63 @@ export const postLike = (
     body: JSON.stringify(body),
   }).then((r) => asJson<{ ok: boolean; likes: number }>(r, `${node}/likes POST`));
 
+// Mirrors main.py's PUBLIC_LIMIT_PER_GUEST -- a curation cap (best strips
+// of the night, not a dump of the whole roll), enforced server-side so it
+// holds no matter which node a guest's toggle lands on. Kept in sync by
+// hand since this repo has no shared config between the two languages.
+export const PUBLIC_LIMIT_PER_GUEST = 25;
+
+export const getPublicPhotos = (node: string) =>
+  fetch(`${node}/photos/public`)
+    .then((r) => asJson<{ node: string; photos: RemotePhoto[] }>(r, `${node}/photos/public`))
+    .then((b) => b.photos);
+
+export type PublicMarkResult =
+  | { ok: true }
+  | { ok: false; reason: "limit" | "forbidden" | "not_found" | "error" };
+
+/** Opts one of this guest's own photos into (or out of) the public
+ * gallery. Doesn't throw on the expected failure modes -- a full quota or
+ * a stale photo_id are routine outcomes the caller should show inline,
+ * not exceptions to catch. */
+export async function setPhotoPublic(
+  node: string,
+  body: { guest_id: string; photo_id: string; public: boolean; vclock: Record<string, number> },
+): Promise<PublicMarkResult> {
+  const r = await fetch(`${node}/photos/public`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (r.ok) return { ok: true };
+  if (r.status === 409) return { ok: false, reason: "limit" };
+  if (r.status === 403) return { ok: false, reason: "forbidden" };
+  if (r.status === 404) return { ok: false, reason: "not_found" };
+  return { ok: false, reason: "error" };
+}
+
+export type DeleteResult = { ok: true } | { ok: false; reason: "forbidden" | "not_found" | "error" };
+
+/** Retracts one of this guest's own photos everywhere (see main.py's
+ * POST /photos/delete docstring) -- the room feed, zones, likes, and the
+ * public gallery, once gossip catches up on every node. Only meant to be
+ * called for a photo currently in the public gallery; a private roll
+ * photo never needs the network at all, see outbox.ts's removePhoto. */
+export async function deletePhoto(
+  node: string,
+  body: { guest_id: string; photo_id: string; vclock: Record<string, number> },
+): Promise<DeleteResult> {
+  const r = await fetch(`${node}/photos/delete`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (r.ok) return { ok: true };
+  if (r.status === 403) return { ok: false, reason: "forbidden" };
+  if (r.status === 404) return { ok: false, reason: "not_found" };
+  return { ok: false, reason: "error" };
+}
+
 export const getZones = (node: string) =>
   fetch(`${node}/zones`)
     .then((r) => asJson<{ node: string; zones: ZoneScore[] }>(r, `${node}/zones`))

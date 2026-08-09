@@ -105,6 +105,19 @@ export function addLike(item: Omit<OutboxLike, "kind" | "synced" | "created_at">
   return full;
 }
 
+/** Removes one item from this device's own roll -- for a photo that was
+ * never made public, this is the *entire* delete operation (see
+ * api.ts's deletePhoto docstring): nothing was ever shared beyond this
+ * outbox, so there's nothing on the cluster to retract. For a photo
+ * that *was* public, the caller (mine.tsx) sends the network tombstone
+ * first and only calls this once that's confirmed -- a failed backend
+ * call should leave the roll entry in place, not silently vanish while
+ * the room still has the photo. */
+export function removePhoto(local_id: string) {
+  writeAll(readAll().filter((it) => it.local_id !== local_id));
+  notify();
+}
+
 function patch(local_id: string, changes: Partial<OutboxItem>) {
   writeAll(
     readAll().map((it) => (it.local_id === local_id ? ({ ...it, ...changes } as OutboxItem) : it)),

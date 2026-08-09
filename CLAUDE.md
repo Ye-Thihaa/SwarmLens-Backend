@@ -35,7 +35,19 @@ list and manual demo commands: [README.md](README.md).
   `OPERATOR_TOKEN` is unset, so `test_quorum.py`, `load_test.py`, and
   `dashboard.html`, none of which set it, keep working unauthenticated.
   `client-2`'s operator console is the one real caller that sets it (see
-  that entry below).
+  that entry below). `POST /photos/public` opts one of a guest's *own*
+  photos into (or out of) the cross-guest public gallery — a curation
+  cap (`PUBLIC_LIMIT_PER_GUEST = 25`), not the composited-strip "public
+  album" `routes/album.tsx` already posts to zone `photo_booth` (see
+  `client-2` below, and don't conflate the two — that confusion is what
+  this feature replaced). Ownership is checked against the photo event's
+  *own* `guest_id` (`store.photo_by_id`), never the caller-supplied one,
+  so the cap can't be bypassed by mislabeling whose photo it is; the cap
+  itself only blocks the *first* `public: true` past the limit — toggling
+  an already-public photo back to `true` (a retry, a second device) is a
+  no-op, not a 409. `GET /photos/public` is the derived read: every photo
+  whose latest `public_mark` says `true`, same replay-the-log pattern as
+  everything else, no second `is_public` column.
 - `store.py` — SQLite-backed append-only event log. All state (photos,
   likes, job leases, recap) is derived by replaying `events`, never
   written directly. `(origin, seq)` primary key makes merges idempotent.
@@ -52,7 +64,12 @@ list and manual demo commands: [README.md](README.md).
   seq + inserting — see the Gotchas section for the real concurrency bug
   this fixes. `photo_image_b64(photo_id)` is the read side of the
   image-sharing feature above — pulls straight from the same event row,
-  no second table.
+  no second table. `photo_by_id`/`public_state` back the public-gallery
+  feature (`POST`/`GET /photos/public` in `main.py`, see below) — a new
+  `public_mark` event kind, `{photo_id, guest_id, public}`, replayed the
+  same last-write-wins way as `aesthetic_scores`, not a set-union CRDT
+  like likes: a guest toggling their own photo is expected to converge on
+  whichever toggle actually happened last, not be merged as a set.
 - `gossip.py` — anti-entropy loop: every `GOSSIP_INTERVAL` (default 1s),
   pick one random peer, exchange version-vector digests, pull/push
   whatever's missing.
@@ -203,6 +220,38 @@ list and manual demo commands: [README.md](README.md).
     goes silent — not stale — when no node answers, since capture and the
     outbox are local and a partition should cost a guest advice, never a
     photo.
+  - `src/routes/public.tsx` — the cross-guest **public gallery**: every
+    photo any guest has opted in via the `MAKE PUBLIC` toggle on
+    `routes/mine.tsx` (up to `PUBLIC_LIMIT_PER_GUEST` each, enforced
+    server-side — see `main.py` above), open to anyone with the URL, no
+    guest identity required to look. This is deliberately a *different*
+    feature from `routes/album.tsx`'s "POST TO PUBLIC ALBUM" (composited
+    strips tagged zone `photo_booth`) — the two were getting conflated
+    under one name, and this route exists specifically so "make this
+    public" can mean one hand-picked raw photo, not a whole composed
+    strip. Layout mimics a real gallery-wall print sheet (asymmetric
+    clusters of differently-sized rectangles, not a uniform grid): each
+    tile's column/row span comes from `tileFor()`, an FNV-1a hash of the
+    photo's own `photo_id` fed through weighted buckets (mostly 1×1/1×2,
+    a few 2×2, rare 2×3/3×3 "anchor" tiles) into a `grid-auto-flow: dense`
+    CSS grid — deterministic per photo, so the wall doesn't reshuffle
+    itself on every 4s poll just because a photo further down the sorted
+    order arrived; a real RNG seeded once per mount would do that this
+    doesn't need. Tapping a tile opens a lightbox with a `DOWNLOAD`
+    button (`fetch` → `blob` → object URL → synthetic `<a download>`,
+    same pattern as `album.tsx`'s `downloadCanvas`) so a non-guest can
+    take the image without needing the strip-maker.
+  - `src/routes/mine.tsx`'s public toggle (`MAKE PUBLIC` / `★ PUBLIC` per
+    photo card) polls `GET /photos/public` filtered to this guest's own
+    `guest_id` for the live `x / 25` count — server state, not purely
+    optimistic, so a toggle made from a second device still shows up
+    here. A 409 from the cap surfaces as an inline message rather than a
+    thrown error; only synced photos (real `photo_id`) show the button at
+    all, since an unsynced local capture has nothing on the cluster yet
+    for a `public_mark` event to reference.
+  - `src/guest/ui.tsx`'s `GuestTabs` grew a 4th tab (`Public` →
+    `/public`) alongside Camera/My roll/The room, for discoverability
+    from anywhere in the guest app.
   - `src/routes/console.tsx` — the operator console: real Raft
     term/role and gossip/partition state polled from all 3 nodes, an
     event tape built from *observed state diffs* (term changes, peer

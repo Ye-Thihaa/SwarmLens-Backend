@@ -29,11 +29,12 @@ export function PerfRail({
   );
 }
 
-export function GuestTabs({ active }: { active: "capture" | "mine" | "room" }) {
+export function GuestTabs({ active }: { active: "capture" | "mine" | "room" | "public" }) {
   const tabs = [
     { key: "capture", to: "/capture", label: "Camera" },
     { key: "mine", to: "/mine", label: "My roll" },
     { key: "room", to: "/event/$slug", label: "The room" },
+    { key: "public", to: "/public", label: "Public" },
   ] as const;
 
   return (
