@@ -1,6 +1,6 @@
 # SwarmLens — progress report
 
-_Last updated: 8 August 2026._
+_Last updated: 9 August 2026._
 
 A three-node, no-central-authority photo system for live events. Three
 identical FastAPI nodes, each with its own SQLite file, converging by
@@ -19,8 +19,12 @@ working notes and hard-won gotchas in [CLAUDE.md](CLAUDE.md).
 | Guest client `client/` (reference PWA) | Done |
 | Branded guest app + operator console `client-2/` | Done, wired to the real cluster |
 | Load test + measured numbers | Done |
+| Face-first subject detection (YuNet) | Built on `progress-report`, unmerged, not on a handset |
+| Eyes-open / smiling (MediaPipe blendshapes) | Built on `progress-report`, unmerged, never seen fire |
 
-Nothing in the roadmap is outstanding. What remains are documented
+Nothing in the roadmap is outstanding. The last two rows are this working
+branch (`progress-report`, four commits ahead of `master`); everything
+above them is merged. What remains otherwise are documented
 simplifications, listed at the bottom.
 
 ## The distributed-systems core
@@ -59,8 +63,9 @@ so throughput scales nearly linearly with N.
 
 ## AI analysis
 
-`ai_engine.py`, pretrained only, nothing trained or fine-tuned here:
-OpenCV spectral-residual saliency, CLIP ViT-B/32 (int8 ONNX) for
+`ai_engine.py`, pretrained only, nothing trained or fine-tuned here: YuNet
+face detection with OpenCV spectral-residual saliency as the fallback,
+MediaPipe FaceLandmarker for eyes and smile, CLIP ViT-B/32 (int8 ONNX) for
 film-stock matching, and LAION's aesthetic-predictor linear head reusing
 the same CLIP embedding. Two entry points that differ in **persistence,
 not computation**:
@@ -75,6 +80,47 @@ not computation**:
   `avg_aesthetic` with frames no guest kept. Semaphore-bounded, sheds
   with 503 rather than queueing. ~37ms/frame with `/health` staying under
   10ms alongside it, so raft's 50ms heartbeat is untouched.
+
+### Faces come first
+
+Saliency answers *"what is visually unusual here"*, which is not the same
+question as *"what is this a photo of"*. The phone session below shows
+both halves of that at once: it boxed RGB-lit headphones correctly, and it
+would have boxed a bright lamp standing beside the guest with exactly the
+same confidence. At an event the subject is a person almost every
+time, so `find_subject()` now runs YuNet first (~230KB, OpenCV Zoo) and
+falls back to saliency only when there is no face — a room, a table, a
+view, where saliency is still the right answer. Callers get
+`subject_source` so they can tell which one answered, and the guest
+overlay relabels the box `FACE` instead of `SUBJECT`.
+
+Two things follow from a face box being a *head* rather than a subject.
+The crop targets a smaller share of the frame (`FACE_SUBJECT_SHARE` 0.20
+against saliency's 0.38), so a portrait isn't cropped down to a head shot.
+And the box is the union of the foreground faces, not the largest one:
+composing on one person while cropping their friend out of frame is worse
+than not helping at all. Faces under a quarter of the largest one's area
+are dropped, so someone twenty feet behind the group doesn't stretch it.
+
+**Eyes-open and smiling** come from MediaPipe FaceLandmarker (~3.7MB),
+which runs only once YuNet has already found a face — a no-face frame
+never pays its ~10ms. It reads the *blendshapes* (`eyeBlinkLeft/Right`,
+`mouthSmile*`) rather than a hand-rolled eye-aspect ratio, because those
+are trained 0..1 outputs: the thresholds are then the model's own
+calibration instead of numbers fitted to one photo. This is exactly the
+capability YuNet's five landmarks could not provide — one point per eye,
+its *centre*, which sits in the same place open or shut, so a blink
+detector built on them would be inventing a signal that isn't in the data.
+Head roll genuinely *is* in the data and is reported: validated by
+rotating a real face through known angles, it tracks to within ~0.3–1.5°
+out to ±10°, degrading to ~5° at ±20°.
+
+`test_ai_preview.py` covers the preview endpoint directly — six known
+subject positions (including 0.28 and 0.72, the modestly-off-centre cases
+a centre-biased detector flips), `move_subject_*` and `pan_camera_*`
+staying exact opposites, zero events persisted, and the 413/400 input
+guards. It was written after both of that endpoint's real bugs had already
+reached a phone.
 
 ### Honesty constraints built into the output
 
@@ -91,6 +137,17 @@ This is guidance a person acts on, so the failure mode that matters is
   stops auto-applying.
 - `subject_found` false means the overlay draws nothing at all and says
   "NO CLEAR SUBJECT", rather than boxing noise.
+- `subject_source` says whether a face or saliency answered, because the
+  two are not equally trustworthy about what the photo is *of* — and the
+  reframe sizes them differently for the same reason.
+- Both eyes must read shut before `EYES CLOSED · SHOOT AGAIN` appears. One
+  is a wink or a detection wobble, and asking for a reshoot over that is
+  noise.
+- `turned` (yaw) is computed and returned but deliberately never shown to
+  a guest. It is a coarse proxy — nose offset from the eye midpoint over
+  interocular distance — and on the one real face available to check with,
+  a roughly-frontal portrait already measured 0.25 against a 0.35 bound.
+  Returned as data, withheld as advice.
 
 ## Frontends
 
@@ -123,10 +180,17 @@ confirmed from a screen recording of the session:
   tungsten night film does"*
 - the `AI PICK` badge appears on that stock and the strip auto-loads it
 
-Not yet exercised on the phone: the front camera, and left/right `PAN`
-guidance specifically (the recorded run produced a vertical nudge). The
+**That run predates face-first detection.** The headphones were found by
+saliency, which was the only detector in the build at the time. Nothing on
+the `progress-report` branch has been on a handset yet.
+
+Not yet exercised on the phone: the front camera, left/right `PAN`
+guidance specifically (the recorded run produced a vertical nudge), and
+the entire face path — the `FACE` box, `EYES CLOSED`, `HEAD TILTED`. The
 horizontal path is verified in the browser and by unit-level measurement,
-not on a handset.
+not on a handset. `eyes_open=false` and `smiling=true` have never been
+observed firing on any device at all: they are verified only by threshold
+margin, open eyes measuring ~0.003 against a 0.5 bound.
 
 In the browser, with all three nodes killed, the overlay clears to
 "GUIDANCE OFFLINE · SHUTTER UNAFFECTED" rather than showing stale boxes,
@@ -165,6 +229,21 @@ changed how the system is built:
    because it read the DOM with `get_page_text`, which cannot see
    occlusion — the text was present, the pixels were not. Fixed by moving
    the guidance to the viewfinder's centre.
+8. **The test scripts would have deleted the demo cluster's databases.**
+   Every `test_*.py` hardcodes ports 8001-8003 and `./node1.db`–
+   `./node3.db`, and deletes those files on the way out. A busy port
+   doesn't fail the bind — uvicorn loses the race and the test's synthetic
+   events land in real data — and then the cleanup removes the databases
+   it never created. Now guarded: `testutil.ensure_safe_to_run()` exits
+   with the `mv node*.db .dbbackup/` fix rather than starting.
+9. **A cached model object is shared mutable state.** One `FaceDetectorYN`
+   serves the whole process, and `/analyze` and `/analyze/preview` both run
+   on `asyncio.to_thread` — overlapping in ordinary use, since client-2
+   posts `/analyze` the moment a photo syncs while the preview loop is
+   still ticking. Two threads reproduced an OpenCV assertion failure and,
+   once in 150 runs, zero faces on a frame containing two — which is
+   silently the "no face, use saliency" signal rather than an error.
+   Locked; `test_face_concurrency.py` fails without it.
 
 Items 6 and 7 share a lesson worth stating plainly: a test that exercises
 only the easy case, or that measures the wrong layer, will pass while the
@@ -214,15 +293,28 @@ working.**
   together.
 - Front camera and horizontal `PAN` guidance still unverified on a
   handset.
+- `eyes_open=false` and `smiling=true` have never been observed firing —
+  only the open-eyed, non-smiling case has been exercised, and only by
+  threshold margin.
+- The face path as a whole (`FACE` box, `EYES CLOSED`, `HEAD TILTED`) is
+  unverified on a handset.
+- `progress-report` is four commits ahead of `master` and unmerged. The
+  cluster-spinning tests can't run while the demo cluster holds ports
+  8001-8003 and the `node*.db` files, by design — see bug 8 above.
 
 ## Known simplifications
 
 - One "room" — the backend has no multi-event concept.
 - `client-2`'s outbox is localStorage, not `client/`'s Dexie + service
   worker.
-- Saliency is classical CV, not a semantic detector: it finds visually
-  salient regions, so in a dim venue it may box a bright light rather than
-  a guest. Real, but not reliably *about the person*.
+- The saliency *fallback* is still classical CV, not a semantic detector:
+  it finds visually salient regions, so in a dim venue it may box a bright
+  light rather than a guest. Faces now take priority, so this only bites
+  when YuNet finds nothing — a profile, a face too small or too dark, or a
+  scene with no people in it.
+- Yaw is a coarse proxy, not a pose estimate, and only the dominant face
+  is ever reported on. In a group shot "someone is turned away" is nearly
+  always true, and saying so every frame is noise.
 - The saved photo is the full sensor frame while guidance describes the
   ratio-cropped view; the crop rectangle is advisory.
 - The front camera's mirror maths is verified in code but has not been
