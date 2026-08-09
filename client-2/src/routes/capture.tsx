@@ -56,6 +56,13 @@ const STOCK_PRESETS: Record<string, { tone: number; color: number; palette: numb
 };
 const DEFAULT_PRESET = { tone: 0, color: 100, palette: 50 };
 
+/** Discrete stops for the manual ZOOM dial in the settings panel -- deliberately
+ * separate from the AI's tap-to-zoom, which can recommend an off-center rect.
+ * The manual dial always produces a centered crop (see centeredZoomRect) so
+ * "zoom out a bit" from wherever you are has one unambiguous meaning instead
+ * of needing to reconstruct what an earlier AI tap was centered on. */
+const ZOOM_STEPS = [1, 1.3, 1.6, 2, 2.5, 3, 4] as const;
+
 /** How often the viewfinder asks a node to look at what it's seeing. One
  * analysis measured ~37ms server-side, so this is set by taste and by
  * politeness to a shared node rather than by compute: fast enough to feel
@@ -205,18 +212,52 @@ function Capture() {
     [],
   );
 
-  // Tap-to-zoom: "ZOOM IN 2.3x" turns the passive crop-rectangle label into
-  // an actual digital zoom, the same move doca cam's viewfinder does. `rect`
-  // is always absolute against the ar-cropped full frame, in the SAME
-  // coordinate space grabPreviewFrame already mirrors into when facing the
-  // selfie camera (composeRect folds a second tap's rect, itself relative
-  // to the already-zoomed view, into that same absolute space) so shootOnce
-  // can crop straight from it without knowing how many taps got it there or
-  // which camera is active.
+  // Auto-zoom: when on (the default), the viewfinder zooms itself into
+  // whatever crop ai_engine.py's saliency-based subject detection
+  // recommends, every tick -- no tap required. `rect` is always absolute
+  // against the ar-cropped full frame, in the SAME coordinate space
+  // grabPreviewFrame already mirrors into when facing the selfie camera, so
+  // shootOnce can crop straight from it without caring which camera is
+  // active. Read via digitalZoomRef (below) inside the preview tick, NOT as
+  // a dependency of that effect -- see the ref's own comment for why.
   const [digitalZoom, setDigitalZoom] = useState<{
     rect: { x: number; y: number; w: number; h: number };
     zoom: number;
   } | null>(null);
+  const digitalZoomRef = useRef(digitalZoom);
+  useEffect(() => {
+    digitalZoomRef.current = digitalZoom;
+  }, [digitalZoom]);
+
+  // Touching the manual ZOOM dial (or the reset chip) takes over from
+  // auto-zoom; the AUTO ZOOM toggle in settings hands control back. Kept as
+  // a ref, read inside the same tick that would otherwise auto-apply a new
+  // rect, so flipping it takes effect on the very next frame rather than
+  // waiting for the polling effect to notice a stale closure.
+  const [autoZoom, setAutoZoom] = useState(true);
+  const autoZoomRef = useRef(autoZoom);
+  useEffect(() => {
+    autoZoomRef.current = autoZoom;
+  }, [autoZoom]);
+
+  // The manual ZOOM dial's own position -- kept in sync with digitalZoom
+  // (see the auto-zoom tick and the reset effect below) so the settings
+  // panel never shows a zoom level that disagrees with what's on screen.
+  const [zoomIndex, setZoomIndex] = useState(0);
+
+  // Auto-zoom stability (see the tick effect for the two-rule shape:
+  // engaging from nothing is immediate, only CHANGING or RELEASING an
+  // already-applied zoom is debounced). RECT_JITTER_TOL has to be loose
+  // enough to absorb ordinary tick-to-tick sensor noise -- autofocus
+  // hunting, exposure settling, JPEG artifacts -- or two consecutive real
+  // reads essentially never agree and auto-zoom silently never commits
+  // anything, which is exactly what a first, stricter version of this did.
+  const ZOOM_STABLE_TICKS = 2;
+  const RECT_JITTER_TOL = 0.15;
+  const zoomCandidateRef = useRef<{ rect: { x: number; y: number; w: number; h: number }; zoom: number } | null>(
+    null,
+  );
+  const zoomStableCountRef = useRef(0);
 
   const [stock, setStock] = useState(0);
 
@@ -244,10 +285,21 @@ function Capture() {
 
   // camera settings — the "doca cam" panel (all cosmetic, local to this phone)
   const [iso, setIso] = useState(2);
-  const [shutter, setShutter] = useState(3);
+  // Defaults to the FASTEST setting (index 0, no simulated blur) -- shutter
+  // now drives a real blur on both the live view and the saved photo (see
+  // applyExposure), so defaulting to index 3 meant the camera opened
+  // permanently soft, which read as "the resolution is bad" rather than
+  // "a deliberate shutter-speed effect is on by default". A camera app
+  // should open sharp.
+  const [shutter, setShutter] = useState(0);
   const [ev, setEv] = useState(4);
   const [ratio, setRatio] = useState(0);
   const [flash, setFlash] = useState(false);
+  // A brief full-screen white pulse at the moment of capture, same visual
+  // cue every real camera app uses -- without it, flash's only effect was a
+  // 10% brightness bump baked quietly into the file, which reads as "flash
+  // does nothing" even though it technically did something.
+  const [flashPulse, setFlashPulse] = useState(false);
   const [grid, setGrid] = useState(true);
   const [stamp, setStamp] = useState(true);
   const [timer, setTimer] = useState(0); // 0 | 3 | 10
@@ -265,11 +317,28 @@ function Capture() {
   // The zoom rect's coordinate space is tied to both the frame ratio and
   // which camera is active (mirrored or not -- see grabPreviewFrame). Either
   // changing invalidates it. Turning AI off removes the only control that
-  // can reset it, so treat that as a reset too rather than leaving the guest
-  // stuck zoomed in with no way back.
+  // can drive it, so treat that as a reset too rather than leaving the guest
+  // stuck zoomed in with no way back. Also hands control back to auto-zoom,
+  // matching "changed something major, start fresh" rather than silently
+  // staying in whatever manual/auto state was active before.
   useEffect(() => {
     setDigitalZoom(null);
+    setZoomIndex(0);
+    setAutoZoom(true);
+    zoomCandidateRef.current = null;
+    zoomStableCountRef.current = 0;
   }, [ratio, aiOn, facing]);
+
+  /** Drives digitalZoom from the manual ZOOM dial: a plain centered crop at
+   * the selected step. Touching this dial is a deliberate "I'll drive"
+   * action, so it takes over from auto-zoom rather than being overwritten
+   * by the very next tick's recommendation. */
+  function onManualZoomChange(i: number) {
+    setAutoZoom(false);
+    setZoomIndex(i);
+    const z = ZOOM_STEPS[i]!;
+    setDigitalZoom(z <= 1 ? null : { rect: centeredZoomRect(z), zoom: z });
+  }
 
   // real camera feed, not a bundled photo. Re-runs on flip; the cleanup
   // stops the old tracks first, since a phone won't hand out the front
@@ -279,7 +348,15 @@ function Capture() {
     let cancelled = false;
     setCameraError(null);
     navigator.mediaDevices
-      .getUserMedia({ video: { facingMode: facing }, audio: false })
+      .getUserMedia({
+        // No width/height here means "whatever the browser feels like",
+        // which on plenty of devices is a low default (640x480-ish) rather
+        // than the camera's actual capability -- ideal (not exact/min) so a
+        // phone without a sensor this large still gets its best available
+        // resolution instead of failing the constraint outright.
+        video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1920 } },
+        audio: false,
+      })
       .then((s) => {
         if (cancelled) {
           s.getTracks().forEach((t) => t.stop());
@@ -370,14 +447,20 @@ function Capture() {
       const node = video && canvas && video.videoWidth > 0 ? await pickNode() : null;
 
       if (!stopped && node) {
-        // Crop to the applied zoom rect (if any) so the AI reads the same
-        // tightened frame the guest is actually looking at, not the full
-        // scene it already recommended zooming out of. Mirroring happens
-        // inside grabPreviewFrame too, and must -- the zoom rect itself is
-        // expressed in mirrored space when facing the selfie camera (see
-        // digitalZoom's docstring above), so the two have to agree on
-        // orientation or every box lands on the wrong side of its subject.
-        const frame = grabPreviewFrame(video!, canvas!, ar, mirrored, digitalZoom?.rect);
+        // In auto-zoom mode, always analyze the FULL frame, not whatever
+        // digitalZoom currently holds: each tick proposes a fresh absolute
+        // crop, so a subject that moves -- or stops needing as tight a
+        // crop -- is tracked continuously instead of ratcheting in via
+        // composed rects and never loosening back up. In manual mode
+        // (the guest is driving the ZOOM dial), analyze whatever's
+        // actually on screen instead, so the pan arrows react to what the
+        // guest is really looking at. Mirroring happens inside
+        // grabPreviewFrame either way, and must -- the zoom rect is
+        // expressed in mirrored space when facing the selfie camera, so
+        // the two have to agree on orientation or every box lands on the
+        // wrong side of its subject.
+        const zoomRectForAnalysis = autoZoomRef.current ? undefined : digitalZoomRef.current?.rect;
+        const frame = grabPreviewFrame(video!, canvas!, ar, mirrored, zoomRectForAnalysis);
         if (frame) {
           setAiScanning(true);
           try {
@@ -398,6 +481,75 @@ function Capture() {
                 const i = filmStocks.findIndex((f) => f.key === result.suggested_filter);
                 if (i >= 0) setStock(i);
               }
+              // Real auto-zoom. Absolute against the full frame (see
+              // above), so a committed rect replaces digitalZoom wholesale
+              // rather than composing with whatever was there -- a subject
+              // walking closer loosens the crop just as readily as a
+              // distant one tightens it.
+              //
+              // Two different rules for two different moments, not one
+              // stability gate for both: engaging FROM NOTHING applies
+              // immediately -- any delay there just reads as "auto-zoom
+              // isn't working". CHANGING or RELEASING an already-applied
+              // zoom is what needs debouncing, since that's what flickers
+              // when consecutive reads disagree by sensor noise alone
+              // (autofocus hunting, exposure settling, JPEG artifacts --
+              // real cameras are noisier tick to tick than a static test
+              // image). RECT_JITTER_TOL is deliberately generous: it only
+              // needs to catch "basically the same framing", not exact
+              // agreement, or ordinary noise defeats it exactly like the
+              // stricter version did (this shipped once already and simply
+              // never committed on a real phone).
+              if (autoZoomRef.current) {
+                const candidate = result.reframe.worth_it
+                  ? { rect: result.reframe.rect, zoom: result.reframe.zoom }
+                  : null;
+                const current = digitalZoomRef.current;
+
+                if (candidate && current && rectsSimilar(candidate.rect, current.rect, RECT_JITTER_TOL)) {
+                  // Same framing as what's already applied -- nothing to do,
+                  // and this is also the natural point to stop counting
+                  // toward some earlier, now-stale pending change.
+                  zoomCandidateRef.current = null;
+                  zoomStableCountRef.current = 0;
+                } else if (current === null) {
+                  // Nothing applied yet: engage on the very first worth_it
+                  // reading, no debounce. A guest should see the zoom react
+                  // as soon as they point at something, not after a pause.
+                  if (candidate) {
+                    setDigitalZoom(candidate);
+                    setZoomIndex(nearestZoomStep(candidate.zoom));
+                  }
+                  zoomCandidateRef.current = null;
+                  zoomStableCountRef.current = 0;
+                } else {
+                  // Something's already applied and this reading disagrees
+                  // with it (a real change, or the subject's gone) -- only
+                  // commit once the SAME alternative has been read
+                  // ZOOM_STABLE_TICKS times in a row, so a guest actively
+                  // panning or tilting never gets fought with mid-move.
+                  const prevPending = zoomCandidateRef.current;
+                  const pendingAgrees =
+                    (candidate === null && prevPending === null) ||
+                    (candidate !== null &&
+                      prevPending !== null &&
+                      rectsSimilar(candidate.rect, prevPending.rect, RECT_JITTER_TOL));
+                  zoomStableCountRef.current = pendingAgrees ? zoomStableCountRef.current + 1 : 1;
+                  zoomCandidateRef.current = candidate;
+
+                  if (zoomStableCountRef.current >= ZOOM_STABLE_TICKS) {
+                    if (candidate) {
+                      setDigitalZoom(candidate);
+                      setZoomIndex(nearestZoomStep(candidate.zoom));
+                    } else {
+                      setDigitalZoom(null);
+                      setZoomIndex(0);
+                    }
+                    zoomCandidateRef.current = null;
+                    zoomStableCountRef.current = 0;
+                  }
+                }
+              }
             }
           } catch {
             if (!stopped) setAi(null); // aborted, or the node went away
@@ -417,10 +569,15 @@ function Capture() {
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-    // digitalZoom is intentionally a dep, not just read from a ref: applying
-    // or resetting zoom should trigger an immediate re-read of the new view
-    // instead of waiting up to PREVIEW_INTERVAL_MS for the next scheduled tick.
-  }, [aiOn, cameraError, ratio, mirrored, digitalZoom, isReviewing]);
+    // digitalZoom is read via a ref (digitalZoomRef), NOT listed as a dep
+    // here: auto-zoom sets it on nearly every tick, and depending on it
+    // directly would abort and restart this whole polling loop -- and its
+    // in-flight request -- every single time, faster than any request
+    // could ever complete. autoZoom itself IS a dep: it only changes via a
+    // deliberate tap (the dial, the reset chip, the settings toggle), so
+    // restarting the loop there is rare and gives an immediate re-read
+    // instead of waiting up to PREVIEW_INTERVAL_MS for the next tick.
+  }, [aiOn, cameraError, ratio, mirrored, isReviewing, autoZoom]);
 
   useEffect(() => {
     return () => {
@@ -446,14 +603,30 @@ function Capture() {
     composeTimer.current = setTimeout(() => setComposing(false), 6000);
   }
 
-  /** Grabs the current video frame into a real JPEG, queues it in the
-   * offline outbox immediately (the shutter never waits on the network),
-   * then fires a background sync attempt. Used for burst mode, which
-   * bypasses the review sheet entirely (reviewing three frames one at a
-   * time is a separate feature nobody asked for). */
+  /** Grabs the current video frame, bakes in the currently selected stock's
+   * default look (same buildFilterCss the review sheet and confirmReview
+   * use, just at STOCK_PRESETS defaults since there's no per-shot review to
+   * adjust from), and queues it in the offline outbox immediately -- the
+   * shutter never waits on the network. Used for burst mode, which bypasses
+   * the review sheet entirely (reviewing three frames one at a time is a
+   * separate feature nobody asked for) but should still come out looking
+   * like the stock the guest picked, not a flat unfiltered frame -- a burst
+   * shot skipping the effect entirely was a real gap, not a deliberate
+   * simplification. */
   function shootOnce() {
-    const canvas = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
-    if (!canvas) return;
+    const raw = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
+    if (!raw) return;
+    const exposed = applyExposure(raw, { ev: EV[ev]!, flash, shutterIndex: shutter, isoIndex: iso });
+    const stockKey = filmStocks[stock]!.key;
+    const preset = STOCK_PRESETS[stockKey] ?? DEFAULT_PRESET;
+    const canvas = document.createElement("canvas");
+    canvas.width = exposed.width;
+    canvas.height = exposed.height;
+    const ctx = canvas.getContext("2d")!;
+    ctx.filter = buildFilterCss(stockKey, preset.tone, preset.color, preset.palette);
+    ctx.drawImage(exposed, 0, 0);
+    ctx.filter = "none";
+    if (stamp) drawStamp(canvas, today);
     canvas.toBlob(
       async (blob) => {
         if (!blob) return;
@@ -480,12 +653,22 @@ function Capture() {
    * guest hasn't touched the strip), so the review opens already looking
    * like a reasonable default rather than flat/neutral. */
   function shoot() {
+    if (flash) {
+      setFlashPulse(true);
+      setTimeout(() => setFlashPulse(false), 180);
+    }
     if (burst) {
       for (let i = 0; i < 3; i++) shootOnce();
       return;
     }
-    const canvas = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
-    if (!canvas) return;
+    const raw = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
+    if (!raw) return;
+    // Exposure (ISO/EV/flash/shutter) is baked in here, before the film
+    // stock the review sheet lets the guest choose -- same order a real
+    // camera works in: exposure happens at the sensor, the stock's color
+    // response is a separate, later step. The review preview shows exactly
+    // this already-exposed frame with the stock filter layered on top live.
+    const canvas = applyExposure(raw, { ev: EV[ev]!, flash, shutterIndex: shutter, isoIndex: iso });
     const preset = STOCK_PRESETS[filmStocks[stock]!.key] ?? DEFAULT_PRESET;
     setReviewing({
       canvas,
@@ -523,6 +706,8 @@ function Capture() {
     const ctx = out.getContext("2d")!;
     ctx.filter = filterCss;
     ctx.drawImage(reviewing.canvas, 0, 0);
+    ctx.filter = "none";
+    if (stamp) drawStamp(out, today);
     out.toBlob(
       async (blob) => {
         if (!blob) return;
@@ -579,9 +764,33 @@ function Capture() {
     );
   }
   if (mirrored) videoTransformParts.push("scaleX(-1)");
-  const videoStyle = videoTransformParts.length
-    ? { transform: videoTransformParts.join(" ") }
-    : undefined;
+
+  // Live preview uses the exact same buildFilterCss the review sheet and
+  // final capture do, at the stock's default preset -- not a hand-picked
+  // CSS approximation covering 2 of 5 stocks. What the guest sees while
+  // framing is now what they'll actually get, for every stock, not just
+  // the two that happened to get bespoke Tailwind classes.
+  //
+  // EV/flash/shutter are folded into this same string too (matching
+  // applyExposure's shot-time math) rather than left as separate classes:
+  // an inline style.filter (below) overrides a class's `filter` entirely
+  // rather than composing with it, so a class-based brightness would
+  // silently stop doing anything the moment this was added. ISO's vignette
+  // is the one exposure control NOT here -- it's a spatial gradient, not a
+  // filter function, so it stays the separate boxShadow div below, same as
+  // it always has been.
+  const liveStockKey = filmStocks[stock]!.key;
+  const livePreset = STOCK_PRESETS[liveStockKey] ?? DEFAULT_PRESET;
+  const liveFilterCss = buildFilterCss(liveStockKey, livePreset.tone, livePreset.color, livePreset.palette);
+  const liveBrightness = evBrightness(EV[ev]!) * (flash ? 1.35 : 1);
+  const liveBlurPx = shutter * 0.5;
+
+  const videoStyle: React.CSSProperties = {
+    filter: [liveFilterCss, `brightness(${liveBrightness.toFixed(3)})`, liveBlurPx > 0 ? `blur(${liveBlurPx}px)` : ""]
+      .filter(Boolean)
+      .join(" "),
+  };
+  if (videoTransformParts.length) videoStyle.transform = videoTransformParts.join(" ");
 
   return (
     <main className="grain relative min-h-screen overflow-hidden bg-emulsion pb-16">
@@ -612,13 +821,7 @@ function Capture() {
                 autoPlay
                 playsInline
                 muted
-                className={`h-full w-full object-cover transition-[filter,transform] duration-500 ${
-                  stock === 2
-                    ? "grayscale contrast-125"
-                    : stock === 1
-                      ? "saturate-150 hue-rotate-[-8deg]"
-                      : ""
-                } ${flash ? "brightness-110" : ""}`}
+                className="h-full w-full object-cover transition-[filter,transform] duration-500"
                 // Inline rather than a Tailwind scale utility: v4 emits those
                 // via the `scale` property, not `transform`, which makes the
                 // mirror easy to misread as "not applied" when verifying. The
@@ -683,31 +886,35 @@ function Capture() {
                     </div>
                   )}
 
-                  {ai?.reframe.worth_it && (
-                    <div
-                      className="settling absolute rounded-lg border-2 border-safelight/85"
-                      style={pct(ai.reframe.rect)}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const rect = digitalZoom
-                            ? composeRect(digitalZoom.rect, ai.reframe.rect)
-                            : ai.reframe.rect;
-                          const zoom = (digitalZoom?.zoom ?? 1) * ai.reframe.zoom;
-                          setDigitalZoom({ rect, zoom: Math.round(zoom * 100) / 100 });
-                        }}
-                        className="pointer-events-auto absolute -bottom-6 right-0 rounded-sm border border-safelight/70 bg-safelight/90 px-2 py-1 font-mono text-[0.55rem] font-bold tracking-[0.16em] text-emulsion active:scale-95"
-                      >
-                        ZOOM IN {ai.reframe.zoom}× →
-                      </button>
-                    </div>
-                  )}
-
-                  {digitalZoom && (
+                  {/* Auto-zoom already applied this rect to the video's own
+                      transform the moment the tick that found it landed (see
+                      the preview effect) -- no tap needed, so there's no
+                      separate crop-rectangle-plus-button here to keep in
+                      sync with it. Just a status chip, and a way to hand
+                      control back and forth with the manual ZOOM dial. */}
+                  {autoZoom && digitalZoom && (
                     <button
                       type="button"
-                      onClick={() => setDigitalZoom(null)}
+                      onClick={() => {
+                        setAutoZoom(false);
+                        setZoomIndex(nearestZoomStep(digitalZoom.zoom));
+                      }}
+                      className="pointer-events-auto absolute right-2 bottom-2 rounded-sm border border-safelight/60 bg-emulsion/85 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-safelight active:scale-95"
+                    >
+                      AUTO-ZOOMED {digitalZoom.zoom}× · TAP FOR MANUAL
+                    </button>
+                  )}
+
+                  {!autoZoom && digitalZoom && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDigitalZoom(null);
+                        setZoomIndex(0);
+                        setAutoZoom(true);
+                        zoomCandidateRef.current = null;
+                        zoomStableCountRef.current = 0;
+                      }}
                       className="pointer-events-auto absolute right-2 bottom-2 rounded-sm border border-safelight/60 bg-emulsion/85 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-safelight active:scale-95"
                     >
                       ZOOMED {digitalZoom.zoom}× · TAP TO RESET
@@ -749,13 +956,14 @@ function Capture() {
 
                   {/* Say why there's nothing to show. Saliency genuinely finds
                       no single subject in a diffuse scene (~1 frame in 3 on
-                      real photos), and silent absence is indistinguishable
-                      from the feature being broken -- which is exactly how
-                      this looked on a phone before. */}
+                      real photos); a guest deliberately shooting something
+                      with no single focal point -- a landscape, a mood shot,
+                      a texture -- isn't a failure case, so this says so
+                      instead of implying one. */}
                   {ai && !ai.ar_guide.subject_found && (
                     <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 justify-center">
                       <span className="rounded-sm bg-emulsion/80 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-stale">
-                        NO CLEAR SUBJECT
+                        OPEN SCENE · SHOOT FREELY
                       </span>
                     </div>
                   )}
@@ -886,14 +1094,31 @@ function Capture() {
         {/* scrim so the controls stay legible over a bright room */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-72 bg-gradient-to-t from-emulsion via-emulsion/85 to-transparent" />
 
-        {/* SETTINGS PANEL — the "advanced" drawer of a retro cam */}
+        {/* SETTINGS PANEL — the "advanced" drawer of a retro cam.
+            Deliberately NOT near-opaque: ratio, zoom and film-stock changes
+            are visible live in the viewfinder behind this panel, and a
+            solid bg-emulsion/90 + full backdrop-blur made that impossible
+            to see -- adjusting a setting and having no visual feedback that
+            it did anything (until closing the panel) reads as "broken",
+            same failure shape as a control with no effect at all. Individual
+            Dial/Toggle controls keep their own bg-emulsion/60-70, so text
+            stays legible even with the outer panel this much lighter. */}
         {panel && (
           <div className="absolute inset-x-0 bottom-[16.5rem] px-4">
-            <div className="film-edge rounded-sm border border-fixer/20 bg-emulsion/90 px-3 py-5 backdrop-blur">
+            <div className="film-edge rounded-sm border border-fixer/20 bg-emulsion/45 px-3 py-5 backdrop-blur-sm">
               <div className="flex gap-2">
                 <Dial label="ISO" values={ISO} index={iso} onChange={setIso} />
                 <Dial label="SHUTTER" values={SHUTTER} index={shutter} onChange={setShutter} />
                 <Dial label="EV" values={EV} index={ev} onChange={setEv} />
+              </div>
+
+              <div className="mt-2 flex gap-2">
+                <Dial
+                  label="ZOOM"
+                  values={ZOOM_STEPS.map((z) => `${z}×`)}
+                  index={zoomIndex}
+                  onChange={onManualZoomChange}
+                />
               </div>
 
               <div className="mt-3 flex flex-wrap gap-1.5">
@@ -905,6 +1130,28 @@ function Capture() {
                 </Toggle>
                 <Toggle on={aiOn} onClick={() => setAiOn((v) => !v)}>
                   AI COMPOSE {aiOn ? "ON" : "OFF"}
+                </Toggle>
+                <Toggle
+                  on={autoZoom}
+                  onClick={() =>
+                    setAutoZoom((v) => {
+                      if (v) {
+                        // Turning auto off: freeze the ZOOM dial at wherever
+                        // auto-zoom currently has it, so switching to manual
+                        // doesn't jump the frame.
+                        setZoomIndex(digitalZoom ? nearestZoomStep(digitalZoom.zoom) : 0);
+                      } else {
+                        // Turning auto back on: start the stability count
+                        // fresh rather than resuming whatever it was mid-way
+                        // through when auto got switched off.
+                        zoomCandidateRef.current = null;
+                        zoomStableCountRef.current = 0;
+                      }
+                      return !v;
+                    })
+                  }
+                >
+                  AUTO ZOOM {autoZoom ? "ON" : "OFF"}
                 </Toggle>
                 <Toggle on={stamp} onClick={() => setStamp((v) => !v)}>
                   DATE STAMP
@@ -1105,6 +1352,18 @@ function Capture() {
             </div>
           </div>
         )}
+
+        {/* Flash pulse: last in DOM order (and z-50, belt and suspenders)
+            so it's never hidden behind the review sheet even if a burst
+            shot's timing overlaps it. transition rather than a keyframe
+            animation -- flashPulse is only ever true for 180ms, so a plain
+            opacity transition already gives the fast-in/slow-out shape a
+            real flash has without needing to hand-tune easing curves. */}
+        <div
+          className={`pointer-events-none absolute inset-0 z-50 bg-white transition-opacity ${
+            flashPulse ? "opacity-90 duration-75" : "opacity-0 duration-150"
+          }`}
+        />
       </div>
 
       <GuestTabs active="capture" />
@@ -1154,6 +1413,75 @@ function captureFrame(
   canvas.height = sh;
   canvas.getContext("2d")!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
   return canvas;
+}
+
+/** EV compensation as an actual brightness multiplier -- "+0.3" of real EV
+ * roughly doubles perceived exposure per stop, but a literal doubling per
+ * dial click reads as a lighting switch flipping rather than a compensation
+ * dial, so this is a gentler, still-monotonic mapping rather than a
+ * physically exact one: +-1.0 EV covers roughly +-40% brightness. */
+function evBrightness(evLabel: string): number {
+  return 1 + parseFloat(evLabel) * 0.4;
+}
+
+/** Bakes ISO (vignette), EV + FLASH (brightness), and SHUTTER (blur, standing
+ * in for motion blur at a slower simulated shutter speed) into real pixels on
+ * a fresh canvas -- the "exposure" stage of the shot, applied once right
+ * after the raw frame is grabbed and before any film-stock look is chosen.
+ * Real camera settings work in that order (exposure happens at the sensor;
+ * a film stock's color response is a separate, later step), and the review
+ * sheet's whole premise -- pick a stock, adjust after the fact -- only makes
+ * sense if what it's adjusting is already-exposed pixels, not a live filter
+ * that quietly vanishes the moment you leave the viewfinder. */
+function applyExposure(
+  raw: HTMLCanvasElement,
+  opts: { ev: string; flash: boolean; shutterIndex: number; isoIndex: number },
+): HTMLCanvasElement {
+  const out = document.createElement("canvas");
+  out.width = raw.width;
+  out.height = raw.height;
+  const ctx = out.getContext("2d")!;
+
+  const brightness = evBrightness(opts.ev) * (opts.flash ? 1.35 : 1);
+  const filterParts = [`brightness(${brightness.toFixed(3)})`];
+  // Scaled to the actual capture resolution, not a fixed px count: the live
+  // preview's blur reads fine at a few px because it's displayed at maybe
+  // 350-400 CSS px wide, but a real capture can be several thousand pixels
+  // wide, where a flat 0-2.5px blur would be completely invisible.
+  const blurPx = opts.shutterIndex * (out.width / 800);
+  if (blurPx > 0) filterParts.push(`blur(${blurPx.toFixed(2)}px)`);
+  ctx.filter = filterParts.join(" ");
+  ctx.drawImage(raw, 0, 0);
+  ctx.filter = "none";
+
+  const vignetteStrength = opts.isoIndex * 0.06; // index 0 (ISO 100) -> none ... index 5 (3200) -> 0.3 alpha
+  if (vignetteStrength > 0) {
+    const w = out.width, h = out.height;
+    const cx = w / 2, cy = h / 2;
+    const outerR = Math.hypot(cx, cy);
+    const grad = ctx.createRadialGradient(cx, cy, outerR * 0.55, cx, cy, outerR);
+    grad.addColorStop(0, "rgba(0,0,0,0)");
+    grad.addColorStop(1, `rgba(0,0,0,${vignetteStrength.toFixed(3)})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+  }
+  return out;
+}
+
+/** Burns the date-stamp text into the corner, same font/color/position
+ * language as the live overlay -- drawn last (after the film-stock filter),
+ * so it stays legible instead of picking up e.g. Tri-X's grayscale. */
+function drawStamp(canvas: HTMLCanvasElement, label: string) {
+  const ctx = canvas.getContext("2d")!;
+  const fontSize = Math.max(12, Math.round(canvas.width * 0.035));
+  const pad = fontSize * 0.7;
+  ctx.font = `700 ${fontSize}px "JetBrains Mono", monospace`;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.shadowColor = "rgba(0,0,0,0.65)";
+  ctx.shadowBlur = fontSize * 0.35;
+  ctx.fillStyle = "oklch(0.55 0.18 30)"; // --safelight
+  ctx.fillText(label, canvas.width - pad, canvas.height - pad);
 }
 
 /** Center-crops the live video to `ar` -- exactly how the viewfinder shows
@@ -1229,21 +1557,47 @@ function pct(r: { x: number; y: number; w: number; h: number }) {
   };
 }
 
-/** Folds a rect expressed relative to `outer` (e.g. a second "zoom in" tap,
- * whose ai.reframe.rect is normalized against the already-zoomed view) into
- * the same absolute space `outer` itself is expressed in -- so a chain of
- * taps composes into one rect instead of each tap only knowing about the
- * one before it. */
-function composeRect(
-  outer: { x: number; y: number; w: number; h: number },
-  inner: { x: number; y: number; w: number; h: number },
-) {
-  return {
-    x: outer.x + inner.x * outer.w,
-    y: outer.y + inner.y * outer.h,
-    w: inner.w * outer.w,
-    h: inner.h * outer.h,
-  };
+/** A plain centered crop at `zoom`, for the manual ZOOM dial -- unlike
+ * auto-zoom's absolute-against-the-full-frame rect (see the preview tick),
+ * this doesn't try to track any subject, just centers on whatever's already
+ * in the middle. Manually dialing zoom is a deliberate "just make it
+ * tighter/looser" action, not a refinement of the AI's guess. */
+function centeredZoomRect(zoom: number) {
+  const size = 1 / zoom;
+  const off = (1 - size) / 2;
+  return { x: off, y: off, w: size, h: size };
+}
+
+/** Index of the ZOOM_STEPS entry closest to `zoom`, so the manual dial can
+ * reflect a zoom level the AI's tap-to-zoom just set (an arbitrary, possibly
+ * off-center value) without the two controls visibly disagreeing. */
+function nearestZoomStep(zoom: number): number {
+  let best = 0;
+  let bestDiff = Infinity;
+  ZOOM_STEPS.forEach((z, i) => {
+    const diff = Math.abs(z - zoom);
+    if (diff < bestDiff) {
+      best = i;
+      bestDiff = diff;
+    }
+  });
+  return best;
+}
+
+/** "Close enough to call the same framing" for auto-zoom's stability check
+ * (see zoomCandidateRef) -- position within 6% of the frame and size within
+ * 6% counts as the guest holding roughly still, not a new recommendation. */
+function rectsSimilar(
+  a: { x: number; y: number; w: number; h: number },
+  b: { x: number; y: number; w: number; h: number },
+  tol = 0.06,
+): boolean {
+  return (
+    Math.abs(a.x - b.x) < tol &&
+    Math.abs(a.y - b.y) < tol &&
+    Math.abs(a.w - b.w) < tol &&
+    Math.abs(a.h - b.h) < tol
+  );
 }
 
 /** TONE/COLOR/PALETTE -> a real canvas `filter` string, applied both live

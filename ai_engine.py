@@ -628,6 +628,7 @@ def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
     reframe = compute_reframe(img, aspect=aspect, subject=subject)
     scene = describe_scene(img)
     filter_result, image_emb = suggest_filter(img)
+    aesthetic_score = score_aesthetic(image_emb)
 
     scores = filter_result["scores"]
     ranked = sorted(scores, key=scores.get, reverse=True)
@@ -647,7 +648,7 @@ def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
             for k in ranked[:3]
         ],
         "reason": compose_reason(scene, best, confident),
-        "aesthetic_score": score_aesthetic(image_emb),
+        "aesthetic_score": aesthetic_score,
     }
 
 
