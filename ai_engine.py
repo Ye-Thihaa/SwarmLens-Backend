@@ -338,6 +338,32 @@ def _saliency_centroid(bgr: np.ndarray) -> tuple[float, float]:
     return cx, cy
 
 
+def _soft_saliency_centroid(bgr: np.ndarray) -> tuple[float, float]:
+    """A saliency-weighted centroid over the WHOLE frame, no percentile gate.
+    Used only by _aesthetic_fallback_crop as a framing guess when
+    _saliency_subject finds no single subject -- a diffuse scene (a
+    sunflower field, a crowd, texture) still has *some* distribution of
+    visual weight, just not concentrated enough to call a "subject". Cheap
+    to compute twice: saliency itself is classical CV on a small (224px)
+    preview frame, not a model call -- the real cost this module worries
+    about is CLIP inference, which this function doesn't touch."""
+    h, w = bgr.shape[:2]
+    sal = cv2.saliency.StaticSaliencySpectralResidual_create()
+    ok, smap = sal.computeSaliency(bgr)
+    if not ok:
+        return w / 2, h / 2
+    blur = cv2.GaussianBlur(
+        (smap * 255).astype(np.uint8), (0, 0), sigmaX=max(w, h) / SUBJECT_BLUR_DIV
+    ).astype(np.float32)
+    total = float(blur.sum())
+    if total <= 0:
+        return w / 2, h / 2
+    ys, xs = np.mgrid[0:h, 0:w]
+    cx = float((xs * blur).sum() / total)
+    cy = float((ys * blur).sum() / total)
+    return cx, cy
+
+
 _OPPOSITE = {"left": "right", "right": "left", "up": "down", "down": "up", "centered": "centered"}
 
 
@@ -407,7 +433,7 @@ MIN_USEFUL_ZOOM = 1.15  # below this the crop isn't worth telling anyone about
 
 
 def compute_reframe(img: Image.Image, aspect: float | None = None,
-                    subject: tuple | None = None) -> dict:
+                    subject: tuple | None = None, max_zoom: float = MAX_ZOOM) -> dict:
     """A concrete crop rectangle, not just a nudge direction: where the
     frame would sit if the subject were placed on a rule-of-thirds
     intersection and tightened to fill SUBJECT_SHARE of the frame.
@@ -415,6 +441,11 @@ def compute_reframe(img: Image.Image, aspect: float | None = None,
     `aspect` is the crop's width/height -- pass the ratio the client is
     actually shooting (3:4, 1:1, ...) so the rectangle it draws matches
     the frame it will get. Defaults to the source image's own aspect.
+
+    `max_zoom` lets a caller ask for a gentler cap than the default --
+    _aesthetic_fallback_crop passes a smaller one, since a saliency-weighted
+    guess over a diffuse scene deserves less confidence than an actual
+    detected subject.
 
     The rect is normalized to 0..1 of the source image so the caller can
     render it at any display size. `zoom` is relative to the largest crop
@@ -438,7 +469,7 @@ def compute_reframe(img: Image.Image, aspect: float | None = None,
     sw, sh = max(sx1 - sx0, 1.0), max(sy1 - sy0, 1.0)
     crop_w = max(sw / SUBJECT_SHARE, (sh / SUBJECT_SHARE) * aspect)
     crop_w = min(crop_w, max_w)                 # never larger than fits
-    crop_w = max(crop_w, max_w / MAX_ZOOM)      # never tighter than MAX_ZOOM
+    crop_w = max(crop_w, max_w / max_zoom)      # never tighter than max_zoom
     crop_h = crop_w / aspect
 
     # Put the subject on the nearer thirds line of the *crop*. Choosing the
@@ -462,7 +493,57 @@ def compute_reframe(img: Image.Image, aspect: float | None = None,
         "zoom": round(float(zoom), 2),
         "worth_it": bool(found and zoom >= MIN_USEFUL_ZOOM),
         "subject_found": found,
+        "basis": "subject" if found else None,
     }
+
+
+# ---- aesthetic fallback: a crop guess for scenes with no single subject ----
+
+AESTHETIC_MAX_ZOOM = 1.6       # gentler than MAX_ZOOM -- a guess, not a detection
+AESTHETIC_IMPROVEMENT_MIN = 0.35  # candidate must beat the full frame by this many
+                                   # aesthetic-score points (0-10 scale) to recommend
+
+
+def _aesthetic_fallback_crop(img: Image.Image, bgr: np.ndarray, aspect: float,
+                              full_emb: np.ndarray, full_score: float) -> dict | None:
+    """When _saliency_subject finds no single subject, this stands in for
+    one: a saliency-weighted centroid over the WHOLE frame (see
+    _soft_saliency_centroid), cropped modestly and scored with the same
+    aesthetic predictor used everywhere else here. Returns None unless the
+    crop is a real, measured improvement over the full frame -- a guest
+    deliberately shooting something with no single focal point (a
+    sunflower field, a wall of texture, a group with no lead) should get
+    silence, not an invented recommendation that happens to be wrong.
+
+    Costs exactly one extra CLIP vision pass (for the candidate crop) on
+    top of the one preview() already pays for the full frame -- only paid
+    when there's no subject, not on every frame."""
+    w, h = img.size
+    cx, cy = _soft_saliency_centroid(bgr)
+    # A modest fixed-size seed box, not a real object extent -- just drives
+    # compute_reframe's existing SUBJECT_SHARE math toward "how tight is
+    # worth trying" the same way a detected subject's bbox would.
+    half = 0.12 * min(w, h)
+    synthetic_subject = (cx, cy, (cx - half, cy - half, cx + half, cy + half), True)
+    candidate = compute_reframe(img, aspect=aspect, subject=synthetic_subject, max_zoom=AESTHETIC_MAX_ZOOM)
+    if not candidate["worth_it"]:
+        return None
+
+    r = candidate["rect"]
+    crop = img.convert("RGB").crop((
+        round(r["x"] * w), round(r["y"] * h),
+        round((r["x"] + r["w"]) * w), round((r["y"] + r["h"]) * h),
+    ))
+    candidate_score = score_aesthetic(_embed_image(crop))
+    gain = candidate_score - full_score
+    if gain < AESTHETIC_IMPROVEMENT_MIN:
+        return None
+
+    candidate["subject_box"] = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+    candidate["subject_found"] = False
+    candidate["basis"] = "aesthetic"
+    candidate["aesthetic_gain"] = round(gain, 2)
+    return candidate
 
 
 # ---- scene colour, for the recommendation sentence ----
@@ -623,11 +704,22 @@ def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
     img.load()
     bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
     subject = _saliency_subject(bgr)
+    resolved_aspect = aspect or (img.width / img.height)
 
     ar_guide = compute_ar_guide(img, subject=subject)
-    reframe = compute_reframe(img, aspect=aspect, subject=subject)
+    reframe = compute_reframe(img, aspect=resolved_aspect, subject=subject)
     scene = describe_scene(img)
     filter_result, image_emb = suggest_filter(img)
+    aesthetic_score = score_aesthetic(image_emb)
+
+    # No single subject to recommend a crop around -- try a gentler,
+    # aesthetic-score-driven guess instead of leaving the guest with
+    # nothing to act on. Only replaces reframe when it clears a real,
+    # measured bar; see _aesthetic_fallback_crop.
+    if not subject[3]:
+        fallback = _aesthetic_fallback_crop(img, bgr, resolved_aspect, image_emb, aesthetic_score)
+        if fallback is not None:
+            reframe = fallback
 
     scores = filter_result["scores"]
     ranked = sorted(scores, key=scores.get, reverse=True)
@@ -647,7 +739,7 @@ def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
             for k in ranked[:3]
         ],
         "reason": compose_reason(scene, best, confident),
-        "aesthetic_score": score_aesthetic(image_emb),
+        "aesthetic_score": aesthetic_score,
     }
 
 

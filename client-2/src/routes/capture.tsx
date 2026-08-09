@@ -56,6 +56,13 @@ const STOCK_PRESETS: Record<string, { tone: number; color: number; palette: numb
 };
 const DEFAULT_PRESET = { tone: 0, color: 100, palette: 50 };
 
+/** Discrete stops for the manual ZOOM dial in the settings panel -- deliberately
+ * separate from the AI's tap-to-zoom, which can recommend an off-center rect.
+ * The manual dial always produces a centered crop (see centeredZoomRect) so
+ * "zoom out a bit" from wherever you are has one unambiguous meaning instead
+ * of needing to reconstruct what an earlier AI tap was centered on. */
+const ZOOM_STEPS = [1, 1.3, 1.6, 2, 2.5, 3, 4] as const;
+
 /** How often the viewfinder asks a node to look at what it's seeing. One
  * analysis measured ~37ms server-side, so this is set by taste and by
  * politeness to a shared node rather than by compute: fast enough to feel
@@ -217,6 +224,10 @@ function Capture() {
     rect: { x: number; y: number; w: number; h: number };
     zoom: number;
   } | null>(null);
+  // The manual ZOOM dial's own position -- kept in sync with digitalZoom
+  // (see the AI-tap handler and the reset effect below) so the settings
+  // panel never shows a zoom level that disagrees with what's on screen.
+  const [zoomIndex, setZoomIndex] = useState(0);
 
   const [stock, setStock] = useState(0);
 
@@ -269,7 +280,16 @@ function Capture() {
   // stuck zoomed in with no way back.
   useEffect(() => {
     setDigitalZoom(null);
+    setZoomIndex(0);
   }, [ratio, aiOn, facing]);
+
+  /** Drives digitalZoom from the manual ZOOM dial: a plain centered crop at
+   * the selected step, overriding whatever the AI's tap-to-zoom had set. */
+  function onManualZoomChange(i: number) {
+    setZoomIndex(i);
+    const z = ZOOM_STEPS[i]!;
+    setDigitalZoom(z <= 1 ? null : { rect: centeredZoomRect(z), zoom: z });
+  }
 
   // real camera feed, not a bundled photo. Re-runs on flip; the cleanup
   // stops the old tracks first, since a phone won't hand out the front
@@ -428,6 +448,34 @@ function Capture() {
     };
   }, []);
 
+  // Guidance settle: the pan arrows re-render on every ~1.5s tick for as
+  // long as the frame isn't exactly on a thirds line, which without this
+  // never stops firing -- reading as nagging rather than help, and leaving
+  // no room for the guest to make their own compositional call. After the
+  // SAME direction has held for NUDGE_QUIET_MS, go quiet and trust the
+  // guest; a NEW direction (they moved, or the scene changed) resets the
+  // clock and speaks up again immediately.
+  const NUDGE_QUIET_MS = 4000;
+  const [nudgeQuiet, setNudgeQuiet] = useState(false);
+  const nudgeKeyRef = useRef<string | null>(null);
+  const nudgeSinceRef = useRef(0);
+
+  useEffect(() => {
+    if (!ai || !ai.ar_guide.subject_found || ai.ar_guide.well_composed) {
+      nudgeKeyRef.current = null;
+      setNudgeQuiet(false);
+      return;
+    }
+    const key = `${ai.ar_guide.pan_camera_x}-${ai.ar_guide.pan_camera_y}`;
+    if (key !== nudgeKeyRef.current) {
+      nudgeKeyRef.current = key;
+      nudgeSinceRef.current = Date.now();
+      setNudgeQuiet(false);
+    } else if (Date.now() - nudgeSinceRef.current > NUDGE_QUIET_MS) {
+      setNudgeQuiet(true);
+    }
+  }, [ai]);
+
   useEffect(() => {
     if (count === null) return;
     if (count === 0) {
@@ -446,14 +494,27 @@ function Capture() {
     composeTimer.current = setTimeout(() => setComposing(false), 6000);
   }
 
-  /** Grabs the current video frame into a real JPEG, queues it in the
-   * offline outbox immediately (the shutter never waits on the network),
-   * then fires a background sync attempt. Used for burst mode, which
-   * bypasses the review sheet entirely (reviewing three frames one at a
-   * time is a separate feature nobody asked for). */
+  /** Grabs the current video frame, bakes in the currently selected stock's
+   * default look (same buildFilterCss the review sheet and confirmReview
+   * use, just at STOCK_PRESETS defaults since there's no per-shot review to
+   * adjust from), and queues it in the offline outbox immediately -- the
+   * shutter never waits on the network. Used for burst mode, which bypasses
+   * the review sheet entirely (reviewing three frames one at a time is a
+   * separate feature nobody asked for) but should still come out looking
+   * like the stock the guest picked, not a flat unfiltered frame -- a burst
+   * shot skipping the effect entirely was a real gap, not a deliberate
+   * simplification. */
   function shootOnce() {
-    const canvas = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
-    if (!canvas) return;
+    const raw = captureFrame(videoRef.current, digitalZoom?.rect, RATIOS[ratio]!.ar, mirrored);
+    if (!raw) return;
+    const stockKey = filmStocks[stock]!.key;
+    const preset = STOCK_PRESETS[stockKey] ?? DEFAULT_PRESET;
+    const canvas = document.createElement("canvas");
+    canvas.width = raw.width;
+    canvas.height = raw.height;
+    const ctx = canvas.getContext("2d")!;
+    ctx.filter = buildFilterCss(stockKey, preset.tone, preset.color, preset.palette);
+    ctx.drawImage(raw, 0, 0);
     canvas.toBlob(
       async (blob) => {
         if (!blob) return;
@@ -579,9 +640,26 @@ function Capture() {
     );
   }
   if (mirrored) videoTransformParts.push("scaleX(-1)");
-  const videoStyle = videoTransformParts.length
-    ? { transform: videoTransformParts.join(" ") }
-    : undefined;
+
+  // Live preview uses the exact same buildFilterCss the review sheet and
+  // final capture do, at the stock's default preset -- not a hand-picked
+  // CSS approximation covering 2 of 5 stocks. What the guest sees while
+  // framing is now what they'll actually get, for every stock, not just
+  // the two that happened to get bespoke Tailwind classes.
+  //
+  // flash's brightness bump is folded into this same string rather than
+  // left as a separate Tailwind `brightness-110` class: an inline
+  // style.filter (below) overrides a class's `filter` entirely rather than
+  // composing with it, so a class-based brightness would silently stop
+  // doing anything the moment this was added.
+  const liveStockKey = filmStocks[stock]!.key;
+  const livePreset = STOCK_PRESETS[liveStockKey] ?? DEFAULT_PRESET;
+  const liveFilterCss = buildFilterCss(liveStockKey, livePreset.tone, livePreset.color, livePreset.palette);
+
+  const videoStyle: React.CSSProperties = {
+    filter: flash ? `${liveFilterCss} brightness(1.1)` : liveFilterCss,
+  };
+  if (videoTransformParts.length) videoStyle.transform = videoTransformParts.join(" ");
 
   return (
     <main className="grain relative min-h-screen overflow-hidden bg-emulsion pb-16">
@@ -612,13 +690,7 @@ function Capture() {
                 autoPlay
                 playsInline
                 muted
-                className={`h-full w-full object-cover transition-[filter,transform] duration-500 ${
-                  stock === 2
-                    ? "grayscale contrast-125"
-                    : stock === 1
-                      ? "saturate-150 hue-rotate-[-8deg]"
-                      : ""
-                } ${flash ? "brightness-110" : ""}`}
+                className="h-full w-full object-cover transition-[filter,transform] duration-500"
                 // Inline rather than a Tailwind scale utility: v4 emits those
                 // via the `scale` property, not `transform`, which makes the
                 // mirror easy to misread as "not applied" when verifying. The
@@ -695,11 +767,14 @@ function Capture() {
                             ? composeRect(digitalZoom.rect, ai.reframe.rect)
                             : ai.reframe.rect;
                           const zoom = (digitalZoom?.zoom ?? 1) * ai.reframe.zoom;
-                          setDigitalZoom({ rect, zoom: Math.round(zoom * 100) / 100 });
+                          const rounded = Math.round(zoom * 100) / 100;
+                          setDigitalZoom({ rect, zoom: rounded });
+                          setZoomIndex(nearestZoomStep(rounded));
                         }}
                         className="pointer-events-auto absolute -bottom-6 right-0 rounded-sm border border-safelight/70 bg-safelight/90 px-2 py-1 font-mono text-[0.55rem] font-bold tracking-[0.16em] text-emulsion active:scale-95"
                       >
-                        ZOOM IN {ai.reframe.zoom}× →
+                        {ai.reframe.basis === "aesthetic" ? "TRY THIS CROP" : "ZOOM IN"}{" "}
+                        {ai.reframe.zoom}× →
                       </button>
                     </div>
                   )}
@@ -707,7 +782,10 @@ function Capture() {
                   {digitalZoom && (
                     <button
                       type="button"
-                      onClick={() => setDigitalZoom(null)}
+                      onClick={() => {
+                        setDigitalZoom(null);
+                        setZoomIndex(0);
+                      }}
                       className="pointer-events-auto absolute right-2 bottom-2 rounded-sm border border-safelight/60 bg-emulsion/85 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-safelight active:scale-95"
                     >
                       ZOOMED {digitalZoom.zoom}× · TAP TO RESET
@@ -724,6 +802,7 @@ function Capture() {
                   {ai &&
                     ai.ar_guide.subject_found &&
                     !ai.ar_guide.well_composed &&
+                    !nudgeQuiet &&
                     (() => {
                       const nudge = panInstruction(ai.ar_guide, mirrored);
                       if (!nudge) return null;
@@ -747,15 +826,19 @@ function Capture() {
                     </div>
                   )}
 
-                  {/* Say why there's nothing to show. Saliency genuinely finds
-                      no single subject in a diffuse scene (~1 frame in 3 on
-                      real photos), and silent absence is indistinguishable
-                      from the feature being broken -- which is exactly how
-                      this looked on a phone before. */}
-                  {ai && !ai.ar_guide.subject_found && (
+                  {/* Say why there's nothing to show -- but only when there's
+                      genuinely nothing: a diffuse scene (~1 frame in 3 on real
+                      photos) with no single subject AND no aesthetic-crop
+                      recommendation either (ai_engine.py's fallback, gated on
+                      the crop rectangle above being worth_it). Silent absence
+                      reads as the feature being broken; but a guest
+                      deliberately shooting something with no single focal
+                      point -- a landscape, a mood shot, a texture -- isn't a
+                      failure case, so this says so instead of implying one. */}
+                  {ai && !ai.ar_guide.subject_found && !ai.reframe.worth_it && (
                     <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 justify-center">
                       <span className="rounded-sm bg-emulsion/80 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-stale">
-                        NO CLEAR SUBJECT
+                        OPEN SCENE · SHOOT FREELY
                       </span>
                     </div>
                   )}
@@ -894,6 +977,15 @@ function Capture() {
                 <Dial label="ISO" values={ISO} index={iso} onChange={setIso} />
                 <Dial label="SHUTTER" values={SHUTTER} index={shutter} onChange={setShutter} />
                 <Dial label="EV" values={EV} index={ev} onChange={setEv} />
+              </div>
+
+              <div className="mt-2 flex gap-2">
+                <Dial
+                  label="ZOOM"
+                  values={ZOOM_STEPS.map((z) => `${z}×`)}
+                  index={zoomIndex}
+                  onChange={onManualZoomChange}
+                />
               </div>
 
               <div className="mt-3 flex flex-wrap gap-1.5">
@@ -1244,6 +1336,32 @@ function composeRect(
     w: inner.w * outer.w,
     h: inner.h * outer.h,
   };
+}
+
+/** A plain centered crop at `zoom`, for the manual ZOOM dial -- unlike the
+ * AI's composeRect chain, this doesn't try to preserve any earlier off-center
+ * framing. Manually dialing zoom is a deliberate reset to "just make it
+ * tighter/looser from the middle", not a refinement of the AI's guess. */
+function centeredZoomRect(zoom: number) {
+  const size = 1 / zoom;
+  const off = (1 - size) / 2;
+  return { x: off, y: off, w: size, h: size };
+}
+
+/** Index of the ZOOM_STEPS entry closest to `zoom`, so the manual dial can
+ * reflect a zoom level the AI's tap-to-zoom just set (an arbitrary, possibly
+ * off-center value) without the two controls visibly disagreeing. */
+function nearestZoomStep(zoom: number): number {
+  let best = 0;
+  let bestDiff = Infinity;
+  ZOOM_STEPS.forEach((z, i) => {
+    const diff = Math.abs(z - zoom);
+    if (diff < bestDiff) {
+      best = i;
+      bestDiff = diff;
+    }
+  });
+  return best;
 }
 
 /** TONE/COLOR/PALETTE -> a real canvas `filter` string, applied both live
