@@ -55,6 +55,13 @@ from PIL import Image
 MODEL_DIR = os.getenv("MODEL_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
 CLIP_BASE = "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main"
 AESTHETIC_URL = "https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/sa_0_4_vit_b_32_linear.pth"
+# YuNet face detector (OpenCV Zoo, ~230KB). Note the media.githubusercontent
+# host: opencv_zoo stores model weights in Git LFS, and the ordinary raw.
+# host returns a 131-byte LFS *pointer* that loads as a corrupt model.
+FACE_MODEL_URL = (
+    "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/"
+    "models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
 
 CLIP_IMAGE_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 CLIP_IMAGE_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
@@ -260,6 +267,213 @@ SUBJECT_BOX_SD = 1.2        # box half-width, in weighted standard deviations
 SUBJECT_DIFFUSE_MAX = 0.30
 
 
+FACE_SCORE_MIN = 0.6      # YuNet confidence floor
+FACE_MIN_WIDTH = 0.04     # ignore faces narrower than this fraction of the frame
+FACE_GROUP_RATIO = 0.25   # keep faces at least this fraction of the largest one's area
+
+
+@lru_cache(maxsize=1)
+def _face_detector():
+    path = _cached("face_detection_yunet_2023mar.onnx", FACE_MODEL_URL)
+    # Input size is set per-frame in _detect_faces; (320, 320) is just a
+    # placeholder so the net can be constructed once and reused.
+    return cv2.FaceDetectorYN.create(path, "", (320, 320), FACE_SCORE_MIN, 0.3, 5000)
+
+
+def _detect_faces(bgr: np.ndarray) -> list[np.ndarray]:
+    """Raw YuNet rows, largest face first. Empty when there are none --
+    the common case for a room, a table, a view, so this must stay a cheap
+    early-out rather than something callers depend on.
+
+    Each row is 15 floats: x, y, w, h, then five landmarks as (x, y) pairs
+    in this order -- right eye, left eye, nose tip, right mouth corner,
+    left mouth corner -- then the confidence score. "Right" is the
+    subject's right, which appears on the *left* of the image."""
+    h, w = bgr.shape[:2]
+    det = _face_detector()
+    det.setInputSize((w, h))
+    ok, faces = det.detect(bgr)
+    if not ok or faces is None or len(faces) == 0:
+        return []
+    rows = [f for f in faces if float(f[2]) / w >= FACE_MIN_WIDTH]
+    rows.sort(key=lambda f: float(f[2]) * float(f[3]), reverse=True)
+    return rows
+
+
+def _box_of(f: np.ndarray, w: int, h: int) -> tuple[float, float, float, float]:
+    fx, fy, fw, fh = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+    return (max(0.0, fx), max(0.0, fy), min(float(w), fx + fw), min(float(h), fy + fh))
+
+
+# Head tilt beyond this is worth mentioning. Validated by rotating a real
+# face through known angles: reported roll tracks the rotation to within
+# ~0.3-1.5 degrees out to +/-10, degrading to ~5 degrees at +/-20 as
+# landmark localisation gets harder on a rotated face. Comfortably inside
+# what this threshold needs.
+LEVEL_ROLL_DEG = 7.0
+
+# Nose offset from the eye midpoint, as a fraction of interocular distance.
+# Deliberately loose: this is a coarse proxy for yaw, not a pose estimate,
+# and on the one real face available for checking, a roughly-frontal
+# portrait already measured 0.25 -- so a tighter bound flags people who are
+# looking straight at the camera. Reported as data, but not surfaced as an
+# instruction in the UI, because "turned away" has not been validated
+# across enough faces to be worth telling a guest.
+FRONTAL_YAW_MAX = 0.35
+
+
+FACE_MESH_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+BLINK_SCORE = 0.5   # blendshape midpoint; open eyes measure ~0.003
+SMILE_SCORE = 0.35  # deliberately below the midpoint -- a polite half-smile counts
+
+
+@lru_cache(maxsize=1)
+def _face_landmarker():
+    """MediaPipe FaceLandmarker (Tasks API). Note mediapipe 1.0 dropped the
+    legacy `mp.solutions.face_mesh` entry point entirely, so this is the
+    only route -- and it needs the .task bundle fetched separately."""
+    import mediapipe as mp
+    from mediapipe.tasks.python import vision, BaseOptions
+    path = _cached("face_landmarker.task", FACE_MESH_URL)
+    opts = vision.FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=path),
+        output_face_blendshapes=True,
+        num_faces=1,          # only the dominant face is ever reported on
+    )
+    return mp.Image, mp.ImageFormat, vision.FaceLandmarker.create_from_options(opts)
+
+
+def face_expression(bgr: np.ndarray) -> dict | None:
+    """Eyes-open and smiling for the dominant face, or None if the mesh
+    finds nothing.
+
+    This is what YuNet's five landmarks could not answer. Those give one
+    point per eye -- its *centre* -- which sits in the same place whether
+    the eye is open or shut, so an eye-aspect-ratio measure is simply not
+    computable from them. The face mesh has the eyelid contour, and better
+    still it emits blendshapes: `eyeBlink*` and `mouthSmile*` are trained
+    outputs with a natural 0..1 range, so the thresholds here are a
+    model's own calibration rather than numbers hand-fitted to one photo.
+
+    Only runs when YuNet has already found a face, so the common no-face
+    frame (a room, a table, a view) never pays for it.
+    """
+    Image, ImageFormat, landmarker = _face_landmarker()
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    res = landmarker.detect(Image(image_format=ImageFormat.SRGB, data=rgb))
+    if not res.face_landmarks or not res.face_blendshapes:
+        return None
+
+    bs = {b.category_name: float(b.score) for b in res.face_blendshapes[0]}
+    blink_l = bs.get("eyeBlinkLeft", 0.0)
+    blink_r = bs.get("eyeBlinkRight", 0.0)
+    smile = max(bs.get("mouthSmileLeft", 0.0), bs.get("mouthSmileRight", 0.0))
+
+    # "Both eyes open" is the useful question -- one eye shut is a wink or a
+    # detection wobble, and telling a guest to reshoot for it would be noise.
+    eyes_open = blink_l < BLINK_SCORE and blink_r < BLINK_SCORE
+    return {
+        "eyes_open": eyes_open,
+        "blink_left": round(blink_l, 3),
+        "blink_right": round(blink_r, 3),
+        "smiling": smile >= SMILE_SCORE,
+        "smile_score": round(smile, 3),
+    }
+
+
+def face_pose(f: np.ndarray) -> dict:
+    """Head roll and yaw from the five landmarks.
+
+    What is NOT here, deliberately: eyes-open/closed. That needs the
+    eyelid contour (the standard eye-aspect-ratio measure wants ~6 points
+    per eye); YuNet gives one point per eye -- its *centre* -- which is in
+    exactly the same place whether the eye is open or shut. Any "blink
+    detector" built on these five points would be inventing a signal that
+    isn't in the data, which is worse than not offering the feature.
+
+    Roll and yaw genuinely are in the data:
+      - roll  = the angle of the line between the two eye centres.
+      - yaw   = how far the nose sits from the midpoint between the eyes,
+                normalised by the distance between them so it doesn't
+                change with how close the subject is to the camera.
+    """
+    rx, ry = float(f[4]), float(f[5])    # subject's right eye
+    lx, ly = float(f[6]), float(f[7])    # subject's left eye
+    nx, ny = float(f[8]), float(f[9])    # nose tip
+
+    roll = float(np.degrees(np.arctan2(ly - ry, lx - rx)))
+    # Normalise to (-90, 90]: a face is never meaningfully "upside down"
+    # here, and 179 degrees should read as -1, not as a huge tilt.
+    if roll > 90:
+        roll -= 180
+    elif roll <= -90:
+        roll += 180
+
+    interocular = float(np.hypot(lx - rx, ly - ry)) or 1.0
+    mid_x, mid_y = (rx + lx) / 2.0, (ry + ly) / 2.0
+    # Project the nose offset onto the eye-line direction, so a tilted head
+    # doesn't read as a turned one.
+    ux, uy = (lx - rx) / interocular, (ly - ry) / interocular
+    yaw = ((nx - mid_x) * ux + (ny - mid_y) * uy) / interocular
+
+    return {
+        "roll_deg": round(roll, 1),
+        "level": abs(roll) <= LEVEL_ROLL_DEG,
+        "yaw_ratio": round(float(yaw), 3),
+        "facing_camera": abs(yaw) <= FRONTAL_YAW_MAX,
+        "turned": "none" if abs(yaw) <= FRONTAL_YAW_MAX else ("left" if yaw > 0 else "right"),
+    }
+
+
+def _face_subject(bgr: np.ndarray) -> tuple[float, float, tuple[float, float, float, float], bool] | None:
+    """The union of the foreground faces, or None if there are none.
+
+    Why the union rather than the biggest face: at an event the subject is
+    usually a group, and composing on one person's face while cropping
+    their friend out of frame is worse than not helping at all. Faces
+    smaller than FACE_GROUP_RATIO of the largest are excluded so someone
+    twenty feet behind the group doesn't stretch the box to include them.
+    """
+    h, w = bgr.shape[:2]
+    rows = _detect_faces(bgr)
+    if not rows:
+        return None
+    boxes = [_box_of(f, w, h) for f in rows]
+    biggest = (boxes[0][2] - boxes[0][0]) * (boxes[0][3] - boxes[0][1])
+    keep = [b for b in boxes if (b[2] - b[0]) * (b[3] - b[1]) >= biggest * FACE_GROUP_RATIO]
+    x0 = min(b[0] for b in keep)
+    y0 = min(b[1] for b in keep)
+    x1 = max(b[2] for b in keep)
+    y1 = max(b[3] for b in keep)
+    return (x0 + x1) / 2, (y0 + y1) / 2, (x0, y0, x1, y1), True
+
+
+def find_subject(bgr: np.ndarray) -> tuple[float, float, tuple[float, float, float, float], bool, str]:
+    """(centroid_x, centroid_y, bbox, found, source) -- faces first, saliency
+    second.
+
+    Saliency answers "what is visually unusual here", which is genuinely not
+    the same question as "what is this photo of". Measured on a real phone,
+    it boxed RGB-lit headphones correctly and would just as happily box a
+    bright light fixture standing next to the guest you meant to shoot. At
+    an event the subject is a person the overwhelming majority of the time,
+    so when a face is actually present it is a far better answer than the
+    most salient blob -- and when there isn't one, saliency is still the
+    right fallback for a room, a table or a view.
+
+    `source` is returned so callers can be honest about which ran; the two
+    are not equally trustworthy and the reframe sizes them differently."""
+    face = _face_subject(bgr)
+    if face is not None:
+        cx, cy, bbox, found = face
+        return cx, cy, bbox, found, "face"
+    cx, cy, bbox, found = _saliency_subject(bgr)
+    return cx, cy, bbox, found, "saliency"
+
+
 def _saliency_subject(bgr: np.ndarray) -> tuple[float, float, tuple[float, float, float, float], bool]:
     """One saliency pass -> (centroid_x, centroid_y, bbox, found).
 
@@ -371,8 +585,8 @@ def compute_ar_guide(img: Image.Image, subject: tuple | None = None) -> dict:
     of paying for a second saliency pass."""
     if subject is None:
         bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-        subject = _saliency_subject(bgr)
-    cx, cy, _bbox, found = subject
+        subject = find_subject(bgr)
+    cx, cy, _bbox, found, source = subject
     w, h = img.size
 
     tx = min((w / 3, 2 * w / 3), key=lambda t: abs(t - cx))
@@ -395,13 +609,15 @@ def compute_ar_guide(img: Image.Image, subject: tuple | None = None) -> dict:
         "pan_camera_y": _OPPOSITE[move_y],
         "strength": _strength(max(abs(dx), abs(dy))),
         "subject_found": found,
+        "subject_source": source,
         "well_composed": well_composed,
     }
 
 
 # ---- reframe: a crop rectangle + how much tighter it is ----
 
-SUBJECT_SHARE = 0.38   # subject's long edge should fill this much of the crop
+SUBJECT_SHARE = 0.38       # subject's long edge should fill this much of the crop
+FACE_SUBJECT_SHARE = 0.20  # a face box is just the head -- leave room for shoulders
 MAX_ZOOM = 4.0         # never recommend a crop tighter than this
 MIN_USEFUL_ZOOM = 1.15  # below this the crop isn't worth telling anyone about
 
@@ -427,16 +643,20 @@ def compute_reframe(img: Image.Image, aspect: float | None = None,
     w, h = img.size
     if subject is None:
         bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-        subject = _saliency_subject(bgr)
-    cx, cy, (sx0, sy0, sx1, sy1), found = subject
+        subject = find_subject(bgr)
+    cx, cy, (sx0, sy0, sx1, sy1), found, source = subject
     aspect = aspect or (w / h)
+    # A face box is the head alone, so filling SUBJECT_SHARE of the crop with
+    # it would frame a portrait as a tight head shot. Faces get a smaller
+    # target share, which leaves the shoulders and some air in frame.
+    share = FACE_SUBJECT_SHARE if source == "face" else SUBJECT_SHARE
 
     # Largest crop of this aspect that still fits inside the frame.
     max_w = min(float(w), h * aspect)
     max_h = max_w / aspect
 
     sw, sh = max(sx1 - sx0, 1.0), max(sy1 - sy0, 1.0)
-    crop_w = max(sw / SUBJECT_SHARE, (sh / SUBJECT_SHARE) * aspect)
+    crop_w = max(sw / share, (sh / share) * aspect)
     crop_w = min(crop_w, max_w)                 # never larger than fits
     crop_w = max(crop_w, max_w / MAX_ZOOM)      # never tighter than MAX_ZOOM
     crop_h = crop_w / aspect
@@ -462,6 +682,7 @@ def compute_reframe(img: Image.Image, aspect: float | None = None,
         "zoom": round(float(zoom), 2),
         "worth_it": bool(found and zoom >= MIN_USEFUL_ZOOM),
         "subject_found": found,
+        "subject_source": source,
     }
 
 
@@ -622,7 +843,7 @@ def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
     img = Image.open(io.BytesIO(image_bytes))
     img.load()
     bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-    subject = _saliency_subject(bgr)
+    subject = find_subject(bgr)
 
     ar_guide = compute_ar_guide(img, subject=subject)
     reframe = compute_reframe(img, aspect=aspect, subject=subject)
@@ -636,9 +857,27 @@ def preview(image_bytes: bytes, aspect: float | None = None) -> dict:
     margin = scores[ranked[0]] - scores[ranked[1]]
     confident = margin >= CONFIDENT_MARGIN
 
+    # Pose of the dominant face, when there is one. Reported only for the
+    # largest face: in a group shot, "someone is turned away" is almost
+    # always true and telling the guest so on every frame is noise.
+    faces = _detect_faces(bgr) if ar_guide["subject_source"] == "face" else []
+    face_block = None
+    if faces:
+        face_block = face_pose(faces[0])
+        try:
+            expr = face_expression(bgr)
+        except Exception:
+            # The mesh is an enhancement, not load-bearing: if its model is
+            # missing or it throws on an odd frame, the pose half and every
+            # other part of the preview must still come back.
+            expr = None
+        if expr:
+            face_block.update(expr)
+
     return {
         "ar_guide": ar_guide,
         "reframe": reframe,
+        "face": face_block,
         "scene": scene,
         "suggested_filter": best,
         "confident": confident,
@@ -661,4 +900,6 @@ def warmup():
     _text_session()
     _tokenizer()
     _aesthetic_head()
+    _face_detector()
+    _face_landmarker()
     _film_stock_text_embeddings()

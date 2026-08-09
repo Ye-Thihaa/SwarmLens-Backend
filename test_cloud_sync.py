@@ -27,6 +27,8 @@ import time
 import os
 import httpx
 
+from testutil import ensure_safe_to_run
+
 NODES = [
     ("node1", 8001, "http://127.0.0.1:8002,http://127.0.0.1:8003"),
     ("node2", 8002, "http://127.0.0.1:8001,http://127.0.0.1:8003"),
@@ -165,6 +167,7 @@ def trigger_leader(leader_id, leader_port, max_attempts=8):
 
 
 def main():
+    ensure_safe_to_run()
     # reserve a free port for the fake cloud but don't start it yet --
     # that's "disconnected from the internet"
     probe = http.server.HTTPServer(("127.0.0.1", 0), FakeCloudHandler)

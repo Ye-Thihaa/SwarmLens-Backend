@@ -192,6 +192,10 @@ export type ArGuide = {
   pan_camera_y: "up" | "down" | "centered";
   strength: "none" | "slight" | "moderate" | "large";
   subject_found: boolean;
+  /** Which detector actually answered. "face" is YuNet and is far more
+   * trustworthy about *what the photo is of*; "saliency" only knows what
+   * is visually unusual, so it can box a bright lamp beside the guest. */
+  subject_source: "face" | "saliency";
   well_composed: boolean;
 };
 
@@ -207,9 +211,27 @@ export type Reframe = {
   subject_found: boolean;
 };
 
+/** Dominant face only, null when there isn't one. eyes_open/smiling come
+ * from MediaPipe blendshapes (trained 0..1 outputs); roll/yaw come from
+ * YuNet's landmarks. `turned` is returned but deliberately not surfaced --
+ * it hasn't been validated across enough faces to tell a guest. */
+export type FaceState = {
+  roll_deg: number;
+  level: boolean;
+  yaw_ratio: number;
+  facing_camera: boolean;
+  turned: "none" | "left" | "right";
+  eyes_open?: boolean;
+  blink_left?: number;
+  blink_right?: number;
+  smiling?: boolean;
+  smile_score?: number;
+};
+
 export type ComposePreview = {
   ar_guide: ArGuide;
   reframe: Reframe;
+  face: FaceState | null;
   scene: {
     colors: string[];
     saturation: "low" | "medium" | "high";

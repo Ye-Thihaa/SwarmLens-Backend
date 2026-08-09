@@ -24,3 +24,11 @@ numpy==2.5.1
 pillow==12.3.0
 onnxruntime==1.28.0
 tokenizers==0.23.1
+
+# Face mesh for eyes-open / smiling (ai_engine.face_expression). Its
+# blendshapes are trained outputs, so the thresholds are the model's own
+# calibration rather than numbers fitted to one photo -- which is what
+# YuNet's 5 landmarks could never support (one point per eye, its centre,
+# identical whether the eye is open or shut). The 1.0.0 wheel is
+# py3-none-win_amd64, so it installs on 3.14 unlike many native wheels.
+mediapipe>=1.0.0

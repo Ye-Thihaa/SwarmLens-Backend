@@ -74,7 +74,13 @@ list and manual demo commands: [README.md](README.md).
   `R` over `N/2` is always fresh, `R=1` can land on a stale/partitioned
   node.
 - `ai_engine.py` — pretrained-only photo analysis (no training anywhere):
-  saliency subject detection, a rule-of-thirds AR reframe guide, CLIP
+  **face-first** subject detection (`find_subject`: YuNet face detector,
+  falling back to saliency when no face is present — saliency answers
+  "what is visually unusual", which is not the same question as "what is
+  this a photo of", and at an event it will box a bright lamp beside the
+  guest; the response carries `subject_source` so callers can be honest
+  about which ran, and `compute_reframe` sizes a face box with
+  `FACE_SUBJECT_SHARE` so a portrait isn't cropped to a head shot), a rule-of-thirds AR reframe guide, CLIP
   film-stock suggestion, and a CLIP-embedding aesthetic score. Two entry
   points that differ in *persistence, not computation*: `analyze()` is the
   post-capture path whose `aesthetic_score` is written to the event log,
@@ -96,6 +102,20 @@ list and manual demo commands: [README.md](README.md).
   stall this node's asyncio loop, and gossip/raft both depend on that
   loop staying responsive). Models are downloaded on first use into
   `./models/` (gitignored, ~154MB) and cached after that:
+  - faces: YuNet (`face_detection_yunet_2023mar.onnx`, ~230KB) from
+    OpenCV Zoo. Must be fetched from `media.githubusercontent.com`, not
+    `raw.` — the zoo keeps weights in Git LFS and the raw host returns a
+    131-byte LFS *pointer* that loads as a corrupt model.
+  - eyes-open / smiling: MediaPipe FaceLandmarker (`face_landmarker.task`,
+    ~3.7MB). Runs only when YuNet already found a face, adding ~10ms;
+    a no-face frame never pays for it. Uses the *blendshapes*
+    (`eyeBlinkLeft/Right`, `mouthSmile*`) rather than a hand-rolled
+    eye-aspect ratio — they're trained 0..1 outputs, so the thresholds
+    are the model's own calibration. This is the capability YuNet's five
+    landmarks fundamentally could not provide: one point per eye, its
+    *centre*, which sits in the same place open or shut. Note mediapipe
+    1.0 removed `mp.solutions.face_mesh`, so the Tasks API is the only
+    route.
   - saliency: `cv2.saliency.StaticSaliencySpectralResidual` — ships in
     `opencv-contrib-python`, no download, classical CV.
   - filter suggestion + aesthetic embedding: CLIP ViT-B/32, int8-quantized
@@ -239,7 +259,10 @@ above need the matching `OPERATOR_TOKEN` env var set too (optional —
 `/chaos/*` fails open without it). A `.claude/launch.json` entry
 (`swarmlens-client-2`) is set up for `preview_start`.
 
-Tests:
+Tests (all the cluster-spinning ones call `testutil.ensure_safe_to_run()`
+first, which refuses to start if ports 8001-8003 are busy or `node*.db`
+already exists — they delete those files on the way out, and they are the
+same paths the demo cluster uses):
 - `python test_raft.py` — spins up 3 nodes itself, confirms leader
   election, `kill -9`s the leader, confirms re-election + exactly-once
   recap. Self-contained, cleans up its own processes and `.db` files.
@@ -260,6 +283,14 @@ Tests:
   count matches on all three nodes' own `.db` files after a gossip
   round. First run downloads ~154MB of models into `./models/`
   (gitignored) — cached after that, budget extra time for a cold run.
+- `python test_ai_preview.py` — spins up one node and exercises `POST
+  /analyze/preview`: subjects at six known positions must produce the
+  direction computed independently from the truth (including 0.28 and
+  0.72, the modestly-off-centre cases a centre-biased detector flips),
+  `move_subject_*` and `pan_camera_*` must stay exact opposites, the
+  endpoint must persist **no** events, and the input guards must return
+  413/400. Written after both of this endpoint's real bugs reached a
+  phone.
 - `python test_vclock.py` — spins up 3 nodes, simulates a couple of
   guest "devices" attaching `{device_id: counter}` clocks directly to
   `POST /photos` (no real guest client exists to generate these yet),

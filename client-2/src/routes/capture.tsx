@@ -881,7 +881,7 @@ function Capture() {
                       style={pct(ai.reframe.subject_box)}
                     >
                       <span className="absolute -top-4 left-0 rounded-sm bg-emulsion/85 px-1 font-mono text-[0.5rem] tracking-[0.16em] text-drifting">
-                        SUBJECT
+                        {ai.ar_guide.subject_source === "face" ? "FACE" : "SUBJECT"}
                       </span>
                     </div>
                   )}
@@ -1068,6 +1068,25 @@ function Capture() {
                 <span className="rounded-sm bg-emulsion/80 px-1.5 py-0.5 font-mono text-[0.5rem] tracking-[0.14em] text-fixer-dim">
                   LOOKS {ai.aesthetic_score.toFixed(1)}/10
                   {!ai.confident && " · NO STRONG STOCK"}
+                </span>
+              )}
+
+              {/* Eyes and tilt. eyes_open comes from MediaPipe's trained
+                  eyeBlink blendshape, not a hand-fitted eye-aspect ratio --
+                  open eyes measure ~0.003 against a 0.5 threshold, so this
+                  fires on a real blink rather than on a squint. Both eyes
+                  must be shut: one is a wink or a detection wobble, and
+                  asking for a reshoot over that is noise. Lives in the top
+                  banner stack, not pinned inside the viewfinder, so it can't
+                  end up underneath the film strip the way the arrows did. */}
+              {ai?.face?.eyes_open === false && (
+                <span className="rounded-sm bg-safelight px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-emulsion">
+                  EYES CLOSED · SHOOT AGAIN
+                </span>
+              )}
+              {ai?.face && ai.face.eyes_open !== false && !ai.face.level && (
+                <span className="rounded-sm bg-emulsion/85 px-2 py-0.5 font-mono text-[0.55rem] tracking-[0.16em] text-drifting">
+                  HEAD TILTED {Math.abs(Math.round(ai.face.roll_deg))}°
                 </span>
               )}
             </div>

@@ -14,7 +14,8 @@ working notes and hard-won gotchas in [CLAUDE.md](CLAUDE.md).
 |---|---|
 | Phases 0–8 (the whole planned backend) | Done, tested |
 | AI analysis engine (`ai_engine.py`) | Done, tested |
-| Live AI compose guidance (pre-shutter) | Done, verified on a real phone |
+| Live AI compose guidance (pre-shutter) | Merged (PRs #1–#3), verified on a real phone |
+| Auto-zoom + exposure controls | Merged (PRs #4–#5), driven by phone testing |
 | Guest client `client/` (reference PWA) | Done |
 | Branded guest app + operator console `client-2/` | Done, wired to the real cluster |
 | Load test + measured numbers | Done |
@@ -109,15 +110,25 @@ means *the phone*. All three are handled in `client-2/vite.config.ts`.
 
 ## Verified on real hardware
 
-Live on an iOS phone against the real 3-node cluster: correct arrows on
-real scenes (a subject just right of the thirds line → PAN RIGHT; a
-low-left subject → PAN LEFT + TILT DOWN), apt film-stock calls (RGB
-lighting in a dim room → Cinestill 800T, *"lets the lights bloom the way
-tungsten night film does"*; a grey desk → Tri-X 400), and captures from
-the phone replicating to all three nodes (109 → 127 events, new guest
-visible cluster-wide).
+**On an iOS phone**, over the LAN against the real 3-node cluster —
+confirmed from a screen recording of the session:
 
-Also confirmed: with all three nodes killed the overlay clears to
+- the camera works (secure context via the dev cert; Safari still labels
+  a self-signed cert "Not Secure", which is expected and harmless)
+- a `SUBJECT` box lands on the real subject — RGB-lit headphones on a desk
+- the composition arrow is **visible**, reading "↑ TILT UP slightly" —
+  this is the fix for the arrows previously hidden behind the film strip
+- the film-stock call is apt: Cinestill 800T for RGB/tungsten-ish lighting
+  in a dim room, with the reason *"800T lets the lights bloom the way
+  tungsten night film does"*
+- the `AI PICK` badge appears on that stock and the strip auto-loads it
+
+Not yet exercised on the phone: the front camera, and left/right `PAN`
+guidance specifically (the recorded run produced a vertical nudge). The
+horizontal path is verified in the browser and by unit-level measurement,
+not on a handset.
+
+In the browser, with all three nodes killed, the overlay clears to
 "GUIDANCE OFFLINE · SHUTTER UNAFFECTED" rather than showing stale boxes,
 the shutter still queues to the outbox, and guidance resumes unprompted
 when the cluster returns.
@@ -147,17 +158,62 @@ changed how the system is built:
    line, so the arrow pointed the wrong way. Fixed with a
    saliency-weighted centroid over the top few percent of mass; error
    against known positions is now ≤1px per axis.
-7. **Two overlay elements rendered underneath the camera's own chrome** —
-   the arrows behind the film strip, later the reason banner behind the
-   exposure readout. Both "passed" checks that read the DOM, which cannot
-   see occlusion. The rule now: only things that must align with frame
-   coordinates live inside the viewfinder; text pinned to its edges lands
-   under chrome positioned against the screen.
+7. **The composition arrows rendered underneath the film strip on a
+   phone.** At 375×812 a badge anchored to the viewfinder's bottom landed
+   at y 548–598; the film strip, positioned against the *screen*, spans
+   528–600. Same band, and the strip paints later. The check "passed"
+   because it read the DOM with `get_page_text`, which cannot see
+   occlusion — the text was present, the pixels were not. Fixed by moving
+   the guidance to the viewfinder's centre.
 
 Items 6 and 7 share a lesson worth stating plainly: a test that exercises
-only the easy case will pass while the feature is broken. The inverted
-arrow survived a browser check because that test's subject sat far enough
-off-centre to escape the bias.
+only the easy case, or that measures the wrong layer, will pass while the
+feature is broken. The inverted arrow survived a browser check because
+that test's subject sat far enough off-centre to escape the bias; the
+invisible arrow survived because the assertion read the DOM rather than
+the screen.
+
+## What real-device testing changed (post-merge)
+
+The AI compose work merged in PRs #1–#3. Testing it on an actual phone
+then drove four more commits, and the pattern in them is worth keeping:
+**three of the four "bugs" were things that worked but couldn't be seen
+working.**
+
+- The reason banner collided with the exposure readout and zone picker at
+  phone width — the same class of bug as the hidden arrows. Moved to
+  `top-[10rem]`, clear of both.
+- An **aesthetic-fallback crop** (recommending a framing when no subject
+  was found) and a **4s guidance cooldown** were both added, then reverted
+  after real use: the fallback gave worse recommendations than silence on
+  scenes with people, and the cooldown made live guidance feel broken
+  rather than considerate. `preview()` and `compute_reframe()` were
+  restored byte-for-byte, verified against identical output on a test
+  image.
+- **Auto-zoom** replaced them: the viewfinder now zooms itself into the
+  recommended crop every tick, evaluating the full frame fresh each time
+  so a subject moving closer loosens the crop as readily as a distant one
+  tightens it.
+- Its first stability gate required two consecutive near-identical reads
+  before applying *any* zoom — a bar real hardware never clears
+  (autofocus hunting, exposure settling, JPEG noise), so it never fired at
+  all. Split into "engage immediately, debounce only changes/releases"
+  with a much looser tolerance.
+- *"The resolution sucks"* was not resolution: `SHUTTER` defaulted to a
+  simulated 1/60 blur, so the camera opened permanently soft.
+  `getUserMedia` also requested no resolution constraints, letting
+  browsers silently pick 640×480.
+- *"Ratio isn't working"* and *"the settings panel is confusing"* were one
+  bug: the panel was nearly opaque and sat over the viewfinder, so
+  changing ratio or stock while it was open showed no feedback. The
+  controls worked; the panel hid the proof.
+
+## Open issues
+
+- The arrow's caption can overlap the subject box when the two land close
+  together.
+- Front camera and horizontal `PAN` guidance still unverified on a
+  handset.
 
 ## Known simplifications
 
