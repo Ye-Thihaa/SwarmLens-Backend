@@ -24,7 +24,8 @@ the consistent-hashing ring matches how peers already refer to it.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/events` | register or edit a hosted event (slug, name, venue, zones) — gated by `OPERATOR_TOKEN` |
-| GET  | `/events` | operator's directory of every hosted event, join tokens included — gated |
+| GET  | `/events?status=&limit=&offset=` | operator's directory, paginated, newest first, with a derived `active`/`ended` status. No join tokens — gated |
+| GET  | `/events/{slug}/token` | one event's join token, for printing its QR — gated |
 | GET  | `/events/{slug}?k=` | resolve a scanned QR: slug + join token → `{event_id, name, venue, zones, ...}` (no token echoed back) |
 | POST | `/photos` | upload (guest_id, zone, composition_score, optional event_id, optional vclock) |
 | GET  | `/photos?event_id=` | gallery as this node currently sees it, scoped to one hosted event when given; each photo carries `vclock` + `concurrent_with` |
@@ -44,9 +45,14 @@ the consistent-hashing ring matches how peers already refer to it.
 | POST | `/raft/request_vote` | peer-to-peer: cast a vote for a candidate |
 | POST | `/raft/heartbeat` | peer-to-peer: leader keepalive |
 | GET  | `/raft/status` | this node's Raft role, term, current leader |
-| POST | `/recap/trigger` | fire the one-time recap; no-ops unless this node is leader |
+| POST | `/recap/trigger?event_id=` | end an event: freeze its top-`RECAP_TOP_N` most-liked photos into a one-time `recap_sent` event. No-ops unless this node is leader, or if that event's recap already fired — gated by `OPERATOR_TOKEN` |
+| GET  | `/recap?event_id=` | that frozen snapshot, for the guest slideshow; `{ready: false, photos: []}` until it's been triggered |
 | POST | `/cloud_sync/trigger` | force a cloud archive sync tick now; no-ops unless leader + SUPABASE_URL configured |
 | GET  | `/cloud_sync/status` | enabled/role/last sync count/last error |
+| GET  | `/blobs/digest` | peer-to-peer: which photo blobs this node holds (hashes only) |
+| GET  | `/blobs/{hash}` | peer-to-peer: one blob's raw bytes. 404 = "not here", a routine answer mid-replication |
+| POST | `/blob_archive/trigger` | upload recap-pinned blobs to Supabase Storage now; no-ops unless leader + configured — gated by `OPERATOR_TOKEN`, since it spends money |
+| GET  | `/blob_archive/status` | archive enabled/role/uploaded/last error, plus local blob counts |
 | GET  | `/dashboard` | static chaos + metrics dashboard (dashboard.html), served identically by every node |
 
 ## Verified demo
@@ -185,6 +191,140 @@ in `/photos`, `/zones`, `/zones/quorum` (at R=1/2/3), and the per-guest
 public-gallery cap (which is per guest *per event* — the same phone at
 two events is two separate guests, see `client-2/src/lib/guest.ts`) —
 plus a legacy no-`event_id` photo staying reachable throughout.
+
+## End-of-event recap (the frozen slideshow)
+
+When an event finishes, the host ends it and the cluster freezes that
+event's `RECAP_TOP_N` (default 10) most-liked photos into a single
+`recap_sent` event. Guests replay it as a slideshow at `client-2`'s
+`/recap` route, anytime afterward:
+
+    # end the event -- broadcast to all three, only the leader acts
+    for p in 8001 8002 8003; do
+      curl -X POST "localhost:$p/recap/trigger?event_id=ev_xxxx" \
+        -H "X-Operator-Token: $OPERATOR_TOKEN"
+    done
+    # -> {"triggered":true,"by":"node2","event_id":"ev_xxxx"}  (leader)
+    # -> {"triggered":false,...}                               (followers)
+
+    curl 'localhost:8003/recap?event_id=ev_xxxx'
+    # -> {"ready":true,"photos":[{"photo_id":"ph_...","guest_id":"...",
+    #                             "zone":"ceremony","likes":7}, ...]}
+
+The snapshot is **frozen at trigger time, not recomputed on read**. That
+is the whole point rather than an optimization: a like arriving after the
+host called it a wrap must not quietly reshuffle what "most memorable"
+meant at that moment, and a guest opening the slideshow a week later
+should see the same reel everyone else did. The ranking is
+`(-likes, photo_id)`, deterministic even in the unlikely case two nodes
+ever computed it independently.
+
+Exactly-once works the same way the original recap did — only the Raft
+leader appends, and idempotence is re-checked against the *replicated
+log* (`store.recap_for`), not local memory, so it survives a leader
+crash and re-election. It's per event now: ending the wedding doesn't
+touch the donation ceremony booked the same weekend. `POST
+/recap/trigger` is gated by `OPERATOR_TOKEN` (ending an event is an
+operator decision); `GET /recap` deliberately is not — a guest coming
+back to relive the night is exactly who it's for.
+
+Deletion, however, outranks the freeze. A guest can retract one of their
+own photos after the event, and a withdrawn photo has to leave the reel
+even though the snapshot named it — "the recap froze it first" is not an
+answer to someone withdrawing consent. So the snapshot also freezes
+`RECAP_SPARES` extra photos beyond the visible `RECAP_TOP_N`: a deleted
+photo is dropped and the next-ranked spare backfills, and the reel stays
+full length instead of developing a hole. `GET /recap` reports
+`backfilled` and `exhausted` rather than quietly serving a short reel.
+
+Each frozen photo also records its `blob_hash`, and that is what **pins**
+those bytes: pinned blobs replicate first, are never evicted by
+retention, and are the ones uploaded to object storage (below). A recap
+is meant to outlive its event, and pinning is what makes that true of the
+pixels rather than just the metadata.
+
+`python test_recap.py` proves the freeze is real: it triggers, then piles
+enough new likes onto the lowest-ranked photo to make it the most-liked
+overall, and confirms `GET /recap` is unchanged — then deletes a frozen
+photo and confirms it leaves the reel, a spare backfills in rank order,
+and its bytes stop serving.
+
+## Photo storage at production scale
+
+Photo **bytes** do not live in the event log. They used to — inline
+base64 on the photo event — and that broke three things once an event
+meant thousands of frames rather than a demo's fifty. All measured, not
+predicted:
+
+| 500 photos @ 150KB | bytes inline | blob split |
+|---|---|---|
+| event log size, per node | 95.7 MB | **0.2 MB** |
+| `GET /photos` | 221 ms | **4 ms** |
+
+- **`GET /photos` was blocking the asyncio loop.** It read every photo's
+  bytes off disk and discarded 99.9% of them in Python — and that's
+  synchronous work on the same single event loop raft's 50ms heartbeat
+  and gossip both run on. At 3,000 photos it's seconds per call, polled
+  every 4s by every guest, which is enough to vote out a leader that
+  never lost contact.
+- **Gossip could not converge.** A 500-row batch of 203KB events is a
+  ~100MB JSON body against a 3-second timeout, so a node that fell behind
+  could never catch up.
+- **`cloud_sync` was pushing 200KB blobs into Postgres `jsonb`**, which
+  is the wrong storage class for an image by a wide margin.
+
+So bytes moved to a content-addressed `blobs` table (keyed by sha256, so
+a retry or a second device uploading an identical frame stores once), and
+replicate on their own byte-budgeted path (`blob_sync.py`) instead of
+inside a gossip round that had to finish in one timeout. Durability is
+unchanged — every node still ends up with every blob, surviving two node
+losses — only *how the bytes get there* changed. `GET /photos/{id}/image`
+reads through to a peer when this node has the metadata but not yet the
+pixels, so a guest never sees a broken image mid-replication.
+
+Photos written before the split still work, indefinitely: real databases
+have them and rewriting history to migrate is a worse trade than one
+branch in `store.photo_image()`.
+
+### Archiving to Supabase Storage
+
+Three nodes surviving node loss is not the same as a recap surviving the
+*fleet* — these are processes on hardware that gets reimaged and laptops
+that go back in cupboards, and a wedding recap is expected to still play
+a year later. `blob_archive.py` uploads recap-pinned blobs to a Supabase
+Storage bucket, leader-gated and disabled entirely unless configured:
+
+    SUPABASE_URL=https://xxxx.supabase.co SUPABASE_KEY=... SUPABASE_BUCKET=recap-photos
+
+    curl -X POST localhost:8001/blob_archive/trigger
+    # -> {"uploaded": 10, "enabled": true, "role": "leader", ...}
+
+The object key **is** the blob's content hash, which is what makes a
+re-upload after a leadership change idempotent — the same "let the
+destination be the dedup authority" reasoning as `cloud_sync`'s
+`UNIQUE(origin, seq)`. Only pinned (recap) blobs are uploaded, not every
+frame every guest shot: archiving the whole roll is a cost decision
+nobody has made, and doing it by default would quietly turn a demo
+cluster into a storage bill.
+
+The archive is **readable**, not write-only: `GET /photos/{id}/image`
+falls back local → peer → archive, re-caching what it pulls back. That
+last hop is the case the archive exists for — a recap replayed after the
+cluster that produced it is gone or has lost the blob.
+
+Photos predating the split have their bytes inline and no hash, so they
+could never be pinned or archived. When a recap freezes one,
+`store.ensure_blob_for_photo` materialises a blob and records the hash on
+the **recap** event — the photo event is never rewritten, because it has
+already been gossiped under its `(origin, seq)` and two nodes disagreeing
+about one event's content is the one thing the merge model can't
+survive.
+
+`python test_blobs.py` proves the split holds: the photo event is a few
+hundred bytes of metadata with no `image_base64` in *any* node's log, the
+bytes still reach all three nodes, a node lacking a blob reads through
+instead of 404ing, identical bytes dedup, and legacy inline photos still
+serve.
 
 ## AI analysis engine
 

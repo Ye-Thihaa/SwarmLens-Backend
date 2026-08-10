@@ -4,3 +4,9 @@ __pycache__/
 data/
 models/
 load_test_results/
+
+# Third-party agent skills installed via `npx skills add` -- tooling for
+# whoever is driving the agent, not part of the project. Re-add with:
+#   npx skills add https://github.com/mattpocock/skills
+.claude/skills/
+skills-lock.json

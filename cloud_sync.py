@@ -120,12 +120,23 @@ class CloudSync:
         return len(outgoing)
 
     async def _push(self, client: httpx.AsyncClient, events: list[dict]):
+        """image_base64 is stripped from any legacy photo event on the way
+        out. This table is a metadata archive -- Postgres jsonb is the
+        wrong storage class for a 200KB image, and every such row would be
+        TOASTed, slow to query, and duplicated against bytes that already
+        have a proper home in object storage (blob_archive.py). Photos
+        written since the blob split carry only a blob_hash and are
+        unaffected; this keeps the pre-split ones from poisoning the
+        archive with pixels."""
         rows = [
             {
                 "origin": e["origin"],
                 "seq": e["seq"],
                 "kind": e["kind"],
-                "payload": e["payload"],
+                "payload": (
+                    {k: v for k, v in e["payload"].items() if k != "image_base64"}
+                    if e["kind"] == "photo" else e["payload"]
+                ),
                 "created_at": e["created_at"],
                 "vclock": e.get("vclock") or {},
             }

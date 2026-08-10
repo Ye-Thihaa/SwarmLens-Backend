@@ -90,9 +90,82 @@ list and manual demo commands: [README.md](README.md).
   intersecting `public_state()` against `store.photos(photo["event_id"])`
   — a guest who shoots at three weddings gets 25 public frames at each,
   not 25 total.
+  **End-of-event recap** (`POST /recap/trigger`, `GET /recap`, both
+  `event_id`-scoped): what happens when an event *ends*. The operator
+  calls it over and `send_event_recap(event_id)` snapshots the
+  `RECAP_TOP_N` (default 10) most-liked photos **into the `recap_sent`
+  event's own payload** — a frozen list, not something `GET /recap`
+  recomputes live on every read. That's the whole design choice: a like
+  that lands after the host called it a wrap must not quietly reshuffle
+  what "most memorable" meant at that moment, and a guest opening the
+  slideshow a week later has to see the same reel as everyone else.
+  Ranking is `(-likes, photo_id)` so the snapshot is deterministic even
+  if two would-be leaders ever computed it independently. Exactly-once
+  is unchanged from the original recap (only the Raft leader acts,
+  idempotence re-checked against the *replicated log* via
+  `store.recap_for`, which replaced `store.event_exists` — that function
+  had no way to ask "for which event", and per-event recaps need one).
+  `/recap/trigger` is gated by `require_operator_token` (ending an event
+  is an operator decision); `GET /recap` is deliberately **not** — a
+  guest coming back to relive the night is exactly who it's for, and it
+  exposes nothing `GET /photos` didn't already.
+  The snapshot freezes `RECAP_TOP_N` **plus `RECAP_SPARES`** photos and
+  records each one's `blob_hash`. Both exist for production, not neatness:
+  the spares let `GET /recap` drop a photo the guest later deleted and
+  backfill from reserve, so a retraction costs the reel nothing instead of
+  leaving a broken tile — **deletion outranks the freeze**, because a
+  guest who retracts a photo has withdrawn consent and "the recap froze it
+  first" is not an answer to that. The `blob_hash` is what pins those
+  bytes (`store.pinned_hashes`), making them the ones `blob_sync`
+  replicates first and the only ones `blob_archive` uploads. `GET /recap`
+  reports `backfilled` and `exhausted` rather than silently serving a
+  short reel.
+  `GET /events` is paginated, newest first, carries a derived
+  `status` (active/ended, from whether that event's recap has fired), and
+  deliberately **omits `join_token`** — the console polls it every 5s, and
+  the unpaginated version shipped every event ever hosted, each with the
+  credential that opens it, on every poll. A token is fetched per event
+  from `GET /events/{slug}/token` at the moment an operator prints one
+  card.
+- `blob_sync.py` — out-of-band replication for photo **bytes**, which
+  deliberately do *not* ride the event log. Byte-budgeted
+  (`BLOB_SYNC_BUDGET_BYTES`, default 8MB/round), one blob per request,
+  recap-pinned blobs first, pull-only. Reuses `gossip`'s failure detector
+  and partition set rather than keeping a second view of who's up.
+  `fetch_from_peer` is the read-through `GET /photos/{id}/image` uses when
+  this node has a photo's metadata but not yet its pixels — a real window
+  now that the two replicate at different speeds, and a 404 there renders
+  as a permanently broken image in both clients. See its module docstring
+  for the measured failure that forced the split.
+- `blob_archive.py` — leader-gated upload of recap-pinned blobs to
+  Supabase Storage (`POST /blob_archive/trigger`, `GET
+  /blob_archive/status`), disabled entirely unless `SUPABASE_URL` +
+  `SUPABASE_KEY` are set. The object key **is** the blob's content hash,
+  which is what makes a re-upload after a leadership change idempotent —
+  same "let the destination be the dedup authority" reasoning as
+  `cloud_sync.py`'s `UNIQUE(origin, seq)`. Only pinned blobs, not every
+  frame every guest shot: archiving the whole roll is a cost decision
+  nobody has made, and doing it by default would quietly turn a demo
+  cluster into a storage bill.
 - `store.py` — SQLite-backed append-only event log. All state (photos,
   likes, job leases, recap) is derived by replaying `events`, never
-  written directly. `(origin, seq)` primary key makes merges idempotent.
+  written directly.
+  **Photo bytes live in a separate `blobs` table, not in the log** —
+  keyed by sha256, replicated by `blob_sync.py`, whose module docstring
+  carries the measured reasoning (don't restate it here or in a third
+  place). The rules that bind new code: never put a large payload in an
+  event (it breaks gossip, see the Gotchas entry); strip legacy
+  `image_base64` in **SQL** (`json_remove`) rather than a Python `.pop`
+  after `json.loads` — `photos`, `photo_by_id` and `raw_events` all do;
+  and `photo_image()` must keep serving **both storage generations**,
+  because real databases hold pre-split rows and rewriting gossiped
+  history to migrate them is a worse trade than one branch.
+  `ensure_blob_for_photo` is how a legacy photo still gets archived: it
+  materialises a blob and records the hash on the *recap* event, never by
+  rewriting the photo event. `pinned_hashes()` derives the protected set
+  from those recap events, never a flag column (see Gotchas).
+  `events_missing_from` caps a batch by **bytes as well as rows**
+  (`MAX_SYNC_BYTES`). `(origin, seq)` primary key makes merges idempotent.
   Each event also carries a `vclock` (JSON, envelope metadata like
   origin/seq — a guest device's `{device_id: counter}` clock, `{}` for
   internally-generated events with no device behind them) and `main.py`'s
@@ -122,7 +195,12 @@ list and manual demo commands: [README.md](README.md).
   edit's own timestamp, so a later rename can't jump an event ahead of
   another one that claimed the same slug first (`main.py`'s
   `resolve_event` needs that ordering to pick a deterministic winner if
-  two events ever raced on one slug during a partition). `raw_events` and
+  two events ever raced on one slug during a partition). `recap_for(
+  event_id)` returns one event's frozen top-liked snapshot and doubles as
+  the exactly-once check `main.py`'s `send_event_recap` needs before
+  appending a new one — it replaced the old `event_exists(kind)`, which
+  could only answer "has *any* recap ever fired" and so would have let
+  the first event's recap suppress every later event's. `raw_events` and
   `photo_by_id` both strip `image_base64` before returning — the former
   because it's what every `/zones/quorum` sample ships across the wire to
   every other node, and shipping pixels there turned a zone-score merge
@@ -375,9 +453,25 @@ list and manual demo commands: [README.md](README.md).
     thrown error; only synced photos (real `photo_id`) show the button at
     all, since an unsynced local capture has nothing on the cluster yet
     for a `public_mark` event to reference.
-  - `src/guest/ui.tsx`'s `GuestTabs` grew a 4th tab (`Public` →
-    `/public`) alongside Camera/My roll/The room, for discoverability
-    from anywhere in the guest app.
+  - `src/routes/recap.tsx` — the guest-facing **end-of-event slideshow**:
+    the frozen top-liked reel for whichever event this phone joined (see
+    `GET /recap` above), auto-advancing every 4s with tap-to-pause and
+    PREV/NEXT/dot controls. Polls every 5s rather than fetching once, so
+    a guest who opens the tab *before* the host ends the event sees it
+    come alive on its own — same "no manual refresh" reasoning as
+    `routes/join.$slug.tsx`'s retry timer. `ready: false` renders a
+    "check back later" state, never an error: an event that hasn't ended
+    yet is the normal case, not a failure.
+  - `src/routes/console.tsx`'s **END EVENT & FREEZE RECAP** button (per
+    event, in the Hosted events panel) is the operator side of that —
+    `serverTriggerRecap` in `lib/operatorGateway.ts`, broadcast to every
+    node like the chaos actions since the operator doesn't know which one
+    holds Raft leadership, and only the leader's call appends anything.
+    The button flips to `RE-CHECK RECAP` with a `RECAP READY · n PHOTOS
+    FROZEN` line once it's fired.
+  - `src/guest/ui.tsx`'s `GuestTabs` grew a 4th and 5th tab (`Public` →
+    `/public`, `Recap` → `/recap`) alongside Camera/My roll/The room, for
+    discoverability from anywhere in the guest app.
   - `src/routes/console.tsx` — the operator console: real Raft
     term/role and gossip/partition state polled from all 3 nodes, an
     event tape built from *observed state diffs* (term changes, peer
@@ -497,6 +591,27 @@ same paths the demo cluster uses):
   stays reachable under `"default"` throughout. `PUBLIC_LIMIT_PER_GUEST`
   is env-overridable specifically so this test can drive the cap to its
   edge in 3 requests instead of 26.
+- `python test_recap.py` — spins up 3 nodes and proves the end-of-event
+  recap is genuinely *frozen*, not a live query wearing a snapshot's
+  name: posts 5 photos with distinct like counts, triggers, then piles 6
+  more likes onto the lowest-ranked photo (enough to make it the most
+  liked overall) and confirms `GET /recap` is byte-identical afterward.
+  Also covers ranking by likes, the `RECAP_TOP_N` cap (driven to 3 via
+  the env var, same trick `test_events.py` uses for the public cap),
+  not-ready-before-trigger returning an empty list rather than a 404,
+  replication to a node that read it nowhere else, an idempotent
+  re-trigger, two events' recaps staying isolated, that the recap pins
+  its blobs (the check that caught the local-vs-replicated pinning bug),
+  and that a photo deleted after the freeze leaves the reel while a spare
+  backfills in rank order — including that its bytes stop serving too.
+- `python test_blobs.py` — spins up 3 nodes and proves photo bytes are
+  really out of the log and really replicate without it: the photo event
+  is asserted to be a few hundred bytes of metadata with a `blob_hash`
+  matching the sha256 of the uploaded bytes and **no** `image_base64`
+  anywhere in any node's log; a node that lacks the blob reads through to
+  a peer instead of 404ing; the blob reaches all 3 nodes on `blob_sync`'s
+  own path within 25s; identical bytes dedup to one blob; and a
+  legacy inline-base64 row written straight into the DB still serves.
 - `python load_test.py [--quick]` — not a pass/fail test, a measurement
   script. Spins up and tears down its own real clusters, fires real
   concurrent traffic, reports p50/p95/p99 latency, convergence time,
@@ -546,6 +661,15 @@ print their QR cards. See the "Multi-event hosting" section in
 [README.md](README.md) for the endpoint shapes and demo commands, and
 `python test_events.py` for the automated isolation proof.
 
+Also done: **the end-of-event recap** — what happens after an event
+finishes, which until now was a bare `recap_sent` flag no client read.
+An operator ends an event from the console and the cluster freezes that
+event's `RECAP_TOP_N` most-liked photos into the `recap_sent` payload;
+guests replay it anytime afterward as a slideshow at `/recap`. Frozen
+deliberately, not recomputed live — see the `main.py` entry above for
+why, and `python test_recap.py` for the proof that later likes don't
+move it.
+
 ## Gotchas hit so far (don't reintroduce these)
 
 - **Raft heartbeat must be well under the election timeout, not over
@@ -564,7 +688,7 @@ print their QR cards. See the "Multi-event hosting" section in
   moment of *becoming* leader (that fires on every election, including
   ones after the action already happened). Instead, gate an explicit
   one-time trigger and make the action itself idempotent by checking the
-  replicated event log (see `store.event_exists` / `send_event_recap` in
+  replicated event log (see `store.recap_for` / `send_event_recap` in
   `main.py`), not local in-memory state — local state doesn't survive
   the crash and isn't shared across nodes.
 - **...but a repeated, ongoing sync (not a one-time trigger) can safely
@@ -810,6 +934,36 @@ print their QR cards. See the "Multi-event hosting" section in
   (absolute URLs) rather than `NODES`, because `/chaos/partition`
   indexes positionally into a specific node's own `PEERS` list. Missing
   cert files fall back to HTTP rather than failing to boot.
+- **A row-count batch cap is not a size cap, and large payloads in the
+  log break gossip in a way that looks like a flaky peer.**
+  `events_missing_from(limit=500)` reads as a sensible bound until a
+  payload can be 200KB — then the body outgrows the client timeout, and a
+  node that falls behind can *never* catch up because every attempt to
+  catch up times out. Bytes now live in `blobs` (`blob_sync.py` has the
+  measurements); `events_missing_from` also takes `MAX_SYNC_BYTES`. If
+  you add another event kind with a large payload, it belongs in a blob.
+- **Read amplification in a route handler is a latency bug on the *event
+  loop*, not just wasted I/O.** `store.photos()` did `SELECT *` and
+  popped the unwanted field in Python, reading ~1800× more than it
+  returned — synchronous work on the one asyncio loop raft's 50ms
+  heartbeat and gossip both live on, polled every 4s by every guest. Same
+  class of failure as the `to_thread` gotcha above, reached from a
+  different direction. Strip unwanted JSON fields in **SQL**
+  (`json_remove`); don't `SELECT *` when you want four columns.
+  The same rule applies to what you hang off `GET /health`: it's polled
+  every second by the dashboard and console, so `blob_stats()` keeps its
+  recap-replay behind an opt-in flag rather than paying it on every poll.
+- **Deriving a flag locally when the thing it describes is replicated
+  gives every node a different answer.** The recap's blob "pinning" was
+  first written as `UPDATE blobs SET pinned=1` at freeze time. That only
+  ran on whichever node happened to be Raft leader at that moment, and
+  only for blobs that node had already pulled — so the other two nodes
+  had no idea those bytes were protected, and `blob_stats` reported 0
+  pinned on the node the test happened to ask. Caught by `test_recap.py`
+  asserting the pinned count. Fixed by deriving the pinned set from the
+  `recap_sent` events themselves (`store.pinned_hashes`). This is the
+  Conventions rule at the bottom of this file, and pinning is not a good
+  place to make an exception to it.
 - **A dev server bound with `--host` on a port that's already taken
   silently moves to the next one, and the old process on the old port
   doesn't stop just because you meant to replace it.** Running

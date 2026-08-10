@@ -30,7 +30,11 @@ export function PerfRail({
   );
 }
 
-export function GuestTabs({ active }: { active: "capture" | "mine" | "room" | "public" }) {
+export function GuestTabs({
+  active,
+}: {
+  active: "capture" | "mine" | "room" | "public" | "recap";
+}) {
   // The room link's slug is whichever event this phone actually joined
   // (lib/event.ts), not a hardcoded room -- the same tab bar now has to
   // work for every hosted event, not just the one this app shipped with.
@@ -40,6 +44,7 @@ export function GuestTabs({ active }: { active: "capture" | "mine" | "room" | "p
     { key: "mine", to: "/mine", label: "My roll" },
     { key: "room", to: "/event/$slug", label: "The room" },
     { key: "public", to: "/public", label: "Public" },
+    { key: "recap", to: "/recap", label: "Recap" },
   ] as const;
 
   return (

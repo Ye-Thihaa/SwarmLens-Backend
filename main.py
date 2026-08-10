@@ -15,6 +15,8 @@ from pydantic import BaseModel
 
 import ai_engine
 from store import DEFAULT_EVENT_ID, Store
+from blob_archive import BlobArchive
+from blob_sync import BlobSync
 from gossip import Gossip
 from worker import Worker
 from raft import Raft
@@ -30,6 +32,20 @@ QUORUM_EVENT_KINDS = ("photo", "like", "aesthetic_score", "photo_delete")
 # requests instead of uploading 26 photos twice. The default is the real
 # number and is mirrored by hand in client-2/src/lib/api.ts.
 PUBLIC_LIMIT_PER_GUEST = int(os.getenv("PUBLIC_LIMIT_PER_GUEST", "25"))
+# How many of an event's most-liked photos the end-of-event recap freezes
+# into its slideshow. Env-overridable for the same reason
+# PUBLIC_LIMIT_PER_GUEST is: a test can drive it to its edge with a
+# handful of photos instead of uploading dozens twice.
+RECAP_TOP_N = int(os.getenv("RECAP_TOP_N", "10"))
+# Extra photos frozen beyond the visible N, held in reserve so GET /recap
+# can backfill when a guest deletes one of their own frozen photos after
+# the event. Without these the reel would simply shrink -- see
+# send_event_recap for why deletion has to win over the snapshot.
+RECAP_SPARES = int(os.getenv("RECAP_SPARES", "10"))
+# Largest single photo accepted, decoded. Guards the blob store against
+# one client (or one bug) writing an unbounded row; 12MB comfortably fits
+# a full-resolution phone JPEG.
+MAX_PHOTO_BYTES = int(os.getenv("MAX_PHOTO_BYTES", str(12 * 1024 * 1024)))
 
 NODE_ID = os.getenv("NODE_ID", "node1")
 DB_PATH = os.getenv("DB_PATH", f"./{NODE_ID}.db")
@@ -53,19 +69,83 @@ OPERATOR_TOKEN = os.getenv("OPERATOR_TOKEN", "")
 
 store = Store(DB_PATH, NODE_ID)
 gossip = Gossip(NODE_ID, PEERS, store, INTERVAL)
+# Photo bytes replicate here, NOT through gossip -- see blob_sync.py's
+# module docstring for the failure that split them apart.
+blob_sync = BlobSync(NODE_ID, PEERS, store, gossip)
 worker = Worker(NODE_ID, store)
 
 
-async def send_event_recap():
-    """Fires once, cluster-wide, no matter how many times it's triggered
-    or how many leaders come and go. Only the leader ever calls this."""
-    if await store.event_exists("recap_sent"):
+async def send_event_recap(event_id: str):
+    """Fires once per hosted event, no matter how many times it's
+    triggered or how many leaders come and go -- store.recap_for(event_id)
+    is the replicated-log check that makes that survive a leader crash
+    (see CLAUDE.md's exactly-once gotcha), not local memory. Only the
+    leader ever calls this.
+
+    Snapshots the RECAP_TOP_N most-liked photos into the recap event's own
+    payload at trigger time -- a frozen "most memorable" list, not
+    something recomputed live every time a guest opens the slideshow
+    afterward. A like that lands after the operator has called the event
+    over shouldn't quietly reshuffle what "memorable" meant at that
+    moment. Sorted by likes then photo_id so the snapshot is deterministic
+    even in the rare case two would-be leaders both pass the exists-check
+    in the same race window and compute it independently.
+
+    Two things make the freeze survive real life rather than just a demo:
+
+    - It stores RECAP_SPARES extra photos beyond the visible N. A guest
+      can delete their own photo after the event (POST /photos/delete),
+      and a frozen reel that referenced it would render a broken tile. The
+      spares let GET /recap drop the deleted one and backfill, so a
+      withdrawn photo costs the reel nothing rather than leaving a hole.
+      Deletion has to win over the snapshot -- a guest who retracts a
+      photo has withdrawn consent, and "the recap froze it first" is not
+      an answer to that.
+    - It records each photo's blob_hash. That's what pins those blobs:
+      store.pinned_hashes() derives the protected set from these very
+      events, so every node agrees on what must never be evicted and what
+      blob_archive should upload first. A recap is meant to outlive its
+      event, and recording the hash is what makes that true of the pixels
+      and not just the metadata."""
+    if await store.recap_for(event_id) is not None:
         return
-    await store.append_local("recap_sent", {"sent_by": NODE_ID})
+    photos = await store.photos(event_id)
+    ranked = sorted(photos, key=lambda p: (-p["likes"], p["photo_id"]))
+    frozen = ranked[: RECAP_TOP_N + RECAP_SPARES]
+
+    snapshot = []
+    for p in frozen:
+        # ensure_blob_for_photo, not p["blob_hash"]: a photo predating the
+        # blob split has its bytes inline and no hash, so it could never be
+        # pinned and therefore never archived -- and since cloud_sync stopped
+        # shipping base64, that left pre-split photos with no off-cluster
+        # copy at all. Materialising a blob here gives the recap a durable
+        # handle on those pixels without rewriting the original event.
+        snapshot.append({
+            "photo_id": p["photo_id"],
+            "guest_id": p["guest_id"],
+            "zone": p["zone"],
+            "likes": p["likes"],
+            "blob_hash": await store.ensure_blob_for_photo(p["photo_id"]),
+        })
+
+    await store.append_local("recap_sent", {
+        "event_id": event_id,
+        "sent_by": NODE_ID,
+        # How many of `photos` are meant to be shown; the rest are spares
+        # held in reserve for deletions. Stored rather than assumed so a
+        # reel frozen under one RECAP_TOP_N still renders at its original
+        # length if the env var later changes.
+        "visible": RECAP_TOP_N,
+        "photos": snapshot,
+    })
 
 
 raft = Raft(NODE_ID, PEERS)
 cloud_sync = CloudSync(NODE_ID, store, raft)
+# Pushes recap-pinned photo bytes to object storage so a frozen recap
+# outlives the cluster, not just the event. Disabled unless configured.
+blob_archive = BlobArchive(NODE_ID, store, raft)
 
 
 def cluster_members() -> list[str]:
@@ -172,13 +252,17 @@ def _zone_scores_from_events(events, event_id: str | None = None) -> dict[str, d
 async def lifespan(app: FastAPI):
     await store.open()
     await gossip.start()
+    await blob_sync.start()
     await worker.start()
     await raft.start()
     await cloud_sync.start()
+    await blob_archive.start()
     yield
+    await blob_archive.stop()
     await cloud_sync.stop()
     await raft.stop()
     await worker.stop()
+    await blob_sync.stop()
     await gossip.stop()
     await store.close()
 
@@ -273,18 +357,65 @@ async def create_event(body: EventIn, _: None = Depends(require_operator_token))
 
 
 @app.get("/events")
-async def list_events(_: None = Depends(require_operator_token)):
-    """Every event this node knows about, join tokens included -- the
-    operator console's list. Gated because a public directory of every
-    event on the cluster is the thing multi-tenant hosting is supposed to
+async def list_events(
+    status: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    _: None = Depends(require_operator_token),
+):
+    """The operator console's directory. Gated because a public list of
+    every event on the cluster is the thing multi-tenant hosting exists to
     prevent: a wedding's guests have no business enumerating the funeral
-    booked the same weekend. Guests resolve exactly one event, by slug
-    plus token, through the endpoint below."""
+    booked the same weekend. Guests resolve exactly one event, by slug plus
+    token, through the endpoint below.
+
+    Paginated, newest first, and **without join tokens**. Both matter once
+    a venue has run a season rather than a demo: the console polls this
+    every 5s, and the unpaginated version shipped every event ever hosted
+    -- each with the credential that opens it -- on every poll, forever.
+    A token is only needed when actually printing one event's QR, so it's
+    fetched per event (GET /events/{slug}/token) instead of broadcast to a
+    browser fifty at a time.
+
+    `status` filters active/ended -- an event is "ended" once its recap has
+    been frozen (there is no separate ended flag to disagree with the log),
+    which is what makes a season's worth of finished events collapsible
+    out of the way instead of crowding the one running tonight."""
     catalog = await store.events_catalog()
+    ended = await store.recapped_event_ids()
+
+    rows = []
+    for e in catalog.values():
+        row = {k: v for k, v in e.items() if k != "join_token"}
+        row["status"] = "ended" if e["event_id"] in ended else "active"
+        rows.append(row)
+
+    if status in ("active", "ended"):
+        rows = [r for r in rows if r["status"] == status]
+
+    rows.sort(key=lambda e: (-e["created_at"], e["slug"]))
+    limit = max(1, min(limit, 200))
     return {
         "node": NODE_ID,
-        "events": sorted(catalog.values(), key=lambda e: e["slug"]),
+        "total": len(rows),
+        "limit": limit,
+        "offset": offset,
+        "events": rows[offset: offset + limit],
     }
+
+
+@app.get("/events/{slug}/token")
+async def event_join_token(slug: str, _: None = Depends(require_operator_token)):
+    """One event's join token, for printing its QR. Split out of the list
+    above so a directory poll doesn't ship every event's credential to the
+    browser on a timer -- an operator needs exactly one token at the moment
+    they print exactly one card."""
+    matches = [e for e in (await store.events_catalog()).values() if e["slug"] == slug.lower()]
+    if not matches:
+        raise HTTPException(404, "no such event")
+    event = min(matches, key=lambda e: (e["created_at"], e["event_id"]))
+    return {"event_id": event["event_id"], "slug": event["slug"],
+            "join_token": event.get("join_token", "")}
 
 
 @app.get("/events/{slug}")
@@ -360,9 +491,27 @@ async def upload_photo(body: PhotoIn):
     would turn a normal replication lag into a lost photo -- exactly the
     failure this whole system is built to avoid. An unknown event_id costs
     nothing: the photo is simply invisible until a matching event exists,
-    and visible the moment one does."""
-    payload = body.model_dump(exclude={"vclock"})
+    and visible the moment one does.
+
+    Image bytes do NOT go into the event. They're hashed into the blobs
+    table and the event carries only {blob_hash, size, mime} -- see
+    store.py's blobs schema for the three things inline base64 broke at
+    event scale. The event log stays pure metadata, gossips as before, and
+    the pixels replicate on their own out-of-band path (blob_sync.py)."""
+    payload = body.model_dump(exclude={"vclock", "image_base64"})
     payload["photo_id"] = f"ph_{uuid.uuid4().hex[:8]}"
+
+    if body.image_base64:
+        try:
+            raw = base64.b64decode(body.image_base64, validate=True)
+        except Exception:
+            raise HTTPException(400, "image_base64 is not valid base64")
+        if len(raw) > MAX_PHOTO_BYTES:
+            raise HTTPException(413, "photo too large")
+        payload["blob_hash"] = await store.put_blob(raw)
+        payload["size"] = len(raw)
+        payload["mime"] = "image/jpeg"
+
     event = await store.append_local("photo", payload, vclock=body.vclock)
     return {"ok": True, "photo_id": payload["photo_id"], "seq": event["seq"]}
 
@@ -414,22 +563,54 @@ async def list_photos(event_id: str | None = None):
 
 @app.get("/photos/{photo_id}/image")
 async def photo_image(photo_id: str):
-    """Serves one photo's actual image bytes, decoded from the same event
-    log entry gossip already replicated to every node -- no separate media
-    storage or CDN, this repo has none (see ai_engine.py's /analyze
-    docstring). Split out from GET /photos so the list endpoint (polled
-    every few seconds by the client) stays light instead of shipping every
-    photo's full bytes on every poll. 404 if this photo has no
-    image_base64 attached (metadata-only test photos, or captures from a
-    guest client older than this endpoint)."""
-    b64 = await store.photo_image_b64(photo_id)
-    if not b64:
+    """Serves one photo's actual image bytes. Split out from GET /photos so
+    the list endpoint (polled every few seconds by every guest client)
+    stays light instead of shipping every photo's bytes on every poll.
+
+    Since the blob split, metadata and pixels replicate on separate paths:
+    the photo event arrives by gossip in ~1s, its blob arrives by
+    blob_sync's byte-budgeted loop, which is deliberately slower. So a node
+    can legitimately know about a photo whose bytes it doesn't hold yet.
+    Rather than 404 (which a client renders as a permanently broken image),
+    this reads through to a peer that does have it, caches the result, and
+    serves it -- the fetch also warms this node for the next request. Only
+    a photo no node has, or one that was never uploaded with bytes at all
+    (metadata-only test photos), actually 404s."""
+    found = await store.photo_image(photo_id)
+    if found is None and photo_id not in await store.deleted_photo_ids():
+        blob_hash = await store.blob_hash_for_photo(photo_id)
+        if blob_hash:
+            found = await blob_sync.fetch_from_peer(blob_hash)
+            if found is None:
+                # Last resort: object storage. Without this the archive is
+                # write-only -- bytes uploaded and never readable again,
+                # which is not the durability the archive exists to give.
+                # This is the case it was built for: a recap replayed after
+                # the cluster that produced it is gone or has lost the blob.
+                found = await _fetch_archived(blob_hash)
+    if found is None:
         raise HTTPException(404, "no image stored for this photo")
+    image_bytes, mime = found
+    return Response(content=image_bytes, media_type=mime or "image/jpeg")
+
+
+async def _fetch_archived(blob_hash: str) -> tuple[bytes, str] | None:
+    """Pull a blob back from object storage and re-cache it locally, so the
+    next read is served from disk. Returns None when this blob was never
+    archived (the common case -- only recap-pinned blobs are) or the
+    archive is unreachable; the caller then 404s as before."""
+    url = await store.archived_url_for(blob_hash)
+    if not url:
+        return None
     try:
-        image_bytes = base64.b64decode(b64, validate=True)
+        async with httpx.AsyncClient(timeout=10.0, trust_env=CLOUD_SYNC_TRUST_ENV) as client:
+            r = await client.get(url)
+            r.raise_for_status()
     except Exception:
-        raise HTTPException(500, "corrupt stored image")
-    return Response(content=image_bytes, media_type="image/jpeg")
+        return None
+    mime = r.headers.get("content-type", "image/jpeg")
+    await store.put_blob(r.content, mime)
+    return r.content, mime
 
 
 @app.post("/photos/public")
@@ -538,15 +719,22 @@ async def analyze_photo(body: AnalyzeIn):
         except Exception:
             raise HTTPException(400, "image_base64 is not valid base64")
     else:
-        photo = next((p for p in await store.photos() if p["photo_id"] == body.photo_id), None)
-        if not photo or not photo.get("url"):
-            raise HTTPException(
-                400, "no image_base64 given, and this photo has no fetchable url"
-            )
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
-            r = await client.get(photo["url"])
-            r.raise_for_status()
-            image_bytes = r.content
+        # Since the blob split there IS a local source of pixels for a bare
+        # photo_id, which there wasn't when this endpoint was written --
+        # try it before falling back to refetching an external url.
+        stored = await store.photo_image(body.photo_id)
+        if stored is not None:
+            image_bytes = stored[0]
+        else:
+            photo = await store.photo_by_id(body.photo_id)
+            if not photo or not photo.get("url"):
+                raise HTTPException(
+                    400, "no image_base64 given, no stored bytes, and no fetchable url"
+                )
+            async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+                r = await client.get(photo["url"])
+                r.raise_for_status()
+                image_bytes = r.content
 
     result = await asyncio.to_thread(ai_engine.analyze, image_bytes)
 
@@ -778,6 +966,30 @@ async def gossip_push(body: dict):
     return {"node": NODE_ID, "merged": merged}
 
 
+# ---------------------------- blobs (photo bytes) ----------------------------
+
+@app.get("/blobs/digest")
+async def blobs_digest():
+    """Which blobs this node holds, hashes only. Peer-facing, cheap enough
+    to call every round -- a hash is 64 bytes where the blob it names is
+    ~150KB, which is the entire point of exchanging these instead of the
+    bytes themselves."""
+    return {"node": NODE_ID, "hashes": sorted(await store.blob_hashes())}
+
+
+@app.get("/blobs/{blob_hash}")
+async def get_blob(blob_hash: str):
+    """Serve one blob's raw bytes to a peer (blob_sync.py's pull loop, or
+    another node's read-through on behalf of a guest). 404 means "not
+    here", which is a routine answer during replication, not an error --
+    the caller just tries the next peer."""
+    found = await store.get_blob(blob_hash)
+    if found is None:
+        raise HTTPException(404, "blob not held by this node")
+    raw, mime = found
+    return Response(content=raw, media_type=mime or "image/jpeg")
+
+
 # ---------------------------- raft ----------------------------
 
 class RequestVoteIn(BaseModel):
@@ -806,14 +1018,59 @@ async def raft_status():
 
 
 @app.post("/recap/trigger")
-async def recap_trigger():
-    """Fire the one-time 'event recap ready' notification. Safe to call on
-    every node (a client doesn't know who the leader is) or more than once
-    (idempotent) -- only the leader acts, and only the first time."""
+async def recap_trigger(event_id: str = DEFAULT_EVENT_ID, _: None = Depends(require_operator_token)):
+    """Fire the one-time 'event recap ready' snapshot for one hosted
+    event. Safe to call on every node (a client doesn't know who the
+    leader is) or more than once (idempotent) -- only the leader acts, and
+    only the first time. Same operator gate as /chaos/* and /events:
+    calling an event over and freezing its highlight reel is an operator
+    decision, not a guest one."""
     if raft.role == "leader":
-        await send_event_recap()
-        return {"triggered": True, "by": NODE_ID}
-    return {"triggered": False, "by": NODE_ID}
+        await send_event_recap(event_id)
+        return {"triggered": True, "by": NODE_ID, "event_id": event_id}
+    return {"triggered": False, "by": NODE_ID, "event_id": event_id}
+
+
+@app.get("/recap")
+async def get_recap(event_id: str = DEFAULT_EVENT_ID):
+    """The frozen top-liked snapshot for one hosted event, if its recap
+    has fired -- what client-2's slideshow route renders. No operator
+    gate, same reasoning as GET /photos/public: a guest coming back after
+    the event ended to relive it is exactly who this is for, and the
+    snapshot carries nothing an unauthenticated guest couldn't already see
+    on GET /photos.
+
+    The ranking is frozen; the *membership* still honours deletion. A
+    guest can retract one of their own photos after the event, and a
+    withdrawn photo must disappear from the reel even though the snapshot
+    named it -- consent outranks the freeze. Spares frozen alongside the
+    visible N (see send_event_recap) backfill the gap, so a deletion
+    shortens the reel only once the reserve is exhausted."""
+    recap = await store.recap_for(event_id)
+    if recap is None:
+        return {"event_id": event_id, "ready": False, "photos": []}
+
+    deleted = await store.deleted_photo_ids()
+    visible = recap.get("visible", RECAP_TOP_N)
+    kept = [p for p in recap["photos"] if p["photo_id"] not in deleted]
+    served = kept[:visible]
+
+    # Counted against the slots that were originally on screen, not against
+    # how many photos were deleted -- those differ the moment the reserve
+    # runs dry (6 deletions with 5 spares is 5 backfills, not 6), and
+    # "short" has to mean the reel actually shrank, which happens whenever
+    # fewer than `visible` survive however many were frozen. An earlier
+    # version reported the deletion count and gated "short" on there having
+    # been a reserve at all, so an event that froze exactly `visible`
+    # photos lost one and reported everything fine.
+    originally_visible = {p["photo_id"] for p in recap["photos"][:visible]}
+    return {
+        "event_id": event_id,
+        "ready": True,
+        "photos": served,
+        "backfilled": sum(1 for p in served if p["photo_id"] not in originally_visible),
+        "short": len(served) < visible,
+    }
 
 
 # ---------------------------- cloud archive sync ----------------------------
@@ -836,6 +1093,28 @@ async def cloud_sync_status():
     return cloud_sync.status()
 
 
+@app.post("/blob_archive/trigger")
+async def blob_archive_trigger(_: None = Depends(require_operator_token)):
+    """Force an archive tick now rather than waiting for
+    BLOB_ARCHIVE_INTERVAL -- mainly for tests/demos, and for an operator
+    who wants a recap's photos safely off-cluster before packing up.
+    Same no-op rules as the loop: leader only, disabled without Supabase
+    credentials, and an unreachable archive is reported in last_error
+    rather than raised.
+
+    Gated, unlike /cloud_sync/trigger: this one spends money. An
+    unauthenticated caller could otherwise loop it and run up a storage
+    bill on someone else's Supabase project."""
+    async with httpx.AsyncClient(timeout=30.0, trust_env=CLOUD_SYNC_TRUST_ENV) as client:
+        n = await blob_archive.archive_once(client)
+    return {"uploaded": n, **blob_archive.status()}
+
+
+@app.get("/blob_archive/status")
+async def blob_archive_status():
+    return {**blob_archive.status(), "blobs": await store.blob_stats(with_pinned=True)}
+
+
 # ---------------------------- ops & chaos ----------------------------
 
 @app.get("/jobs/{photo_id}")
@@ -856,6 +1135,8 @@ async def health():
         "events": await store.event_count(),
         "digest": await store.digest(),
         "gossip": gossip.stats(),
+        "blob_sync": blob_sync.stats(),
+        "blobs": await store.blob_stats(),
         "raft": raft.status(),
         "cloud_sync": cloud_sync.status(),
     }

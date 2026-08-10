@@ -861,6 +861,42 @@ If Phase 2 overruns, it's safe to cut Phase 6 (cloud sync) entirely —
 the live system doesn't need it to be a complete distributed-systems
 demo, it's a nice-to-have for the "permanent gallery" story only.
 
+## Blob replication + archive (added after Phase 8, for production scale)
+
+Listed here because "What NOT to add" below binds this repo, and
+`blob_sync.py` is genuinely a second anti-entropy path — so it either
+gets justified in this document or it shouldn't exist.
+
+The justification is that it isn't a *new* mechanism so much as the
+existing one split along a boundary that turned out to be load-bearing.
+Inline photo bytes didn't merely slow gossip down, they stopped it
+converging — a batch of photo events outgrew the client timeout, so a
+node that fell behind could never catch up — and the same bytes made
+`GET /photos` a multi-second synchronous read on the one event loop
+raft's heartbeat lives on, which votes out a healthy leader. The
+measurements behind both are in `blob_sync.py`'s module docstring and
+README.md's "Photo storage at production scale"; they aren't repeated
+here.
+
+So bytes moved to a content-addressed `blobs` table and replicate on
+their own byte-budgeted loop. What this deliberately does **not** add:
+
+- No new consensus, no second leader election — `blob_sync` reuses
+  `gossip`'s failure detector and partition set rather than forming its
+  own view of who's alive.
+- No new source of truth — which blobs matter (the recap-pinned set) is
+  derived from `recap_sent` events in the existing log, not tracked
+  separately.
+- Pull-only, no push negotiation. Every node wants the same complete set,
+  so "each fetches what it lacks" converges without anyone tracking what
+  anyone else holds.
+
+`blob_archive.py` (Supabase Storage, leader-gated, disabled unless
+configured) is the same shape as Phase 6's `cloud_sync.py` pointed at
+object storage instead of a table, for the same reason Phase 6 exists:
+three nodes surviving node loss is not the same as a recap surviving the
+fleet, and a recap is promised to outlive its event.
+
 ## What NOT to add
 
 No new distributed mechanism beyond what's listed here. Every additional
