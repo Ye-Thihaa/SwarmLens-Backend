@@ -18,7 +18,15 @@
  */
 
 import { createServerFn } from "@tanstack/react-start";
-import { CLUSTER, createHostedEvent, healAllNodes, isolateNode, listHostedEvents } from "./api";
+import {
+  CLUSTER,
+  createHostedEvent,
+  fetchJoinToken,
+  healAllNodes,
+  isolateNode,
+  listHostedEvents,
+  triggerRecap,
+} from "./api";
 import { checkConsoleSession } from "./consoleAuth";
 
 async function requireConsoleSession(): Promise<void> {
@@ -72,8 +80,66 @@ export const serverListEvents = createServerFn({ method: "GET" }).handler(async 
       continue;
     }
   }
-  return [];
+  return { total: 0, limit: 50, offset: 0, events: [] };
 });
+
+/** Fetches one event's join token, on demand, for printing its QR. Kept
+ * out of serverListEvents so the console's 5s directory poll doesn't
+ * carry every event's credential -- see api.ts's HostedEventAdmin. */
+export const serverEventToken = createServerFn({ method: "POST" })
+  .validator((data: unknown) => {
+    if (
+      typeof data !== "object" ||
+      data === null ||
+      !("slug" in data) ||
+      typeof (data as { slug: unknown }).slug !== "string"
+    ) {
+      throw new Error("Invalid request");
+    }
+    return { slug: (data as { slug: string }).slug };
+  })
+  .handler(async ({ data }) => {
+    await requireConsoleSession();
+    const headers = operatorHeaders();
+    for (const n of CLUSTER) {
+      try {
+        return await fetchJoinToken(n.url, data.slug, headers);
+      } catch {
+        continue;
+      }
+    }
+    return { event_id: "", slug: data.slug, join_token: "" };
+  });
+
+/** Calls the operator "end this event" action: freezes its recap
+ * slideshow at whatever's most-liked right now. Broadcasts to every
+ * cluster node like serverHealAll/serverIsolateNode -- the operator
+ * doesn't (and shouldn't have to) know which node is the Raft leader, and
+ * triggerRecap is a no-op everywhere except there. */
+export const serverTriggerRecap = createServerFn({ method: "POST" })
+  .validator((data: unknown) => {
+    if (
+      typeof data !== "object" ||
+      data === null ||
+      !("eventId" in data) ||
+      typeof (data as { eventId: unknown }).eventId !== "string"
+    ) {
+      throw new Error("Invalid request");
+    }
+    return { eventId: (data as { eventId: string }).eventId };
+  })
+  .handler(async ({ data }) => {
+    await requireConsoleSession();
+    const headers = operatorHeaders();
+    const results = await Promise.allSettled(
+      CLUSTER.map((n) => triggerRecap(n.url, data.eventId, headers)),
+    );
+    const fired = results.some(
+      (r) => r.status === "fulfilled" && r.value.triggered,
+    );
+    const reached = results.some((r) => r.status === "fulfilled");
+    return { ok: reached, fired };
+  });
 
 export const serverCreateEvent = createServerFn({ method: "POST" })
   .validator((data: unknown) => {

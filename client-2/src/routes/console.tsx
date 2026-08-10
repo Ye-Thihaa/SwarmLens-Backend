@@ -6,12 +6,15 @@ import {
   URL_TO_ID,
   getHealth,
   getPhotos,
+  getRecap,
   getZones,
   getZonesQuorum,
   prettyZone,
+  RECAP_TOP_N,
   type HostedEventAdmin,
   type NodeHealth,
   type QuorumResult,
+  type Recap,
   type ZoneScore,
 } from "@/lib/api";
 import { checkConsoleSession, loginToConsole, logoutOfConsole } from "@/lib/consoleAuth";
@@ -19,7 +22,9 @@ import {
   serverCreateEvent,
   serverHealAll,
   serverIsolateNode,
+  serverEventToken,
   serverListEvents,
+  serverTriggerRecap,
 } from "@/lib/operatorGateway";
 import { joinQrSvg, printJoinCard } from "@/lib/qr";
 
@@ -95,7 +100,9 @@ function Console() {
 
   // ---- hosted events: the multi-tenant directory this console alone can see ----
   const [events, setEvents] = useState<HostedEventAdmin[]>([]);
+  const [eventsTotal, setEventsTotal] = useState(0);
   const [eventsLoaded, setEventsLoaded] = useState(false);
+  const [tokenBySlug, setTokenBySlug] = useState<Record<string, string>>({});
   // undefined = every event merged -- the same cluster-wide view this
   // console always showed before multi-event hosting existed. Selecting a
   // real event scopes the room stats, the aesthetic map and the quorum
@@ -128,10 +135,54 @@ function Console() {
   const [qrOpenId, setQrOpenId] = useState<string | null>(null);
   const [qrSvgById, setQrSvgById] = useState<Record<string, string>>({});
 
+  // Recap: an operator's "end this event" action, freezing the top-liked
+  // slideshow guests see afterward on /recap. Fetched lazily per event
+  // (a button, not a poll) -- there's no cluster-wide urgency to knowing
+  // this the moment it changes, unlike the health/zone panels below.
+  const [recapByEvent, setRecapByEvent] = useState<Record<string, Recap>>({});
+  const [recapBusyId, setRecapBusyId] = useState<string | null>(null);
+
   async function loadEvents() {
-    const list = await serverListEvents();
-    setEvents(list);
+    const page = await serverListEvents();
+    setEvents(page.events);
+    setEventsTotal(page.total);
     setEventsLoaded(true);
+  }
+
+  // Join tokens are no longer in the directory response (see api.ts's
+  // HostedEventAdmin) -- fetched per event, only when an operator actually
+  // reaches for that event's link or QR, and cached for the session.
+  async function tokenFor(ev: HostedEventAdmin): Promise<string> {
+    const cached = tokenBySlug[ev.slug];
+    if (cached) return cached;
+    const { join_token } = await serverEventToken({ data: { slug: ev.slug } });
+    setTokenBySlug((m) => ({ ...m, [ev.slug]: join_token }));
+    return join_token;
+  }
+
+  async function checkRecap(ev: HostedEventAdmin) {
+    const n = CLUSTER.find((c) => health[c.id])?.url ?? CLUSTER[0]!.url;
+    try {
+      const r = await getRecap(n, ev.event_id);
+      setRecapByEvent((m) => ({ ...m, [ev.event_id]: r }));
+    } catch {
+      // stay on the last known-good read
+    }
+  }
+
+  async function freezeRecap(ev: HostedEventAdmin) {
+    setRecapBusyId(ev.event_id);
+    try {
+      const res = await serverTriggerRecap({ data: { eventId: ev.event_id } });
+      if (!res.ok) {
+        push(`couldn't reach any node to freeze ${ev.name}'s recap`, "bad");
+        return;
+      }
+      await checkRecap(ev);
+      push(`recap frozen for ${ev.name} · top ${RECAP_TOP_N} most-liked`, "ok");
+    } finally {
+      setRecapBusyId(null);
+    }
   }
 
   useEffect(() => {
@@ -182,18 +233,19 @@ function Console() {
     }
     setQrOpenId(ev.event_id);
     if (!qrSvgById[ev.event_id]) {
-      const url = joinUrl(ev);
+      const url = await joinUrl(ev);
       const svg = await joinQrSvg(url);
       setQrSvgById((m) => ({ ...m, [ev.event_id]: svg }));
     }
   }
 
-  function joinUrl(ev: HostedEventAdmin): string {
-    return `${publicBaseUrl || window.location.origin}/join/${ev.slug}?k=${ev.join_token}`;
+  async function joinUrl(ev: HostedEventAdmin): Promise<string> {
+    const token = await tokenFor(ev);
+    return `${publicBaseUrl || window.location.origin}/join/${ev.slug}?k=${token}`;
   }
 
   async function copyJoinUrl(ev: HostedEventAdmin) {
-    await navigator.clipboard.writeText(joinUrl(ev));
+    await navigator.clipboard.writeText(await joinUrl(ev));
     push(`copied join link for ${ev.name}`, "ok");
   }
 
@@ -489,7 +541,14 @@ function Console() {
           hosted events did. */}
       <section className="mt-5 rounded-sm border border-border bg-card p-4">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <h2 className="text-lg font-bold">Hosted events</h2>
+          <h2 className="text-lg font-bold">
+            Hosted events
+            {eventsTotal > events.length && (
+              <span className="ml-2 font-mono text-[0.6rem] tracking-widest text-fixer-dim">
+                SHOWING {events.length} OF {eventsTotal}
+              </span>
+            )}
+          </h2>
           <label className="flex items-center gap-2 font-mono text-xs text-fixer-dim">
             VIEWING
             <select
@@ -585,7 +644,11 @@ function Console() {
                 <div className="min-w-0">
                   <p className="truncate text-sm font-semibold">{ev.name}</p>
                   <p className="font-mono text-[0.6rem] tracking-widest text-fixer-dim">
-                    /{ev.slug} · {ev.zones.length > 1 ? `${ev.zones.length} zones` : "single room"}
+                    <span className={ev.status === "ended" ? "text-stale" : "text-converged"}>
+                      {ev.status === "ended" ? "ENDED" : "ACTIVE"}
+                    </span>
+                    {" · "}/{ev.slug} ·{" "}
+                    {ev.zones.length > 1 ? `${ev.zones.length} zones` : "single room"}
                     {ev.venue ? ` · ${ev.venue}` : ""}
                   </p>
                 </div>
@@ -612,8 +675,28 @@ function Console() {
                   >
                     {qrOpenId === ev.event_id ? "HIDE QR" : "SHOW QR"}
                   </button>
+                  <button
+                    onClick={() => void freezeRecap(ev)}
+                    disabled={recapBusyId === ev.event_id}
+                    className="rounded-sm border border-drifting px-2 py-1 font-mono text-[0.6rem] tracking-widest text-drifting disabled:opacity-40"
+                  >
+                    {recapBusyId === ev.event_id
+                      ? "FREEZING…"
+                      : recapByEvent[ev.event_id]?.ready
+                        ? "RE-CHECK RECAP"
+                        : "END EVENT & FREEZE RECAP"}
+                  </button>
                 </div>
               </div>
+              {recapByEvent[ev.event_id] && (
+                <p className="mt-2 font-mono text-[0.6rem] tracking-widest text-fixer-dim">
+                  {recapByEvent[ev.event_id]!.ready
+                    ? `RECAP READY · ${recapByEvent[ev.event_id]!.photos.length} PHOTO${
+                        recapByEvent[ev.event_id]!.photos.length === 1 ? "" : "S"
+                      } FROZEN`
+                    : "NOT FROZEN YET"}
+                </p>
+              )}
               {qrOpenId === ev.event_id && (
                 <div className="mt-3 flex flex-wrap items-center gap-4 border-t border-border pt-3">
                   {qrSvgById[ev.event_id] ? (
@@ -628,8 +711,14 @@ function Console() {
                     <p className="font-mono text-[0.6rem] text-stale">rendering…</p>
                   )}
                   <div className="min-w-0 flex-1 space-y-2">
+                    {/* Rendered from the cached token rather than by calling
+                        joinUrl (now async, since tokens are fetched on
+                        demand) -- toggleQr has already resolved it by the
+                        time this panel is open. */}
                     <p className="break-all font-mono text-[0.6rem] text-fixer-dim">
-                      {joinUrl(ev)}
+                      {tokenBySlug[ev.slug]
+                        ? `${publicBaseUrl || ""}/join/${ev.slug}?k=${tokenBySlug[ev.slug]}`
+                        : "fetching join link…"}
                     </p>
                     <button
                       disabled={!qrSvgById[ev.event_id]}

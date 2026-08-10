@@ -128,12 +128,25 @@ export type HostedEvent = {
   created_at: number;
 };
 
-/** What the operator console lists. Carries join_token, which is why
- * main.py gates GET /events behind the operator token -- a public
- * directory of every event on the cluster is exactly what multi-tenant
- * hosting has to avoid. Goes through lib/operatorGateway.ts, never
- * straight from the browser. */
-export type HostedEventAdmin = HostedEvent & { join_token: string; created_by: string };
+/** What the operator console lists. Still gated (a public directory of
+ * every event on the cluster is what multi-tenant hosting has to avoid),
+ * but deliberately **without** join_token: the console polls this every
+ * 5s, and shipping every event's credential to a browser on a timer is
+ * both needless exposure and needless bytes once a venue has run a
+ * season. Fetch one on demand with fetchJoinToken when actually printing
+ * a QR. `status` is derived server-side from whether that event's recap
+ * has been frozen. */
+export type HostedEventAdmin = HostedEvent & {
+  created_by: string;
+  status: "active" | "ended";
+};
+
+export type HostedEventPage = {
+  total: number;
+  limit: number;
+  offset: number;
+  events: HostedEventAdmin[];
+};
 
 /** Resolves one scanned QR: slug (+ its join token) -> the event_id every
  * later call carries. Returns null for both "no such event" and "wrong
@@ -156,9 +169,33 @@ export async function resolveEvent(
  * OPERATOR_TOKEN like the chaos endpoints. Called only from
  * lib/operatorGateway.ts's server functions, never straight from the
  * browser, so the token stays server-side. */
-export const listHostedEvents = (node: string, headers: Record<string, string> = {}) =>
-  fetch(`${node}/events`, { headers }).then((r) =>
-    asJson<{ node: string; events: HostedEventAdmin[] }>(r, `${node}/events`).then((b) => b.events),
+export const listHostedEvents = (
+  node: string,
+  headers: Record<string, string> = {},
+  opts: { status?: "active" | "ended"; limit?: number; offset?: number } = {},
+) => {
+  const q = new URLSearchParams();
+  if (opts.status) q.set("status", opts.status);
+  q.set("limit", String(opts.limit ?? 50));
+  q.set("offset", String(opts.offset ?? 0));
+  return fetch(`${node}/events?${q}`, { headers }).then((r) =>
+    asJson<HostedEventPage & { node: string }>(r, `${node}/events`),
+  );
+};
+
+/** One event's join token, fetched only when an operator actually prints
+ * that event's QR -- see HostedEventAdmin above for why the list no
+ * longer carries them. Server-side only (operator-gated), like the list. */
+export const fetchJoinToken = (
+  node: string,
+  slug: string,
+  headers: Record<string, string> = {},
+) =>
+  fetch(`${node}/events/${encodeURIComponent(slug)}/token`, { headers }).then((r) =>
+    asJson<{ event_id: string; slug: string; join_token: string }>(
+      r,
+      `${node}/events/${slug}/token`,
+    ),
   );
 
 export type CreateEventResult =
@@ -439,6 +476,37 @@ export async function deletePhoto(
   if (r.status === 404) return { ok: false, reason: "not_found" };
   return { ok: false, reason: "error" };
 }
+
+// ---- end-of-event recap: the frozen "most memorable" slideshow ---------
+
+export type RecapPhoto = { photo_id: string; guest_id: string; zone: string; likes: number };
+
+export type Recap = { event_id: string; ready: boolean; photos: RecapPhoto[] };
+
+/** Mirrors main.py's RECAP_TOP_N -- the real default, kept in sync by hand
+ * like PUBLIC_LIMIT_PER_GUEST above. Only used for copy ("top 10"), never
+ * to slice the array client-side -- the server already capped it. */
+export const RECAP_TOP_N = 10;
+
+/** The frozen top-liked snapshot for one event's recap slideshow, once an
+ * operator has called the event over (see triggerRecap below). No token
+ * needed to read -- same reasoning as getPublicPhotos: a guest coming back
+ * to relive the night is exactly who this is for. `ready: false` with an
+ * empty list is the routine "nothing frozen yet" state, not an error --
+ * the UI should say "check back later," never show a broken-page state. */
+export const getRecap = (node: string, eventId: string) =>
+  fetch(`${node}/recap?${eventQuery(eventId)}`).then((r) => asJson<Recap>(r, `${node}/recap`));
+
+/** Freezes an event's top-liked-photos snapshot. Idempotent and safe to
+ * call on every node -- same broadcast pattern as the chaos actions, since
+ * the caller doesn't know which node is the Raft leader and only the
+ * leader's call actually appends anything. Routed through
+ * lib/operatorGateway.ts so OPERATOR_TOKEN stays server-side, like every
+ * other operator action. */
+export const triggerRecap = (node: string, eventId: string, headers: Record<string, string> = {}) =>
+  fetch(`${node}/recap/trigger?${eventQuery(eventId)}`, { method: "POST", headers }).then((r) =>
+    asJson<{ triggered: boolean; by: string; event_id: string }>(r, `${node}/recap/trigger`),
+  );
 
 export const getZones = (node: string, eventId: string | undefined) =>
   fetch(`${node}/zones${eventId ? `?${eventQuery(eventId)}` : ""}`)

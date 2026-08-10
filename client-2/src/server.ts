@@ -16,7 +16,7 @@ import path from "node:path";
 // Deliberately unconditional (overwrites, doesn't check "already set"):
 // Vite's own internal env loading (dotenv-expand) reads this same .env
 // earlier in the pipeline and treats `$` as variable-interpolation
-// syntax -- CONSOLE_PASSWORD=c0n$ol3 silently became "c0n" ($ol3
+// syntax -- a CONSOLE_PASSWORD=s3cret$val became just "s3cret" ($val
 // resolved as a reference to an undefined var and expanded to empty
 // string), and a guarded "only set if missing" write would have kept
 // that mangled value instead of this file's literal one. This loader
