@@ -1,8 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
-import { events } from "@/guest/data";
 import { GuestTabs } from "@/guest/ui";
 import { getPublicPhotos, photoImageUrl, pickNode, prettyZone, type RemotePhoto } from "@/lib/api";
+import { useCurrentEvent } from "@/lib/event";
 
 export const Route = createFileRoute("/public")({
   head: () => ({
@@ -71,7 +71,7 @@ async function downloadPhoto(node: string, photo: RemotePhoto) {
 }
 
 function PublicGallery() {
-  const event = events[0];
+  const event = useCurrentEvent();
   const [node, setNode] = useState<string | null>(null);
   const [photos, setPhotos] = useState<RemotePhoto[]>([]);
   const [open, setOpen] = useState<RemotePhoto | null>(null);
@@ -85,7 +85,7 @@ function PublicGallery() {
       setNode(n);
       if (!n) return;
       try {
-        const ps = await getPublicPhotos(n);
+        const ps = await getPublicPhotos(n, event.event_id);
         if (!cancelled) setPhotos(ps);
       } catch {
         // stay on the last known-good read
@@ -97,7 +97,7 @@ function PublicGallery() {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [event.event_id]);
 
   const contributors = useMemo(() => new Set(photos.map((p) => p.guest_id)).size, [photos]);
 
@@ -112,7 +112,7 @@ function PublicGallery() {
     <main className="grain min-h-screen pb-24">
       <header className="border-b border-border px-5 pt-8 pb-5">
         <p className="label-mono">PUBLIC GALLERY</p>
-        <h1 className="mt-2 text-3xl font-extrabold">{event?.name ?? "Tonight"}</h1>
+        <h1 className="mt-2 text-3xl font-extrabold">{event.name}</h1>
         <p className="mt-2 max-w-sm text-sm leading-relaxed text-muted-foreground">
           Guests picked these themselves — up to 25 shots each — for anyone to see and take home, not
           just the room. Tap a frame to open it and download the full image.

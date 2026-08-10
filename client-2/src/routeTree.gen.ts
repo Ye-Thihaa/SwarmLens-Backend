@@ -16,6 +16,7 @@ import { Route as ConsoleRouteImport } from './routes/console'
 import { Route as MineRouteImport } from './routes/mine'
 import { Route as PublicRouteImport } from './routes/public'
 import { Route as EventSlugRouteImport } from './routes/event.$slug'
+import { Route as JoinSlugRouteImport } from './routes/join.$slug'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -52,6 +53,11 @@ const EventSlugRoute = EventSlugRouteImport.update({
   path: '/event/$slug',
   getParentRoute: () => rootRouteImport,
 } as any)
+const JoinSlugRoute = JoinSlugRouteImport.update({
+  id: '/join/$slug',
+  path: '/join/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -61,6 +67,7 @@ export interface FileRoutesByFullPath {
   '/mine': typeof MineRoute
   '/public': typeof PublicRoute
   '/event/$slug': typeof EventSlugRoute
+  '/join/$slug': typeof JoinSlugRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -70,6 +77,7 @@ export interface FileRoutesByTo {
   '/mine': typeof MineRoute
   '/public': typeof PublicRoute
   '/event/$slug': typeof EventSlugRoute
+  '/join/$slug': typeof JoinSlugRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -80,6 +88,7 @@ export interface FileRoutesById {
   '/mine': typeof MineRoute
   '/public': typeof PublicRoute
   '/event/$slug': typeof EventSlugRoute
+  '/join/$slug': typeof JoinSlugRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -91,6 +100,7 @@ export interface FileRouteTypes {
     | '/mine'
     | '/public'
     | '/event/$slug'
+    | '/join/$slug'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -100,6 +110,7 @@ export interface FileRouteTypes {
     | '/mine'
     | '/public'
     | '/event/$slug'
+    | '/join/$slug'
   id:
     | '__root__'
     | '/'
@@ -109,6 +120,7 @@ export interface FileRouteTypes {
     | '/mine'
     | '/public'
     | '/event/$slug'
+    | '/join/$slug'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -119,6 +131,7 @@ export interface RootRouteChildren {
   MineRoute: typeof MineRoute
   PublicRoute: typeof PublicRoute
   EventSlugRoute: typeof EventSlugRoute
+  JoinSlugRoute: typeof JoinSlugRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -172,6 +185,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof EventSlugRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/join/$slug': {
+      id: '/join/$slug'
+      path: '/join/$slug'
+      fullPath: '/join/$slug'
+      preLoaderRoute: typeof JoinSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -183,6 +203,7 @@ const rootRouteChildren: RootRouteChildren = {
   MineRoute: MineRoute,
   PublicRoute: PublicRoute,
   EventSlugRoute: EventSlugRoute,
+  JoinSlugRoute: JoinSlugRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

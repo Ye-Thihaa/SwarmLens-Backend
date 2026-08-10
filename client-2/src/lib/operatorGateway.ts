@@ -18,7 +18,7 @@
  */
 
 import { createServerFn } from "@tanstack/react-start";
-import { healAllNodes, isolateNode } from "./api";
+import { CLUSTER, createHostedEvent, healAllNodes, isolateNode, listHostedEvents } from "./api";
 import { checkConsoleSession } from "./consoleAuth";
 
 async function requireConsoleSession(): Promise<void> {
@@ -54,3 +54,53 @@ export const serverHealAll = createServerFn({ method: "POST" }).handler(async ()
   await healAllNodes(operatorHeaders());
   return { ok: true };
 });
+
+/** GET /events is gated the same way the chaos endpoints are (see
+ * main.py's require_operator_token) -- a public directory of every event
+ * on the cluster is exactly what multi-tenant hosting has to avoid.
+ * Routed through here so OPERATOR_TOKEN stays server-side, same reasoning
+ * as serverIsolateNode/serverHealAll above. Tries each cluster node in
+ * turn: unlike the chaos actions (which target one specific node on
+ * purpose), a directory listing just needs any node that's up. */
+export const serverListEvents = createServerFn({ method: "GET" }).handler(async () => {
+  await requireConsoleSession();
+  const headers = operatorHeaders();
+  for (const n of CLUSTER) {
+    try {
+      return await listHostedEvents(n.url, headers);
+    } catch {
+      continue;
+    }
+  }
+  return [];
+});
+
+export const serverCreateEvent = createServerFn({ method: "POST" })
+  .validator((data: unknown) => {
+    if (typeof data !== "object" || data === null) throw new Error("Invalid request");
+    const d = data as Record<string, unknown>;
+    if (typeof d["slug"] !== "string" || typeof d["name"] !== "string") {
+      throw new Error("Invalid request");
+    }
+    return {
+      slug: d["slug"] as string,
+      name: d["name"] as string,
+      venue: typeof d["venue"] === "string" ? d["venue"] : "",
+      when: typeof d["when"] === "string" ? d["when"] : "",
+      zones: Array.isArray(d["zones"]) ? (d["zones"] as string[]) : [],
+      event_id: typeof d["event_id"] === "string" ? d["event_id"] : undefined,
+    };
+  })
+  .handler(async ({ data }) => {
+    await requireConsoleSession();
+    // Any reachable node will do -- POST /events gossips out from
+    // whichever one accepts it, same as a photo upload.
+    for (const n of CLUSTER) {
+      try {
+        return await createHostedEvent(n.url, data, operatorHeaders());
+      } catch {
+        continue;
+      }
+    }
+    return { ok: false, reason: "error" } as const;
+  });

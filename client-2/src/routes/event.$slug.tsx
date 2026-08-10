@@ -1,8 +1,8 @@
-import { createFileRoute, Link, notFound } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
-import { events } from "@/guest/data";
 import { GuestTabs, PerfRail } from "@/guest/ui";
 import {
+  BOOTH_ZONE,
   CLUSTER_SIZE,
   getPhotos,
   getZones,
@@ -12,24 +12,27 @@ import {
   type RemotePhoto,
   type ZoneScore,
 } from "@/lib/api";
+import { useCurrentEvent } from "@/lib/event";
 import { currentGuestId, tick } from "@/lib/guest";
 import { addLike, hasLiked, syncOutbox, useOutbox } from "@/lib/outbox";
 
 export const Route = createFileRoute("/event/$slug")({
-  loader: ({ params }) => {
-    const event = events.find((e) => e.slug === params.slug);
-    if (!event) throw notFound();
-    return { event };
-  },
-  head: ({ loaderData }) => ({
+  // No loader lookup any more: the room a guest is in comes from the event
+  // they joined by scanning a QR (lib/event.ts), not from a bundled
+  // directory of rooms this app ships with. The slug in the URL is a
+  // human-readable label for the same thing -- throwing notFound() for an
+  // unrecognised one would 404 every real hosted event, since the client
+  // has no list of them and, by design, isn't allowed one (see main.py's
+  // gated GET /events).
+  head: () => ({
     meta: [
-      { title: `${loaderData?.event.name ?? "The room"} — SwarmLens` },
+      { title: "The room — SwarmLens" },
       {
         name: "description",
         content:
           "Everyone's frames from this room: each guest's own small gallery, the crowd's favourites, and which corners the room has decided are beautiful.",
       },
-      { property: "og:title", content: `${loaderData?.event.name ?? "The room"} — SwarmLens` },
+      { property: "og:title", content: "The room — SwarmLens" },
       {
         property: "og:description",
         content: "One picture of the night, assembled from every phone in the room.",
@@ -99,7 +102,7 @@ function PhotoImg({
 }
 
 function EventGallery() {
-  const { event } = Route.useLoaderData();
+  const event = useCurrentEvent();
   const [tab, setTab] = useState<Tab>("people");
   const [open, setOpen] = useState<RemotePhoto | null>(null);
   const [node, setNode] = useState<string | null>(null);
@@ -128,7 +131,10 @@ function EventGallery() {
       setNode(n);
       if (!n) return;
       try {
-        const [ps, zs] = await Promise.all([getPhotos(n), getZones(n)]);
+        const [ps, zs] = await Promise.all([
+          getPhotos(n, event.event_id),
+          getZones(n, event.event_id),
+        ]);
         if (!cancelled) {
           setPhotos(ps);
           setZones(zs);
@@ -143,7 +149,7 @@ function EventGallery() {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [event.event_id]);
 
   const guestCount = useMemo(() => new Set(photos.map((p) => p.guest_id)).size, [photos]);
 
@@ -161,7 +167,7 @@ function EventGallery() {
   // for them; this tab is just that zone filtered back out of the same
   // GET /photos every other tab already reads.
   const boothPhotos = useMemo(
-    () => [...photos.filter((p) => p.zone === "photo_booth")].sort((a, b) => b.taken_at - a.taken_at),
+    () => [...photos.filter((p) => p.zone === BOOTH_ZONE)].sort((a, b) => b.taken_at - a.taken_at),
     [photos],
   );
 
@@ -170,7 +176,7 @@ function EventGallery() {
   async function like(photoId: string) {
     addLike({
       local_id: crypto.randomUUID(),
-      guest_id: currentGuestId(),
+      guest_id: currentGuestId(event.event_id),
       photo_id: photoId,
       vclock: tick(),
     });

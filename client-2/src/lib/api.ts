@@ -10,6 +10,10 @@ export type RemotePhoto = {
   photo_id: string;
   guest_id: string;
   zone: string;
+  /** Which hosted event this frame belongs to. Always present on the way
+   * out -- store.py fills in "default" for anything logged before
+   * multi-event hosting existed. */
+  event_id: string;
   url: string;
   composition_score: number;
   likes: number;
@@ -30,6 +34,7 @@ export type ZoneScore = {
 
 export type QuorumResult = {
   node: string;
+  event_id: string | null;
   N: number;
   R: number;
   W: number;
@@ -93,12 +98,98 @@ export const URL_TO_ID: Record<string, string> = Object.fromEntries(
   CLUSTER.map((n) => [n.url, n.id]),
 );
 
-/** Real zones this cluster actually knows about -- see client/src/constants.ts,
- * the Phase 5 reference client's equivalent list. */
+/** The zones the DEFAULT event uses -- every photo logged before hosted
+ * events existed carries one of these. A real event brings its own list
+ * (see lib/event.ts's JoinedEvent.zones, set by the host in the operator
+ * console); this is only the fallback for a guest who opened the app
+ * without scanning anything. */
 export const ZONES = ["flower_arch", "bar", "dance_floor", "photo_booth", "entrance"];
+
+/** Composited strips from routes/album.tsx are ordinary photos tagged with
+ * this zone -- that's how event.$slug.tsx's "Photo booth" tab finds them
+ * again. It isn't a place in the room, so a host never lists it among an
+ * event's zones, and it can show up in /zones for an event that didn't
+ * declare it. That's expected: it's a marker, not a corner. */
+export const BOOTH_ZONE = "photo_booth";
 
 export function prettyZone(zone: string): string {
   return zone.replace(/_/g, " ");
+}
+
+// ---- hosted events ------------------------------------------------------
+
+export type HostedEvent = {
+  event_id: string;
+  slug: string;
+  name: string;
+  venue: string;
+  when: string;
+  zones: string[];
+  created_at: number;
+};
+
+/** What the operator console lists. Carries join_token, which is why
+ * main.py gates GET /events behind the operator token -- a public
+ * directory of every event on the cluster is exactly what multi-tenant
+ * hosting has to avoid. Goes through lib/operatorGateway.ts, never
+ * straight from the browser. */
+export type HostedEventAdmin = HostedEvent & { join_token: string; created_by: string };
+
+/** Resolves one scanned QR: slug (+ its join token) -> the event_id every
+ * later call carries. Returns null for both "no such event" and "wrong
+ * token" -- main.py answers 404 to both on purpose, and so should the UI:
+ * telling a scanner that the slug exists but their token is wrong is a
+ * distinction only someone probing for other people's events cares
+ * about. */
+export async function resolveEvent(
+  node: string,
+  slug: string,
+  joinToken: string,
+): Promise<HostedEvent | null> {
+  const r = await fetch(`${node}/events/${encodeURIComponent(slug)}?k=${encodeURIComponent(joinToken)}`);
+  if (r.status === 404) return null;
+  const body = await asJson<{ node: string; event: HostedEvent }>(r, `${node}/events/${slug}`);
+  return body.event;
+}
+
+/** The operator's own list, join tokens included -- gated by
+ * OPERATOR_TOKEN like the chaos endpoints. Called only from
+ * lib/operatorGateway.ts's server functions, never straight from the
+ * browser, so the token stays server-side. */
+export const listHostedEvents = (node: string, headers: Record<string, string> = {}) =>
+  fetch(`${node}/events`, { headers }).then((r) =>
+    asJson<{ node: string; events: HostedEventAdmin[] }>(r, `${node}/events`).then((b) => b.events),
+  );
+
+export type CreateEventResult =
+  | { ok: true; event: HostedEventAdmin }
+  | { ok: false; reason: "slug_taken" | "invalid" | "error" };
+
+/** Registers (or, passing back an existing event_id, edits) one hosted
+ * event. Same gate as the chaos endpoints -- see require_operator_token
+ * in main.py -- routed through the server function below so
+ * OPERATOR_TOKEN never reaches client JS. */
+export async function createHostedEvent(
+  node: string,
+  body: {
+    slug: string;
+    name: string;
+    venue: string;
+    when: string;
+    zones: string[];
+    event_id: string | undefined;
+  },
+  headers: Record<string, string> = {},
+): Promise<CreateEventResult> {
+  const r = await fetch(`${node}/events`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+  if (r.ok) return { ok: true, event: (await r.json()) as HostedEventAdmin };
+  if (r.status === 409) return { ok: false, reason: "slug_taken" };
+  if (r.status === 400) return { ok: false, reason: "invalid" };
+  return { ok: false, reason: "error" };
 }
 
 export async function pickNode(timeoutMs = 1500): Promise<string | null> {
@@ -128,8 +219,19 @@ async function asJson<T>(r: Response, what: string): Promise<T> {
 export const getHealth = (node: string) =>
   fetch(`${node}/health`).then((r) => asJson<NodeHealth>(r, `${node}/health`));
 
-export const getPhotos = (node: string) =>
-  fetch(`${node}/photos`)
+/** Every read below takes the event the caller is scoped to, as a REQUIRED
+ * parameter typed `string | undefined` -- required so no call site can
+ * forget it exists, `| undefined` so the one legitimate caller that wants
+ * every event merged (the operator console's cluster-wide overview) can
+ * ask for that on purpose rather than by omission. Every guest-facing
+ * route always passes a real event_id (see lib/event.ts's
+ * useCurrentEvent); only routes/console.tsx ever passes undefined. */
+function eventQuery(eventId: string | undefined): string {
+  return eventId ? `event_id=${encodeURIComponent(eventId)}` : "";
+}
+
+export const getPhotos = (node: string, eventId: string | undefined) =>
+  fetch(`${node}/photos${eventId ? `?${eventQuery(eventId)}` : ""}`)
     .then((r) => asJson<{ node: string; photos: RemotePhoto[] }>(r, `${node}/photos`))
     .then((b) => b.photos);
 
@@ -145,6 +247,7 @@ export const postPhoto = (
     composition_score: number;
     vclock: Record<string, number>;
     image_base64: string;
+    event_id: string;
   },
 ) =>
   fetch(`${node}/photos`, {
@@ -286,8 +389,8 @@ export const postLike = (
 // hand since this repo has no shared config between the two languages.
 export const PUBLIC_LIMIT_PER_GUEST = 25;
 
-export const getPublicPhotos = (node: string) =>
-  fetch(`${node}/photos/public`)
+export const getPublicPhotos = (node: string, eventId: string | undefined) =>
+  fetch(`${node}/photos/public${eventId ? `?${eventQuery(eventId)}` : ""}`)
     .then((r) => asJson<{ node: string; photos: RemotePhoto[] }>(r, `${node}/photos/public`))
     .then((b) => b.photos);
 
@@ -337,15 +440,15 @@ export async function deletePhoto(
   return { ok: false, reason: "error" };
 }
 
-export const getZones = (node: string) =>
-  fetch(`${node}/zones`)
+export const getZones = (node: string, eventId: string | undefined) =>
+  fetch(`${node}/zones${eventId ? `?${eventQuery(eventId)}` : ""}`)
     .then((r) => asJson<{ node: string; zones: ZoneScore[] }>(r, `${node}/zones`))
     .then((b) => b.zones);
 
-export const getZonesQuorum = (node: string, R: number, W: number) =>
-  fetch(`${node}/zones/quorum?R=${R}&W=${W}`).then((r) =>
-    asJson<QuorumResult>(r, `${node}/zones/quorum`),
-  );
+export const getZonesQuorum = (node: string, R: number, W: number, eventId: string | undefined) =>
+  fetch(
+    `${node}/zones/quorum?R=${R}&W=${W}${eventId ? `&${eventQuery(eventId)}` : ""}`,
+  ).then((r) => asJson<QuorumResult>(r, `${node}/zones/quorum`));
 
 /** headers is how main.py's OPERATOR_TOKEN gate gets satisfied -- see
  * lib/operatorGateway.ts, the only real caller. A plain browser call
@@ -390,8 +493,19 @@ export async function isolateNode(
   await Promise.allSettled(calls);
 }
 
+/** Targets CLUSTER (absolute 127.0.0.1 URLs), not NODES, for the same
+ * reason isolateNode above does: NODES can be VITE_NODE_URLS' relative
+ * same-origin proxy paths (/n1,/n2,/n3), set for phone testing over
+ * HTTPS -- see vite.config.ts. Those only resolve against a browser's own
+ * page origin. This runs server-side, inside serverHealAll's TanStack
+ * server function (see operatorGateway.ts), where there is no page
+ * origin to resolve a relative URL against -- a bare fetch("/n1/...")
+ * fails, and Promise.allSettled swallows it silently, so "Heal all" would
+ * log success and do nothing whenever a phone-testing VITE_NODE_URLS was
+ * left configured. Confirmed live: the console reported "heal requested"
+ * and the partition never actually cleared until this was fixed. */
 export async function healAllNodes(headers: Record<string, string> = {}): Promise<void> {
-  await Promise.allSettled(NODES.map((url) => chaosHeal(url, headers)));
+  await Promise.allSettled(CLUSTER.map((n) => chaosHeal(n.url, headers)));
 }
 
 /** How many of the N configured nodes already hold each photo_id, right
@@ -399,9 +513,12 @@ export async function healAllNodes(headers: Record<string, string> = {}): Promis
  * partitioned nodes (allSettled): those simply don't contribute a count,
  * which is itself the point -- a low count during a partition is real
  * signal, not a bug to paper over. */
-export async function replicaAcks(photoIds: string[]): Promise<Record<string, number>> {
+export async function replicaAcks(
+  photoIds: string[],
+  eventId: string | undefined,
+): Promise<Record<string, number>> {
   const counts: Record<string, number> = Object.fromEntries(photoIds.map((id) => [id, 0]));
-  const results = await Promise.allSettled(NODES.map((n) => getPhotos(n)));
+  const results = await Promise.allSettled(NODES.map((n) => getPhotos(n, eventId)));
   for (const res of results) {
     if (res.status !== "fulfilled") continue;
     const ids = new Set(res.value.map((p) => p.photo_id));

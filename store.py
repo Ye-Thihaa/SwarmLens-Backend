@@ -23,6 +23,13 @@ CREATE INDEX IF NOT EXISTS idx_events_origin_seq ON events(origin, seq);
 CREATE INDEX IF NOT EXISTS idx_events_kind       ON events(kind);
 """
 
+# Which event a photo belongs to when nothing said. Every photo logged
+# before multi-event hosting existed has no event_id in its payload, and
+# every client that doesn't send one still works -- both land here rather
+# than in a nameless bucket no read can reach. A single-event deployment
+# never has to think about this field at all.
+DEFAULT_EVENT_ID = "default"
+
 
 class Store:
     def __init__(self, path: str, node_id: str):
@@ -157,7 +164,16 @@ class Store:
         )
         return {r["pid"] for r in await cur.fetchall()}
 
-    async def photos(self) -> list[dict]:
+    async def photos(self, event_id: str | None = None) -> list[dict]:
+        """Every photo this node holds, or just one event's when event_id is
+        given. None means "all events merged", which is what every caller
+        predating multi-event hosting (job scanning, /zones with no
+        event_id, load_test.py, dashboard.html) still asks for and still
+        gets. The photo event is the only kind that carries an event_id:
+        likes, aesthetic scores, public marks and delete tombstones all
+        reference a globally-unique photo_id and inherit that photo's
+        event, so there is exactly one place an event membership is
+        recorded and no second one to disagree with it."""
         deleted = await self.deleted_photo_ids()
         cur = await self.db.execute(
             "SELECT * FROM events WHERE kind='photo' ORDER BY created_at"
@@ -166,6 +182,9 @@ class Store:
         for r in await cur.fetchall():
             p = json.loads(r["payload"])
             if p["photo_id"] in deleted:
+                continue
+            p.setdefault("event_id", DEFAULT_EVENT_ID)
+            if event_id is not None and p["event_id"] != event_id:
                 continue
             p.pop("image_base64", None)  # kept out of the list view -- see
             # photo_image_b64 below, which serves it separately so this
@@ -237,7 +256,29 @@ class Store:
             return None
         p = json.loads(row["payload"])
         p.pop("image_base64", None)
+        p.setdefault("event_id", DEFAULT_EVENT_ID)
         return p
+
+    async def events_catalog(self) -> dict[str, dict]:
+        """event_id -> its latest event_created payload (name, venue, zones,
+        join_token). Replayed from the log like every other derived read,
+        so editing an event is just another append and gossip carries it to
+        every node with no new mechanism. Last write wins by created_at --
+        same reasoning as public_state: two operators renaming one event
+        should converge on whichever rename happened last, not merge."""
+        cur = await self.db.execute(
+            "SELECT payload, created_at FROM events WHERE kind='event_created' ORDER BY created_at"
+        )
+        out: dict[str, dict] = {}
+        for r in await cur.fetchall():
+            p = json.loads(r["payload"])
+            # First registration wins the slug (see main.py's
+            # resolve_event), so carry the *original* timestamp forward
+            # across edits rather than letting a rename jump an event
+            # ahead of one that claimed the slug before it.
+            p["created_at"] = out.get(p["event_id"], {}).get("created_at", r["created_at"])
+            out[p["event_id"]] = p
+        return out
 
     async def public_state(self) -> dict[str, dict]:
         """photo_id -> {"public": bool, "guest_id": str}, replayed from
@@ -262,22 +303,35 @@ class Store:
         which merge several nodes' partial views by union-ing raw events
         (idempotent on (origin, seq), same as gossip) and recomputing --
         not by picking one node's already-aggregated counts as 'the'
-        answer."""
+        answer.
+
+        image_base64 is stripped: zone scoring needs a photo's zone and
+        event, never its pixels, and this response crosses the wire to
+        every node a quorum read samples. Shipping the bytes made every
+        /zones/quorum call transfer the whole gallery between nodes --
+        survivable while one event existed, not once a node holds several
+        events' photos at once."""
         placeholders = ",".join("?" for _ in kinds)
         cur = await self.db.execute(
             f"SELECT * FROM events WHERE kind IN ({placeholders})", kinds
         )
-        return [
-            {
-                "origin": r["origin"],
-                "seq": r["seq"],
-                "kind": r["kind"],
-                "payload": json.loads(r["payload"]),
-                "created_at": r["created_at"],
-                "vclock": json.loads(r["vclock"]),
-            }
-            for r in await cur.fetchall()
-        ]
+        out = []
+        for r in await cur.fetchall():
+            payload = json.loads(r["payload"])
+            payload.pop("image_base64", None)
+            if r["kind"] == "photo":
+                payload.setdefault("event_id", DEFAULT_EVENT_ID)
+            out.append(
+                {
+                    "origin": r["origin"],
+                    "seq": r["seq"],
+                    "kind": r["kind"],
+                    "payload": payload,
+                    "created_at": r["created_at"],
+                    "vclock": json.loads(r["vclock"]),
+                }
+            )
+        return out
 
     async def event_count(self) -> int:
         cur = await self.db.execute("SELECT COUNT(*) AS n FROM events")

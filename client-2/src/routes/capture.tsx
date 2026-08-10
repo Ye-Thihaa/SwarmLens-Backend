@@ -6,14 +6,14 @@ import {
   pickNode,
   postAnalyzePreview,
   prettyZone,
-  ZONES,
   type ComposePreview,
   type ZoneScore,
   getZones,
 } from "@/lib/api";
+import { useCurrentEvent } from "@/lib/event";
 import { buildFilterCss, DEFAULT_PRESET, STOCK_PRESETS } from "@/lib/filmStock";
 import { currentGuestId, tick } from "@/lib/guest";
-import { addPhoto, syncOutbox, useOutbox } from "@/lib/outbox";
+import { addPhoto, OutboxWriteError, photosForEvent, syncOutbox, useOutbox } from "@/lib/outbox";
 
 export const Route = createFileRoute("/capture")({
   head: () => ({
@@ -267,8 +267,36 @@ function Capture() {
     color: number;
     palette: number;
   } | null>(null);
+  // USE THIS FRAME used to close the review sheet the instant it was
+  // tapped, regardless of whether the save that followed actually
+  // succeeded -- a full local roll (outbox.ts's ~5-10MB localStorage
+  // ceiling) would throw well after the sheet was already gone, so the
+  // guest saw the shutter "work" and the photo just never showed up in
+  // My roll. Now the sheet stays open, showing SAVING…, until addPhoto
+  // either succeeds (sheet closes) or throws (stays open with a specific
+  // reason and a way to retry the exact same frame).
+  const [savingReview, setSavingReview] = useState(false);
+  const [reviewSaveError, setReviewSaveError] = useState<string | null>(null);
+  // Burst mode has no review sheet to report into -- see the note on
+  // shootOnce -- so a save failure there surfaces here instead, in the
+  // same spot the frame counter already occupies.
+  const [burstSaveError, setBurstSaveError] = useState<string | null>(null);
 
-  const [zone, setZone] = useState(ZONES[0]!);
+  // Which event this phone walked into, and therefore which corners of the
+  // room a frame can be tagged with. Most events are one location, so the
+  // host leaves this at a single zone and the guest is never asked a
+  // question they have no way to answer -- see showZonePicker below.
+  const event = useCurrentEvent();
+
+  // The zone is DERIVED, not stored, so it can't go stale against the
+  // event: a guest who scans a different QR mid-session has their override
+  // dropped the moment it stops being one of that event's zones, rather
+  // than keeping a zone the new room has never heard of.
+  const [zoneOverride, setZoneOverride] = useState<string | null>(null);
+  const zone =
+    zoneOverride && event.zones.includes(zoneOverride) ? zoneOverride : event.zones[0]!;
+  const showZonePicker = event.zones.length > 1;
+
   const [reachable, setReachable] = useState(false);
   const [composing, setComposing] = useState(false);
   const [topZone, setTopZone] = useState<ZoneScore | null>(null);
@@ -299,7 +327,14 @@ function Capture() {
   const [count, setCount] = useState<number | null>(null);
 
   const outbox = useOutbox();
-  const myPhotos = useMemo(() => outbox.filter((o) => o.kind === "photo"), [outbox]);
+  // Only this event's frames. The counter on the viewfinder says how much
+  // of TONIGHT'S roll is still waiting; frames queued at a different event
+  // are still in the outbox and still syncing, they just aren't this
+  // room's business.
+  const myPhotos = useMemo(
+    () => photosForEvent(outbox, event.event_id),
+    [outbox, event.event_id],
+  );
   const queued = myPhotos.filter((o) => !o.synced).length;
   const frame = myPhotos.length;
 
@@ -383,13 +418,19 @@ function Capture() {
   // the live cue from the venue heatmap: real top-scoring zone, polled
   // softly. Disappears the instant the guest picks a zone that's already
   // the leader, or has no opinion to offer yet (fewer than 2 photos).
+  // Scoped to this event -- a single-zone event has nothing to nudge
+  // toward, so this quietly never fires there.
   useEffect(() => {
+    if (!showZonePicker) {
+      setTopZone(null);
+      return;
+    }
     let cancelled = false;
     async function poll() {
       const node = await pickNode();
       if (!node || cancelled) return;
       try {
-        const zones = await getZones(node);
+        const zones = await getZones(node, event.event_id);
         const ranked = zones
           .filter((z) => z.photos >= 2)
           .sort((a, b) => b.likes * 2 + b.photos - (a.likes * 2 + a.photos));
@@ -404,7 +445,7 @@ function Capture() {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [event.event_id, showZonePicker]);
 
   // Live composition guidance, one analysis at a time (recursive timeout, not
   // setInterval, so a slow node can never stack up overlapping requests).
@@ -622,15 +663,27 @@ function Capture() {
       async (blob) => {
         if (!blob) return;
         const image_base64 = await blobToBase64(blob);
-        addPhoto({
-          local_id: crypto.randomUUID(),
-          guest_id: currentGuestId(),
-          zone,
-          composition_score: 0,
-          vclock: tick(),
-          image_base64,
-        });
-        void syncOutbox();
+        try {
+          addPhoto({
+            local_id: crypto.randomUUID(),
+            guest_id: currentGuestId(event.event_id),
+            zone,
+            composition_score: 0,
+            vclock: tick(),
+            image_base64,
+            event_id: event.event_id,
+          });
+          void syncOutbox();
+        } catch (e) {
+          // No review sheet to hold this failure open in -- burst mode
+          // queues straight to the outbox, so this is the only place a
+          // guest can learn a burst frame didn't save.
+          setBurstSaveError(
+            e instanceof OutboxWriteError && e.quotaExceeded
+              ? "Your roll is full — delete a photo in My roll to free space."
+              : "A burst frame didn't save. Check your roll.",
+          );
+        }
       },
       "image/jpeg",
       0.85,
@@ -677,14 +730,22 @@ function Capture() {
 
   /** RETAKE: discard the frozen frame, back to the live viewfinder. */
   function retakeReview() {
+    setReviewSaveError(null);
     setReviewing(null);
   }
 
   /** USE THIS FRAME: bakes TONE/COLOR/PALETTE into real pixels via
    * ctx.filter (not just a CSS preview that vanishes on save) and only
-   * then queues it -- same offline-first outbox path as a normal shot. */
+   * then queues it -- same offline-first outbox path as a normal shot.
+   * The sheet does NOT close until that save has actually succeeded --
+   * it used to close unconditionally right after scheduling the
+   * toBlob/addPhoto work, so a guest whose local roll was full (outbox.ts's
+   * ~5-10MB localStorage ceiling) would watch this button appear to work
+   * while the photo silently never reached the outbox. */
   function confirmReview() {
     if (!reviewing) return;
+    setReviewSaveError(null);
+    setSavingReview(true);
     const filterCss = buildFilterCss(
       filmStocks[reviewing.stock]!.key,
       reviewing.tone,
@@ -701,27 +762,46 @@ function Capture() {
     if (stamp) drawStamp(out, today);
     out.toBlob(
       async (blob) => {
-        if (!blob) return;
-        const image_base64 = await blobToBase64(blob);
-        addPhoto({
-          local_id: crypto.randomUUID(),
-          guest_id: currentGuestId(),
-          zone,
-          composition_score: 0,
-          vclock: tick(),
-          image_base64,
-        });
-        void syncOutbox();
+        if (!blob) {
+          setSavingReview(false);
+          setReviewSaveError("Couldn't process this frame — try again.");
+          return;
+        }
+        try {
+          const image_base64 = await blobToBase64(blob);
+          addPhoto({
+            local_id: crypto.randomUUID(),
+            guest_id: currentGuestId(event.event_id),
+            zone,
+            composition_score: 0,
+            vclock: tick(),
+            image_base64,
+            // Stamped at queue time from the event this shot was actually
+            // taken at -- never re-read at sync time. See OutboxPhoto.event_id.
+            event_id: event.event_id,
+          });
+          void syncOutbox();
+          // Only now, once the frame is actually in the outbox: carry the
+          // review's stock choice back to the live strip so the next shot
+          // starts from what was just confirmed (and stop the AI pick from
+          // silently overriding a choice the guest just acted on), then
+          // close the sheet.
+          stockTouched.current = true;
+          setStock(reviewing.stock);
+          setSavingReview(false);
+          setReviewing(null);
+        } catch (e) {
+          setSavingReview(false);
+          setReviewSaveError(
+            e instanceof OutboxWriteError && e.quotaExceeded
+              ? "Your roll is full — delete a photo in My roll, then try again."
+              : "Couldn't save this frame — try again.",
+          );
+        }
       },
       "image/jpeg",
       0.9,
     );
-    // Carry the review's stock choice back to the live strip so the next
-    // shot starts from what was just confirmed, and stop the AI pick from
-    // silently overriding a choice the guest just acted on.
-    stockTouched.current = true;
-    setStock(reviewing.stock);
-    setReviewing(null);
   }
 
   const today = "26 07 08";
@@ -999,25 +1079,52 @@ function Capture() {
           </div>
         </div>
 
-        {/* zone strip: which corner of the room this frame belongs to */}
-        <div className="absolute inset-x-0 top-16 px-4">
-          <p className="font-mono text-[0.5rem] tracking-[0.18em] text-fixer-dim">STANDING AT</p>
-          <div className="mt-1 flex flex-wrap gap-1.5">
-            {ZONES.map((z) => (
-              <button
-                key={z}
-                onClick={() => setZone(z)}
-                className={`rounded-sm border px-2 py-1 font-mono text-[0.58rem] tracking-widest capitalize transition ${
-                  z === zone
-                    ? "border-drifting bg-drifting/20 text-drifting"
-                    : "border-fixer/20 bg-emulsion/60 text-fixer-dim"
-                }`}
-              >
-                {prettyZone(z)}
-              </button>
-            ))}
+        {burstSaveError && (
+          <button
+            onClick={() => setBurstSaveError(null)}
+            // Below the zone picker (top-16, "PART OF THE DAY") when it's
+            // showing, so the two never overlap for a multi-zone event.
+            className={`absolute inset-x-4 z-20 rounded-sm border border-safelight/50 bg-safelight/15 px-3 py-2 text-center text-[0.7rem] leading-relaxed text-safelight backdrop-blur ${
+              showZonePicker ? "top-28" : "top-16"
+            }`}
+          >
+            {burstSaveError}
+            <span className="ml-1.5 font-mono text-[0.55rem] tracking-widest text-safelight/70">
+              TAP TO DISMISS
+            </span>
+          </button>
+        )}
+
+        {/* Which part of the event this frame belongs to. Shown ONLY when
+            the host actually divided the day into more than one part
+            (ceremony / reception) -- a wedding at a single venue is one
+            place, and the old "STANDING AT" strip asked every guest to
+            classify their own location on every shot, which is both work
+            and a question they can't reliably answer. The zone itself
+            never goes away: it still rides on the photo event and still
+            drives the consistent-hash ring, /zones and quorum reads. */}
+        {showZonePicker && (
+          <div className="absolute inset-x-0 top-16 px-4">
+            <p className="font-mono text-[0.5rem] tracking-[0.18em] text-fixer-dim">
+              PART OF THE DAY
+            </p>
+            <div className="mt-1 flex flex-wrap gap-1.5">
+              {event.zones.map((z) => (
+                <button
+                  key={z}
+                  onClick={() => setZoneOverride(z)}
+                  className={`rounded-sm border px-2 py-1 font-mono text-[0.58rem] tracking-widest capitalize transition ${
+                    z === zone
+                      ? "border-drifting bg-drifting/20 text-drifting"
+                      : "border-fixer/20 bg-emulsion/60 text-fixer-dim"
+                  }`}
+                >
+                  {prettyZone(z)}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
 
         {/* composition guidance — photography language only */}
         <div className="pointer-events-none absolute inset-0">
@@ -1039,9 +1146,15 @@ function Capture() {
               At 375px wide the chips already wrap to two rows and end at
               y=133; 10rem leaves room for a third row on a narrower phone
               while still sitting well above the nudge at the viewfinder's
-              centre (y~345). */}
+              centre (y~345). With no chips (a single-zone event, the common
+              case now) there is nothing to clear, so it moves back up
+              rather than leaving a band of dead space under the readout. */}
           {aiOn && (
-            <div className="absolute inset-x-0 top-[10rem] flex flex-col items-center gap-1 px-4">
+            <div
+              className={`absolute inset-x-0 flex flex-col items-center gap-1 px-4 ${
+                showZonePicker ? "top-[10rem]" : "top-20"
+              }`}
+            >
               {ai ? (
                 <span className="max-w-full rounded-sm bg-emulsion/85 px-2 py-1 text-center font-mono text-[0.55rem] leading-relaxed tracking-[0.1em] text-fixer">
                   {ai.reason}
@@ -1345,18 +1458,26 @@ function Capture() {
                 />
               </div>
 
+              {reviewSaveError && (
+                <p className="mt-3 rounded-sm border border-safelight/50 bg-safelight/10 px-3 py-2 text-center text-[0.7rem] leading-relaxed text-safelight">
+                  {reviewSaveError}
+                </p>
+              )}
+
               <div className="mt-4 flex gap-3">
                 <button
                   onClick={retakeReview}
-                  className="flex-1 rounded-sm border border-fixer/30 py-2.5 font-mono text-[0.6rem] tracking-widest text-fixer-dim active:scale-95"
+                  disabled={savingReview}
+                  className="flex-1 rounded-sm border border-fixer/30 py-2.5 font-mono text-[0.6rem] tracking-widest text-fixer-dim active:scale-95 disabled:opacity-40"
                 >
                   RETAKE
                 </button>
                 <button
                   onClick={confirmReview}
-                  className="flex-1 rounded-sm border border-drifting bg-drifting/20 py-2.5 font-mono text-[0.6rem] font-bold tracking-widest text-drifting active:scale-95"
+                  disabled={savingReview}
+                  className="flex-1 rounded-sm border border-drifting bg-drifting/20 py-2.5 font-mono text-[0.6rem] font-bold tracking-widest text-drifting active:scale-95 disabled:opacity-60"
                 >
-                  USE THIS FRAME
+                  {savingReview ? "SAVING…" : reviewSaveError ? "TRY AGAIN" : "USE THIS FRAME"}
                 </button>
               </div>
             </div>
