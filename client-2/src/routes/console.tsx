@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { NodeState } from "@/operator/cluster";
 import {
   CLUSTER,
@@ -9,12 +9,19 @@ import {
   getZones,
   getZonesQuorum,
   prettyZone,
+  type HostedEventAdmin,
   type NodeHealth,
   type QuorumResult,
   type ZoneScore,
 } from "@/lib/api";
 import { checkConsoleSession, loginToConsole, logoutOfConsole } from "@/lib/consoleAuth";
-import { serverHealAll, serverIsolateNode } from "@/lib/operatorGateway";
+import {
+  serverCreateEvent,
+  serverHealAll,
+  serverIsolateNode,
+  serverListEvents,
+} from "@/lib/operatorGateway";
+import { joinQrSvg, printJoinCard } from "@/lib/qr";
 
 /** APP B — Operator Console. One operator, laptop → room display. No camera.
  * Real server-side gate (see lib/consoleAuth.ts): the loader checks the
@@ -86,6 +93,115 @@ function Console() {
     Record<string, { term: number; leader: string | null; partitioned: string[] }>
   >({});
 
+  // ---- hosted events: the multi-tenant directory this console alone can see ----
+  const [events, setEvents] = useState<HostedEventAdmin[]>([]);
+  const [eventsLoaded, setEventsLoaded] = useState(false);
+  // undefined = every event merged -- the same cluster-wide view this
+  // console always showed before multi-event hosting existed. Selecting a
+  // real event scopes the room stats, the aesthetic map and the quorum
+  // panel below to that one event, so "which room is this reading?" is
+  // never ambiguous once more than one exists.
+  const [selectedEventId, setSelectedEventId] = useState<string | undefined>(undefined);
+
+  const [newSlug, setNewSlug] = useState("");
+  const [newName, setNewName] = useState("");
+  const [newVenue, setNewVenue] = useState("");
+  const [newZones, setNewZones] = useState("");
+  const [creatingEvent, setCreatingEvent] = useState(false);
+  const [createEventError, setCreateEventError] = useState<string | null>(null);
+
+  // Where a printed QR should actually point. Defaults to this page's own
+  // origin, which is exactly wrong for a guest's phone whenever the
+  // console itself was opened at localhost/127.0.0.1 -- see the warning
+  // rendered below. Persisted so an operator only has to correct it once
+  // per venue, not once per event card.
+  const [publicBaseUrl, setPublicBaseUrl] = useState("");
+  useEffect(() => {
+    const saved = localStorage.getItem("swarmlens_public_base_url");
+    setPublicBaseUrl(saved || window.location.origin);
+  }, []);
+  useEffect(() => {
+    if (publicBaseUrl) localStorage.setItem("swarmlens_public_base_url", publicBaseUrl);
+  }, [publicBaseUrl]);
+  const baseUrlIsLocal = /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(publicBaseUrl);
+
+  const [qrOpenId, setQrOpenId] = useState<string | null>(null);
+  const [qrSvgById, setQrSvgById] = useState<Record<string, string>>({});
+
+  async function loadEvents() {
+    const list = await serverListEvents();
+    setEvents(list);
+    setEventsLoaded(true);
+  }
+
+  useEffect(() => {
+    if (!unlocked) return;
+    void loadEvents();
+    const id = setInterval(() => void loadEvents(), 5000);
+    return () => clearInterval(id);
+  }, [unlocked]);
+
+  async function createEvent(e: FormEvent) {
+    e.preventDefault();
+    setCreateEventError(null);
+    setCreatingEvent(true);
+    try {
+      const zones = newZones
+        .split(",")
+        .map((z) => z.trim().toLowerCase().replace(/\s+/g, "_"))
+        .filter(Boolean);
+      const res = await serverCreateEvent({
+        data: { slug: newSlug.trim().toLowerCase(), name: newName.trim(), venue: newVenue.trim(), when: "", zones },
+      });
+      if (!res.ok) {
+        setCreateEventError(
+          res.reason === "slug_taken"
+            ? `The slug "${newSlug}" is already in use by another event.`
+            : res.reason === "invalid"
+              ? "Needs at least a slug (letters, digits, dashes) and a name."
+              : "Couldn't reach the cluster to create the event.",
+        );
+        return;
+      }
+      setNewSlug("");
+      setNewName("");
+      setNewVenue("");
+      setNewZones("");
+      await loadEvents();
+      setSelectedEventId(res.event.event_id);
+      push(`event created: ${res.event.name} (${res.event.slug})`, "ok");
+    } finally {
+      setCreatingEvent(false);
+    }
+  }
+
+  async function toggleQr(ev: HostedEventAdmin) {
+    if (qrOpenId === ev.event_id) {
+      setQrOpenId(null);
+      return;
+    }
+    setQrOpenId(ev.event_id);
+    if (!qrSvgById[ev.event_id]) {
+      const url = joinUrl(ev);
+      const svg = await joinQrSvg(url);
+      setQrSvgById((m) => ({ ...m, [ev.event_id]: svg }));
+    }
+  }
+
+  function joinUrl(ev: HostedEventAdmin): string {
+    return `${publicBaseUrl || window.location.origin}/join/${ev.slug}?k=${ev.join_token}`;
+  }
+
+  async function copyJoinUrl(ev: HostedEventAdmin) {
+    await navigator.clipboard.writeText(joinUrl(ev));
+    push(`copied join link for ${ev.name}`, "ok");
+  }
+
+  const selectedEvent = useMemo(
+    () => events.find((e) => e.event_id === selectedEventId),
+    [events, selectedEventId],
+  );
+
   function push(text: string, kind: Log["kind"]) {
     const t = new Date().toLocaleTimeString("en-GB", { hour12: false });
     setLog((l) => [{ t, text, kind }, ...l].slice(0, 8));
@@ -116,7 +232,10 @@ function Console() {
       const anyNode = CLUSTER.find((n) => next[n.id])?.url;
       if (anyNode) {
         try {
-          const [ps, zs] = await Promise.all([getPhotos(anyNode), getZones(anyNode)]);
+          const [ps, zs] = await Promise.all([
+            getPhotos(anyNode, selectedEventId),
+            getZones(anyNode, selectedEventId),
+          ]);
           if (!cancelled) {
             setFrames(ps.length);
             setGuests(new Set(ps.map((p) => p.guest_id)).size);
@@ -168,7 +287,7 @@ function Console() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [unlocked]);
+  }, [unlocked, selectedEventId]);
 
   const healthy = CLUSTER.map((n) => health[n.id]).filter((h): h is NodeHealth => !!h);
   const leaderIds = new Set(healthy.map((h) => h.raft.leader_id).filter((x): x is string => !!x));
@@ -220,7 +339,7 @@ function Console() {
   async function runQuorumRead() {
     setQuorumRunning(true);
     try {
-      const result = await getZonesQuorum(CLUSTER[0]!.url, r, w);
+      const result = await getZonesQuorum(CLUSTER[0]!.url, r, w, selectedEventId);
       setQuorum(result);
       const unreachableNote =
         result.unreachable.length > 0
@@ -363,8 +482,179 @@ function Console() {
         </div>
       </section>
 
+      {/* Hosted events: this cluster's multi-tenant directory. Every panel
+          below (room stats, aesthetic map, quorum) reads whichever event
+          is selected here -- undefined ("All events") merges every
+          event's data, which is the only view that ever existed before
+          hosted events did. */}
+      <section className="mt-5 rounded-sm border border-border bg-card p-4">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h2 className="text-lg font-bold">Hosted events</h2>
+          <label className="flex items-center gap-2 font-mono text-xs text-fixer-dim">
+            VIEWING
+            <select
+              value={selectedEventId ?? ""}
+              onChange={(e) => setSelectedEventId(e.target.value || undefined)}
+              className="rounded-sm border border-input bg-emulsion px-2 py-1 text-xs"
+            >
+              <option value="">All events (merged)</option>
+              {events.map((ev) => (
+                <option key={ev.event_id} value={ev.event_id}>
+                  {ev.name} ({ev.slug})
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {/* Where a scanned QR should send a phone. Defaults to this
+            page's own origin, which is exactly wrong if this console was
+            opened at localhost/127.0.0.1 -- a phone scanning that QR has
+            no idea what "localhost" means on its own network. */}
+        <div className="mt-3">
+          <label className="block font-mono text-[0.65rem] tracking-widest text-fixer-dim">
+            PUBLIC URL FOR PRINTED QR CODES
+          </label>
+          <input
+            value={publicBaseUrl}
+            onChange={(e) => setPublicBaseUrl(e.target.value)}
+            placeholder="https://your-venue-domain.example"
+            className="mt-1 w-full max-w-md rounded-sm border border-input bg-emulsion px-3 py-1.5 font-mono text-xs"
+          />
+          {baseUrlIsLocal && (
+            <p className="mt-1 max-w-md text-[0.7rem] leading-relaxed text-safelight">
+              This points at {publicBaseUrl || "localhost"}, which only means something on THIS
+              machine. A guest's phone needs the venue's real LAN IP or public domain here before
+              you print anything.
+            </p>
+          )}
+        </div>
+
+        <form onSubmit={createEvent} className="mt-4 grid gap-2 border-t border-border pt-4 sm:grid-cols-2">
+          <input
+            value={newSlug}
+            onChange={(e) => setNewSlug(e.target.value)}
+            placeholder="slug (e.g. hollis-marchetti)"
+            required
+            className="rounded-sm border border-input bg-emulsion px-3 py-2 font-mono text-xs"
+          />
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="Event name"
+            required
+            className="rounded-sm border border-input bg-emulsion px-3 py-2 text-sm"
+          />
+          <input
+            value={newVenue}
+            onChange={(e) => setNewVenue(e.target.value)}
+            placeholder="Venue (optional)"
+            className="rounded-sm border border-input bg-emulsion px-3 py-2 text-sm"
+          />
+          <input
+            value={newZones}
+            onChange={(e) => setNewZones(e.target.value)}
+            placeholder="Zones, comma-separated (blank = single room, no picker)"
+            className="rounded-sm border border-input bg-emulsion px-3 py-2 font-mono text-xs"
+          />
+          <div className="sm:col-span-2">
+            {createEventError && (
+              <p className="mb-2 text-xs text-safelight">{createEventError}</p>
+            )}
+            <button
+              disabled={creatingEvent}
+              className="rounded-sm bg-fixer px-4 py-2 text-sm font-semibold text-emulsion disabled:opacity-50"
+            >
+              {creatingEvent ? "Creating…" : "Create event"}
+            </button>
+          </div>
+        </form>
+
+        <ul className="mt-4 space-y-2 border-t border-border pt-4">
+          {!eventsLoaded && (
+            <li className="font-mono text-[0.62rem] text-stale">loading events…</li>
+          )}
+          {eventsLoaded && events.length === 0 && (
+            <li className="font-mono text-[0.62rem] tracking-widest text-stale">
+              NO EVENTS HOSTED YET. CREATE ONE ABOVE.
+            </li>
+          )}
+          {events.map((ev) => (
+            <li key={ev.event_id} className="rounded-sm border border-border p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold">{ev.name}</p>
+                  <p className="font-mono text-[0.6rem] tracking-widest text-fixer-dim">
+                    /{ev.slug} · {ev.zones.length > 1 ? `${ev.zones.length} zones` : "single room"}
+                    {ev.venue ? ` · ${ev.venue}` : ""}
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  <button
+                    onClick={() => setSelectedEventId(ev.event_id)}
+                    className={`rounded-sm border px-2 py-1 font-mono text-[0.6rem] tracking-widest ${
+                      selectedEventId === ev.event_id
+                        ? "border-drifting text-drifting"
+                        : "border-border text-fixer-dim"
+                    }`}
+                  >
+                    VIEW
+                  </button>
+                  <button
+                    onClick={() => void copyJoinUrl(ev)}
+                    className="rounded-sm border border-border px-2 py-1 font-mono text-[0.6rem] tracking-widest text-fixer-dim"
+                  >
+                    COPY LINK
+                  </button>
+                  <button
+                    onClick={() => void toggleQr(ev)}
+                    className="rounded-sm border border-border px-2 py-1 font-mono text-[0.6rem] tracking-widest text-fixer-dim"
+                  >
+                    {qrOpenId === ev.event_id ? "HIDE QR" : "SHOW QR"}
+                  </button>
+                </div>
+              </div>
+              {qrOpenId === ev.event_id && (
+                <div className="mt-3 flex flex-wrap items-center gap-4 border-t border-border pt-3">
+                  {qrSvgById[ev.event_id] ? (
+                    <div
+                      className="h-32 w-32 shrink-0 bg-white p-1.5"
+                      // qrcode's toString(svg) output is our own generated
+                      // markup, not user input -- nothing here ever comes
+                      // from a guest or another operator.
+                      dangerouslySetInnerHTML={{ __html: qrSvgById[ev.event_id]! }}
+                    />
+                  ) : (
+                    <p className="font-mono text-[0.6rem] text-stale">rendering…</p>
+                  )}
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <p className="break-all font-mono text-[0.6rem] text-fixer-dim">
+                      {joinUrl(ev)}
+                    </p>
+                    <button
+                      disabled={!qrSvgById[ev.event_id]}
+                      onClick={() =>
+                        qrSvgById[ev.event_id] &&
+                        printJoinCard(qrSvgById[ev.event_id]!, ev.name, ev.venue)
+                      }
+                      className="rounded-sm border border-border px-3 py-1.5 font-mono text-[0.6rem] tracking-widest disabled:opacity-40"
+                    >
+                      PRINT TABLE CARD
+                    </button>
+                  </div>
+                </div>
+              )}
+            </li>
+          ))}
+        </ul>
+      </section>
+
       <div className="mt-5 grid gap-5 lg:grid-cols-[2fr_1fr]">
         <div className="space-y-5">
+          <p className="label-mono">
+            {selectedEvent ? `Reading: ${selectedEvent.name}` : "Reading: every hosted event, merged"}
+          </p>
+
           {/* room state, reframed as system state */}
           <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
             {[

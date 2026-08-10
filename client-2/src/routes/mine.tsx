@@ -11,8 +11,9 @@ import {
   replicaAcks,
   setPhotoPublic,
 } from "@/lib/api";
+import { useCurrentEvent } from "@/lib/event";
 import { currentDeviceId, currentGuestId, tick } from "@/lib/guest";
-import { removePhoto, syncOutbox, useOutbox, type OutboxPhoto } from "@/lib/outbox";
+import { photosForEvent, removePhoto, syncOutbox, useOutbox, type OutboxPhoto } from "@/lib/outbox";
 
 export const Route = createFileRoute("/mine")({
   head: () => ({
@@ -50,18 +51,20 @@ function Mine() {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const event = useCurrentEvent();
   const outbox = useOutbox();
+  // "Your roll" means your roll AT THIS EVENT. The same phone at two events
+  // is two guests with two rolls -- see guest.ts's currentGuestId -- so
+  // mixing them here would show frames this guest_id doesn't even own and
+  // couldn't publish or delete.
   const roll = useMemo(
-    () =>
-      outbox
-        .filter((o): o is OutboxPhoto => o.kind === "photo")
-        .sort((a, b) => b.created_at - a.created_at),
-    [outbox],
+    () => photosForEvent(outbox, event.event_id).sort((a, b) => b.created_at - a.created_at),
+    [outbox, event.event_id],
   );
 
   useEffect(() => {
-    setWho({ guest: currentGuestId(), device: currentDeviceId() });
-  }, []);
+    setWho({ guest: currentGuestId(event.event_id), device: currentDeviceId() });
+  }, [event.event_id]);
 
   // Real replica counts: how many of the N configured nodes have already
   // gossiped each of this device's synced photos in. Polled, not
@@ -71,7 +74,7 @@ function Mine() {
     if (photoIds.length === 0) return;
     let cancelled = false;
     async function poll() {
-      const result = await replicaAcks(photoIds);
+      const result = await replicaAcks(photoIds, event.event_id);
       if (!cancelled) setAcks(result);
     }
     void poll();
@@ -81,7 +84,7 @@ function Mine() {
       clearInterval(id);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roll.map((p) => p.photo_id).join(",")]);
+  }, [roll.map((p) => p.photo_id).join(","), event.event_id]);
 
   // This guest's own slice of GET /photos/public, polled the same way
   // everything else on this page is -- so a device that goes public from
@@ -96,7 +99,7 @@ function Mine() {
       setNode(n);
       if (!n) return;
       try {
-        const pub = await getPublicPhotos(n);
+        const pub = await getPublicPhotos(n, event.event_id);
         if (!cancelled) {
           setPublicIds(new Set(pub.filter((p) => p.guest_id === who!.guest).map((p) => p.photo_id)));
         }
@@ -110,7 +113,7 @@ function Mine() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [who]);
+  }, [who, event.event_id]);
 
   async function togglePublic(p: OutboxPhoto) {
     if (!node || !p.photo_id || !who) return;

@@ -8,6 +8,8 @@
  * from client handlers/effects, never from a route loader's render body.
  */
 
+import { DEFAULT_EVENT_ID } from "./event";
+
 const DEVICE_ID_KEY = "swarmlens_device_id";
 const GUEST_ID_KEY = "swarmlens_guest_id";
 const CLOCK_KEY = "swarmlens_vclock";
@@ -31,12 +33,24 @@ export function currentDeviceId(): string {
   return id;
 }
 
-export function currentGuestId(): string {
+/** Guest identity is per EVENT, not per browser: the same phone at a
+ * wedding and at a donation ceremony is two separate guests, with two
+ * separate rolls and two separate public-gallery quotas (main.py enforces
+ * the cap per guest per event). Sharing one id would put both events'
+ * frames in one "my roll" and spend one event's quota on the other's.
+ *
+ * The default event deliberately keeps the un-suffixed legacy key. Photos
+ * already in the log are owned by whatever guest_id that key holds, and
+ * main.py checks ownership against the photo's own record -- renaming the
+ * key would quietly cost this browser the right to publish or delete
+ * everything it had already shot. */
+export function currentGuestId(eventId: string = DEFAULT_EVENT_ID): string {
   if (typeof window === "undefined") return "guest";
-  let id = localStorage.getItem(GUEST_ID_KEY);
+  const key = eventId === DEFAULT_EVENT_ID ? GUEST_ID_KEY : `${GUEST_ID_KEY}:${eventId}`;
+  let id = localStorage.getItem(key);
   if (!id) {
     id = randomGuestName();
-    localStorage.setItem(GUEST_ID_KEY, id);
+    localStorage.setItem(key, id);
   }
   return id;
 }

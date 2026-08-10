@@ -23,13 +23,16 @@ the consistent-hashing ring matches how peers already refer to it.
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/photos` | upload (guest_id, zone, composition_score, optional vclock) |
-| GET  | `/photos` | gallery as this node currently sees it; each photo carries `vclock` + `concurrent_with` |
+| POST | `/events` | register or edit a hosted event (slug, name, venue, zones) — gated by `OPERATOR_TOKEN` |
+| GET  | `/events` | operator's directory of every hosted event, join tokens included — gated |
+| GET  | `/events/{slug}?k=` | resolve a scanned QR: slug + join token → `{event_id, name, venue, zones, ...}` (no token echoed back) |
+| POST | `/photos` | upload (guest_id, zone, composition_score, optional event_id, optional vclock) |
+| GET  | `/photos?event_id=` | gallery as this node currently sees it, scoped to one hosted event when given; each photo carries `vclock` + `concurrent_with` |
 | POST | `/likes`  | like a photo (guest_id, photo_id, optional vclock) |
-| GET  | `/zones`  | emergent aesthetic map, ranked; each zone's score comes from its owning node on the hash ring (`stale: true` if that node is unreachable) |
-| GET  | `/zones/local` | this node's own replica of every zone, no ownership filtering — what peers proxy to |
-| GET  | `/zones/ring` | debug: current ring membership and the zone → owner mapping |
-| GET  | `/zones/quorum?R=&W=` | quorum read: union raw events from R of N random nodes and recompute; W is echoed back for the CAP narrative only |
+| GET  | `/zones?event_id=` | emergent aesthetic map, ranked, scoped to one event when given; each zone's score comes from its owning node on the hash ring (`stale: true` if that node is unreachable) |
+| GET  | `/zones/local?event_id=` | this node's own replica of every zone, no ownership filtering — what peers proxy to |
+| GET  | `/zones/ring?event_id=` | debug: current ring membership and the zone → owner mapping |
+| GET  | `/zones/quorum?R=&W=&event_id=` | quorum read: union raw events from R of N random nodes and recompute; W is echoed back for the CAP narrative only |
 | GET  | `/zones/events` | this node's raw photo/like/aesthetic_score events, undigested — what quorum reads fetch from each sampled peer |
 | POST | `/analyze` | photo_id + image_base64 -> {ar_guide, suggested_filter, aesthetic_score}; writes an aesthetic_score event |
 | POST | `/analyze/preview` | live viewfinder: image_base64 + aspect -> subject box, crop rect + zoom, camera-move guide, film-stock picks, reason sentence. Writes **nothing**; sheds with 503 when busy |
@@ -120,6 +123,68 @@ Demo the tradeoff live:
 `python test_quorum.py` runs this exact scenario automatically: R=1 over
 30 tries came back fresh 21 and stale 9 times, R=2 was fresh 20/20, and
 R=1 was fresh 10/10 again after healing.
+
+## Multi-event hosting (QR join)
+
+One cluster, several events at once — a wedding and a donation ceremony
+booked the same weekend, both on the same three nodes and the same
+append-only log, kept apart everywhere a guest or the ring can see:
+`GET /photos`, `GET /photos/public`, `GET /zones`, and `GET
+/zones/quorum` all take `event_id` and never merge across it, and the
+consistent-hash ring keys on `f"{event_id}/{zone}"` (`main.py`'s
+`ring_key`) so two events both naming a zone "main" land on different
+owners rather than sharing one node's score. Photos logged before this
+existed have no `event_id` at all; every derived read treats that as the
+`"default"` event (`store.DEFAULT_EVENT_ID`), so they stay reachable
+under that name rather than becoming orphaned.
+
+An event is registered with `POST /events` (gated by `OPERATOR_TOKEN`,
+same as `/chaos/*`) and appends an ordinary `event_created` event — no
+new table, gossiped and replayed exactly like a photo:
+
+    curl -X POST localhost:8001/events -H 'content-type: application/json' \
+      -d '{"slug":"hollis-marchetti","name":"Hollis x Marchetti","venue":"Cordwainers Hall","zones":["ceremony","reception"]}'
+    # -> {"ok":true,"event_id":"ev_xxxx","join_token":"...", ...}
+
+A guest's phone never enumerates events (`GET /events` is gated for
+exactly that reason — a wedding's guests have no business listing the
+funeral booked the same weekend). It resolves exactly one, by slug plus
+the join token printed on that event's own QR:
+
+    curl 'localhost:8001/events/hollis-marchetti?k=<join_token>'
+    # -> {"event": {"event_id":"ev_xxxx","zones":["ceremony","reception"],...}}
+    curl 'localhost:8001/events/hollis-marchetti'          # no token -> 404
+    curl 'localhost:8001/events/hollis-marchetti?k=wrong'  # wrong token -> 404
+
+`k` is not authentication, the same way `GET /photos/public` needs no
+guest identity to view — it only stops a guest who mistypes or guesses a
+slug from wandering into someone else's event. `client-2`'s
+`/join/$slug?k=` route (`routes/join.$slug.tsx`) is what a scanned QR
+actually opens: it calls this endpoint once, stores the result in
+`lib/event.ts`, and sends the guest on into `/capture`. Every other guest
+screen reads the joined event from there — never from a URL param again
+— including which zones (if more than one) show a picker on the capture
+screen at all; a single-zone event shows none.
+
+The operator console's **Hosted events** panel (`routes/console.tsx`) is
+where an operator actually creates events day-to-day: a form posting
+through `lib/operatorGateway.ts`'s `serverCreateEvent` (so
+`OPERATOR_TOKEN` never reaches the browser, same pattern as the chaos
+actions), a per-event QR rendered client-side with the `qrcode` package,
+and a **PUBLIC URL FOR PRINTED QR CODES** field that warns when it's
+still pointed at `localhost`/`127.0.0.1` — a real phone scanning that QR
+has no idea what "localhost" means on its own network. Selecting an
+event in the console scopes the room stats, aesthetic map, and quorum
+panel to it; the default is every event merged, the same view that
+existed before hosted events did.
+
+`python test_events.py` runs the isolation guarantees above against 3
+live, gossiping nodes: two events created on two different nodes with
+matching zone names, confirmed to replicate, resolve, and stay separate
+in `/photos`, `/zones`, `/zones/quorum` (at R=1/2/3), and the per-guest
+public-gallery cap (which is per guest *per event* — the same phone at
+two events is two separate guests, see `client-2/src/lib/guest.ts`) —
+plus a legacy no-`event_id` photo staying reachable throughout.
 
 ## AI analysis engine
 
@@ -329,9 +394,11 @@ branded guest UI.
 
 The actual branded frontend -- two separate apps (guest app, operator
 console) sharing one design system -- wired to this backend in full:
-real camera capture, real zone picker, real offline outbox, real
-gallery/likes/heatmap, and an operator console with real Raft/gossip
-state, a real event tape, and real chaos actions.
+real camera capture (zone picker only when an event actually has more
+than one zone), a real QR join flow into whichever event was scanned,
+real offline outbox, real gallery/likes/heatmap, and an operator console
+with real Raft/gossip state, a hosted-events manager with printable QR
+codes, a real event tape, and real chaos actions.
 
     npm --prefix client-2 run dev -- --host
 

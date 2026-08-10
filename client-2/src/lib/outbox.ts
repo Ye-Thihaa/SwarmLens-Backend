@@ -10,6 +10,7 @@
 
 import { useSyncExternalStore } from "react";
 import { pickNode, postAnalyze, postLike, postPhoto } from "./api";
+import { DEFAULT_EVENT_ID } from "./event";
 
 export type OutboxPhoto = {
   local_id: string;
@@ -23,6 +24,14 @@ export type OutboxPhoto = {
   synced: boolean;
   photo_id?: string;
   error?: string;
+  /** The event this frame was SHOT at, captured at queue time and never
+   * re-read from the current event when it finally syncs. That distinction
+   * is the whole point: a guest shooting offline at a wedding, then
+   * walking into the next room and scanning that event's QR, would
+   * otherwise have their queued wedding frames drain into the second
+   * event -- visible to a roomful of strangers, not a UI glitch. Absent on
+   * rows queued before hosted events existed; treated as "default". */
+  event_id?: string;
 };
 
 export type OutboxLike = {
@@ -40,6 +49,22 @@ export type OutboxItem = OutboxPhoto | OutboxLike;
 
 const STORAGE_KEY = "swarmlens_outbox";
 
+/** Thrown when a write to the outbox's backing localStorage fails --
+ * almost always because the ~5-10MB per-origin quota (see this file's
+ * module docstring) got hit by the accumulated base64 JPEGs of a long
+ * shooting session. `quotaExceeded` lets a caller give the guest a
+ * specific, actionable message ("your roll is full") instead of a generic
+ * failure, since the fix (delete a photo, or sync while online) is
+ * different from any other kind of write failure. */
+export class OutboxWriteError extends Error {
+  quotaExceeded: boolean;
+  constructor(cause: unknown) {
+    super("Couldn't save to this device's local roll.");
+    this.cause = cause;
+    this.quotaExceeded = cause instanceof DOMException && cause.name === "QuotaExceededError";
+  }
+}
+
 function readAll(): OutboxItem[] {
   if (typeof window === "undefined") return [];
   try {
@@ -49,9 +74,22 @@ function readAll(): OutboxItem[] {
   }
 }
 
+/** Every mutator below (`addPhoto`, `addLike`, `removePhoto`, `patch`)
+ * goes through this, so a failure here is the ONE place that needs to
+ * turn into a clear, catchable error rather than an uncaught
+ * `QuotaExceededError` a caller several stack frames away never sees.
+ * Before this wrapped the failure, `confirmReview` in `routes/capture.tsx`
+ * closed its review sheet unconditionally right after calling `addPhoto`
+ * -- so a guest whose roll was full would watch "USE THIS FRAME" appear
+ * to work (the sheet closed, the camera looked normal) while the photo
+ * silently never made it into the outbox at all. */
 function writeAll(items: OutboxItem[]) {
   if (typeof window === "undefined") return;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+  } catch (e) {
+    throw new OutboxWriteError(e);
+  }
 }
 
 const listeners = new Set<() => void>();
@@ -89,6 +127,17 @@ function getSnapshot(): OutboxItem[] {
 
 export function useOutbox(): OutboxItem[] {
   return useSyncExternalStore(subscribe, getSnapshot, () => EMPTY);
+}
+
+/** The queued photos belonging to one event. Every guest screen that reads
+ * the outbox goes through this rather than filtering inline, so the
+ * "missing event_id means default" fallback for rows queued before hosted
+ * events existed lives in one place instead of four. */
+export function photosForEvent(items: OutboxItem[], eventId: string): OutboxPhoto[] {
+  return items.filter(
+    (it): it is OutboxPhoto =>
+      it.kind === "photo" && (it.event_id ?? DEFAULT_EVENT_ID) === eventId,
+  );
 }
 
 export function addPhoto(item: Omit<OutboxPhoto, "kind" | "synced" | "created_at">): OutboxPhoto {
@@ -149,6 +198,7 @@ async function syncOne(item: OutboxItem): Promise<boolean> {
         composition_score: item.composition_score,
         vclock: item.vclock,
         image_base64: item.image_base64,
+        event_id: item.event_id ?? DEFAULT_EVENT_ID,
       });
       patch(item.local_id, { synced: true, photo_id: res.photo_id });
       // Fire-and-forget: populates a real aesthetic_score for this photo

@@ -1,10 +1,11 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { events, filmStocks } from "@/guest/data";
-import { getPhotos, photoImageUrl, pickNode, type RemotePhoto } from "@/lib/api";
+import { filmStocks } from "@/guest/data";
+import { BOOTH_ZONE, getPhotos, photoImageUrl, pickNode, type RemotePhoto } from "@/lib/api";
+import { useCurrentEvent } from "@/lib/event";
 import { buildFilterCss, DEFAULT_PRESET, STOCK_PRESETS } from "@/lib/filmStock";
 import { currentGuestId, tick } from "@/lib/guest";
-import { addPhoto, syncOutbox, useOutbox, type OutboxPhoto } from "@/lib/outbox";
+import { addPhoto, photosForEvent, syncOutbox, useOutbox, type OutboxPhoto } from "@/lib/outbox";
 
 export const Route = createFileRoute("/album")({
   head: () => ({
@@ -377,13 +378,11 @@ function todayLabel(): string {
 }
 
 function Album() {
+  const event = useCurrentEvent();
   const outbox = useOutbox();
   const myRoll = useMemo(
-    () =>
-      outbox
-        .filter((o): o is OutboxPhoto => o.kind === "photo")
-        .sort((a, b) => b.created_at - a.created_at),
-    [outbox],
+    () => photosForEvent(outbox, event.event_id).sort((a, b) => b.created_at - a.created_at),
+    [outbox, event.event_id],
   );
 
   // THE ROOM: everyone's photos, not just this phone's. GET /photos + a
@@ -401,7 +400,7 @@ function Album() {
       setNode(n);
       if (!n) return;
       try {
-        const ps = await getPhotos(n);
+        const ps = await getPhotos(n, event.event_id);
         if (!cancelled) setRoomPhotos(ps);
       } catch {
         // stay on the last known-good read
@@ -413,7 +412,7 @@ function Album() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [source]);
+  }, [source, event.event_id]);
 
   const pickable: PickablePhoto[] = useMemo(() => {
     if (source === "mine") {
@@ -462,7 +461,7 @@ function Album() {
   const [stockKey, setStockKey] = useState<string | null>(null);
 
   const [fontStyleKey, setFontStyleKey] = useState<FontStyleKey>("elegant");
-  const eventName = events[0]?.name ?? "";
+  const eventName = event.name;
   const [eventDate, setEventDate] = useState(todayLabel);
   const [message, setMessage] = useState("");
 
@@ -564,11 +563,12 @@ function Album() {
       const image_base64 = await blobToBase64(blob);
       addPhoto({
         local_id: crypto.randomUUID(),
-        guest_id: currentGuestId(),
-        zone: "photo_booth",
+        guest_id: currentGuestId(event.event_id),
+        zone: BOOTH_ZONE,
         composition_score: 0,
         vclock: tick(),
         image_base64,
+        event_id: event.event_id,
       });
       void syncOutbox();
       setPosted(true);

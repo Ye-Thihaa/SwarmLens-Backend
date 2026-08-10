@@ -48,6 +48,48 @@ list and manual demo commands: [README.md](README.md).
   no-op, not a 409. `GET /photos/public` is the derived read: every photo
   whose latest `public_mark` says `true`, same replay-the-log pattern as
   everything else, no second `is_public` column.
+  **Multi-event hosting** ("hosted events" section, near the bottom of
+  the file, right before the client API): the cluster hosts several
+  events at once (a wedding and a donation ceremony the same weekend),
+  and every derived read that touches photos takes an optional
+  `event_id` query param so the two never merge — `GET /photos`, `GET
+  /photos/public`, `GET /zones`, `GET /zones/local`, `GET /zones/ring`,
+  `GET /zones/quorum`. `POST /events` registers (or, passing back an
+  existing `event_id`, edits) one via an `event_created` event — no new
+  table, gossiped and replayed exactly like a photo
+  (`store.events_catalog`). It's gated by `require_operator_token`, the
+  same gate as `/chaos/*`, and so is `GET /events` (the operator's own
+  directory, join tokens included) — a guest app has no way to enumerate
+  events, on purpose: a wedding's guests have no business listing the
+  funeral booked the same weekend. A guest resolves exactly one event via
+  `GET /events/{slug}?k=<join_token>` (`resolve_event`) — `k` is **not**
+  authentication, the same non-guarantee as `GET /photos/public` needing
+  no guest identity; it only stops a guest who mistypes or guesses a slug
+  from landing in someone else's event, and the token is never echoed
+  back in the response so a successful resolve doesn't hand out a
+  shareable credential the scanner didn't already have. `PhotoIn` is the
+  *only* request model carrying `event_id` (default
+  `store.DEFAULT_EVENT_ID = "default"`, what every photo logged before
+  this existed implicitly has) — a like, public mark, or delete all name
+  a globally-unique `photo_id` and inherit that photo's event
+  (`store.photo_by_id`), so event membership is recorded in exactly one
+  place and a client can't push a like into a different event than its
+  own photo by getting one field wrong. `ring_key(zone, event_id)`
+  namespaces the consistent-hash key to `f"{event_id}/{zone}"` — without
+  it, two events both naming a zone `"main"` would hash to one ring
+  position, and `/zones` would proxy the wedding's `"main"` score from a
+  node computing the donation's `"main"`; `event_id=None` (every caller
+  that predates hosted events, including `test_hashing.py`) keeps the
+  bare-zone key unchanged so existing ring assignments don't move.
+  `_zone_scores_from_events` filters by `event_id` *after* the quorum
+  merge, not on the wire in `GET /zones/events`, because a node can hold
+  a `like` for a photo it hasn't gossiped-in yet — dropping it at the
+  source on an unrelated technicality would lose a count the merge could
+  still have resolved. The per-guest public-gallery cap
+  (`PUBLIC_LIMIT_PER_GUEST`) is enforced *per event*, computed by
+  intersecting `public_state()` against `store.photos(photo["event_id"])`
+  — a guest who shoots at three weddings gets 25 public frames at each,
+  not 25 total.
 - `store.py` — SQLite-backed append-only event log. All state (photos,
   likes, job leases, recap) is derived by replaying `events`, never
   written directly. `(origin, seq)` primary key makes merges idempotent.
@@ -70,6 +112,22 @@ list and manual demo commands: [README.md](README.md).
   same last-write-wins way as `aesthetic_scores`, not a set-union CRDT
   like likes: a guest toggling their own photo is expected to converge on
   whichever toggle actually happened last, not be merged as a set.
+  `photos(event_id=None)` filters by `payload["event_id"]` (defaulting
+  missing values to `DEFAULT_EVENT_ID`) when given one, and returns every
+  event's photos merged when not — every caller from before hosted
+  events existed still gets that merged view for free. `events_catalog()`
+  replays `event_created` into `event_id -> latest payload`, last write
+  wins by created_at like `public_state` — except an edit (rename, venue
+  change) carries its *original* created_at forward rather than the
+  edit's own timestamp, so a later rename can't jump an event ahead of
+  another one that claimed the same slug first (`main.py`'s
+  `resolve_event` needs that ordering to pick a deterministic winner if
+  two events ever raced on one slug during a partition). `raw_events` and
+  `photo_by_id` both strip `image_base64` before returning — the former
+  because it's what every `/zones/quorum` sample ships across the wire to
+  every other node, and shipping pixels there turned a zone-score merge
+  into a full gallery transfer once a node started holding several
+  events' worth of photos, not just one.
 - `gossip.py` — anti-entropy loop: every `GOSSIP_INTERVAL` (default 1s),
   pick one random peer, exchange version-vector digests, pull/push
   whatever's missing.
@@ -200,10 +258,78 @@ list and manual demo commands: [README.md](README.md).
   found doing it. Highlights:
   - `src/lib/api.ts` — the node-picking/fetch client (same "race
     `/health`, use whichever answers first" pattern as `client/src/nodes.ts`).
+    Every read that takes an `event_id` types it `string | undefined` and
+    makes the parameter **required** (not optional) — required so no call
+    site can silently forget it exists, `| undefined` so the one
+    legitimate caller that wants every event merged (the operator
+    console's overview) can ask for that on purpose. Every guest route
+    always passes a real event_id from `lib/event.ts`; only
+    `routes/console.tsx` ever passes `undefined`.
+  - `src/lib/event.ts` — which hosted event this phone joined, mirroring
+    `guest.ts`'s SSR-safe localStorage pattern (`useCurrentEvent()` is a
+    `useSyncExternalStore` hook with the same cached-snapshot discipline
+    as `outbox.ts`'s `useOutbox()` — see the Gotchas entry on that).
+    `DEFAULT_EVENT` is what every guest screen renders before a QR is
+    ever scanned (including during SSR, where localStorage doesn't
+    exist) — it mirrors `store.py`'s `DEFAULT_EVENT_ID` and the single
+    demo room this app always had, not an empty state. `joinEvent()` is
+    the only writer, called once by `routes/join.$slug.tsx` after a
+    resolve succeeds.
+  - `src/routes/join.$slug.tsx` — where a scanned QR actually lands:
+    `/join/{slug}?k={join_token}` (see `main.py`'s `GET
+    /events/{slug}`). Resolves once against whichever node answers
+    first, stores the result via `joinEvent()`, and pushes the guest into
+    `/capture`. Retries on a 3s timer rather than failing once — both
+    real failure modes here (no node up yet, or this node hasn't
+    gossiped-in the `event_created` row the QR points at) are routine and
+    transient, and a guest standing at the door shouldn't have to
+    manually refresh.
+  - `src/routes/capture.tsx`'s zone strip only renders when the joined
+    event actually has more than one zone (`event.zones.length > 1`) —
+    most events are one location, and asking every guest to classify
+    their own position on every shot was both work and a question they
+    usually can't answer well. The zone itself never disappears from the
+    photo payload; it still drives the consistent-hash ring, `/zones`,
+    and quorum reads exactly as before — only the picker UI is
+    conditional. The override is stored separately from the derived
+    `zone` value and dropped the instant it stops being one of the
+    *current* event's zones, so switching events mid-session can't leave
+    a guest silently tagging frames with a zone the new room never
+    declared.
+  - `src/routes/console.tsx`'s **Hosted events** panel is where an
+    operator actually creates/edits events and prints their QR cards —
+    `serverCreateEvent`/`serverListEvents` in `lib/operatorGateway.ts`
+    follow the exact same shape as the chaos actions (session re-checked
+    server-side, `OPERATOR_TOKEN` read from `process.env`, never touches
+    client JS). Selecting an event here scopes the room-stats/aesthetic
+    -map/quorum panels below it to that one event; the default
+    (`undefined`) merges every event, the only view that existed before
+    this feature did. `src/lib/qr.ts` wraps the `qrcode` package's
+    `toString(..., {type:"svg"})` path deliberately — it does its own
+    matrix generation in pure JS with no `<canvas>`, so the same call
+    works during SSR and the output stays crisp at any print size, unlike
+    a canvas/PNG raster which goes blocky at table-card scale. The
+    **PUBLIC URL FOR PRINTED QR CODES** field defaults to the console's
+    own origin and warns when that's `localhost`/`127.0.0.1` — the
+    console runs wherever the operator's laptop is, but the QR has to
+    point at wherever a *guest's phone* can actually reach the cluster,
+    the same LAN-IP-vs-localhost distinction the camera/HTTPS gotcha
+    below already has to solve for a different reason.
   - `src/lib/outbox.ts` — offline photo/like queue, localStorage-backed
     (this app has no Dexie yet, unlike `client/`) — `useOutbox()` is a
     `useSyncExternalStore` hook; see the Gotchas entry on caching its
-    snapshot.
+    snapshot. `OutboxPhoto.event_id` is captured once, at queue time, from
+    whichever event the guest was actually standing in when the shutter
+    fired — never re-read from the *current* joined event when the item
+    finally syncs. That distinction is the whole point of the field: a
+    guest shooting offline at a wedding who then walks into the next room
+    and scans that event's QR would otherwise have their queued wedding
+    frames sync straight into the second event once connectivity
+    returned — visible to a roomful of strangers, not a cosmetic bug.
+    `photosForEvent()` is the one place every guest screen filters the
+    outbox down to "this event's photos", so the `event_id ?? "default"`
+    fallback for rows queued before this field existed lives in one spot
+    instead of four.
   - `POST /analyze` fires automatically after each photo syncs (see
     `outbox.ts`) — the first time either client has actually exercised
     `ai_engine.py`'s aesthetic pipeline instead of leaving it dark.
@@ -355,6 +481,22 @@ same paths the demo cluster uses):
   of 500ing, the full backlog syncs in one push once it starts listening
   ("reconnect"), a no-op re-trigger creates no duplicates, a new event
   afterward syncs incrementally, and only the Raft leader ever pushes.
+- `python test_events.py` — spins up 3 nodes, creates two hosted events
+  (on two *different* nodes, deliberately, so the create-and-gossip path
+  gets exercised, not just create-and-read-locally) that both declare a
+  zone named `"main"`, and confirms: the catalog replicates to a node
+  that created neither; a duplicate slug is rejected even from a node
+  that only learned it by gossip; `GET /events/{slug}?k=` resolves with
+  the right token, 404s on a wrong or missing one, and never echoes the
+  token back; `GET /photos`/`GET /zones`/`GET /zones/quorum` (at R=1, 2,
+  and 3) never mix the two events' data despite the shared zone name;
+  `ring_key`'s namespacing actually spreads that shared zone name across
+  multiple ring owners instead of one; the per-guest public-gallery cap
+  fires within one event and is untouched in the other; and a photo
+  logged with no `event_id` at all (simulating pre-hosted-events data)
+  stays reachable under `"default"` throughout. `PUBLIC_LIMIT_PER_GUEST`
+  is env-overridable specifically so this test can drive the cap to its
+  edge in 3 requests instead of 26.
 - `python load_test.py [--quick]` — not a pass/fail test, a measurement
   script. Spins up and tears down its own real clusters, fires real
   concurrent traffic, reports p50/p95/p99 latency, convergence time,
@@ -389,9 +531,20 @@ operator console (Raft/gossip state, chaos actions, quorum reads), and
 a real password gate on `/console` plus an optional backend
 `OPERATOR_TOKEN`. See the "Branded guest app + operator console"
 writeup in ROADMAP.md for what was built, the real bugs found wiring
-it up, and what's still a known simplification (a single "room" since
-this backend has no multi-event concept, and a localStorage outbox
+it up, and what's still a known simplification (a localStorage outbox
 instead of `client/`'s Dexie/service-worker one).
+
+Also done: **multi-event hosting** — the single-"room" simplification
+above no longer applies. One cluster now hosts several events at once
+(`POST`/`GET /events`, `GET /events/{slug}?k=`), every derived read that
+touches photos is event-scoped, the consistent-hash ring is namespaced
+per event so identically-named zones on two events never collide, a
+guest joins by scanning a QR (`client-2`'s `/join/$slug` route) rather
+than picking from a directory the app deliberately can't show them, and
+the operator console has a **Hosted events** panel to create events and
+print their QR cards. See the "Multi-event hosting" section in
+[README.md](README.md) for the endpoint shapes and demo commands, and
+`python test_events.py` for the automated isolation proof.
 
 ## Gotchas hit so far (don't reintroduce these)
 

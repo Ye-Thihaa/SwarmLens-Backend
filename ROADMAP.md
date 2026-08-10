@@ -749,6 +749,101 @@ untouched because it reads `CLUSTER` directly. Real-camera behaviour is
 still unverified by this session — the sandbox has no webcam and the
 in-app browser won't accept a self-signed cert.
 
+## Multi-event hosting — done (outside the phase numbering)
+
+Removed the single-"room" simplification every earlier phase writeup
+above mentions: the cluster now hosts several events at once (a wedding
+Saturday, a donation ceremony Sunday, both on the same three nodes and
+the same append-only log) with no shared data between them and no new
+distributed-systems mechanism — an event is just one more event kind
+(`event_created`) that gossips and replays like everything else.
+
+**What actually needed to change**, in order of how much it mattered:
+
+1. **Storage isolation.** Every derived read that touches photos
+   (`GET /photos`, `GET /photos/public`, `GET /zones` and its
+   siblings, `GET /zones/quorum`) takes an `event_id` and never merges
+   across it. `PhotoIn` is the only request model that carries one —
+   a like, a public-mark toggle, or a delete tombstone all name a
+   globally-unique `photo_id` and inherit *that photo's* event
+   (`store.photo_by_id`), so there's exactly one place event membership
+   is recorded, not five copies that could disagree with each other.
+2. **The ring key.** This was the sharpest actual bug risk, not a
+   theoretical one: `hashing.py`'s ring hashes a bare zone string, and
+   two events both naming a zone `"main"` (the overwhelmingly common
+   case — most venues call their main area "main") would hash to the
+   *same* ring position. `GET /zones` would then proxy the wedding's
+   `"main"` score from whichever node happened to own that position,
+   which would answer with **its own** computation of `"main"` — the
+   donation's number, silently substituted for the wedding's. Fixed by
+   namespacing the hashed key to `f"{event_id}/{zone}"`
+   (`main.py`'s `ring_key`). `test_events.py` checks this isn't just
+   theoretical: 30 synthetic event ids sharing the zone name `"main"`
+   spread across 3 different ring owners, not 1.
+3. **The per-guest public-gallery cap.** `PUBLIC_LIMIT_PER_GUEST` was
+   computed by counting a guest's public photos across the whole log.
+   Left alone, a guest who shoots at three events over a few months
+   would arrive at their third with the quota already spent by the
+   first two. Fixed by intersecting against `store.photos(event_id)`
+   before counting.
+4. **Client-side guest identity, per event.** `client-2`'s
+   `currentGuestId()` was one localStorage key per browser profile.
+   The same phone at two events needs to be two separate guests — two
+   separate rolls, two separate public quotas — or the second event's
+   `POST /photos/public` calls silently inherit the first event's
+   already-spent cap. Fixed by suffixing the key with `event_id` (the
+   default event keeps the old un-suffixed key, so photos already
+   attributed to it under the old scheme don't lose their owner).
+5. **The offline outbox, which was the actual hard case.** A guest
+   shooting at a wedding with no signal, then walking into the next
+   room and scanning *that* event's QR before the wedding photos ever
+   synced, would — if the outbox didn't remember which event each
+   queued photo belonged to — have those photos sync straight into
+   the second event once connectivity returned. Not a display bug: a
+   stranger's photo turning up in the wrong room's public feed. Fixed
+   by stamping `event_id` onto each `OutboxPhoto` at capture time (not
+   read from "whatever event is current" at sync time), which is the
+   one field in this whole feature that had to be right for a genuinely
+   bad failure mode not to reach a real guest.
+
+**Discovery, without a directory.** A guest app has no way to list
+events — `GET /events` is gated by `OPERATOR_TOKEN` like the chaos
+endpoints, on purpose: a wedding's guests have no business enumerating
+the funeral booked the same weekend. The only way in is scanning that
+event's own QR, which encodes `/join/{slug}?k={join_token}`; `GET
+/events/{slug}?k=` resolves it. The token is explicitly **not**
+authentication, the same non-guarantee `GET /photos/public` already
+relies on — it exists only to stop a guest who mistypes or guesses a
+slug from landing in the wrong event, and it's never echoed back in a
+successful resolve, so scanning a QR doesn't hand a guest's phone a
+credential it could reshare.
+
+**The operator side.** `client-2/routes/console.tsx` grew a **Hosted
+events** panel — create/edit events, and a per-event QR rendered with
+the `qrcode` package's SVG path (chosen specifically because it needs
+no `<canvas>`, so it renders identically during SSR and stays crisp at
+table-card print size, unlike a canvas/PNG raster). The panel also
+carries a **public base URL** field defaulting to the console's own
+origin, with an explicit warning when that's `localhost`/`127.0.0.1` —
+a real finding, not a hypothetical: the console runs on the operator's
+laptop, but the printed QR has to resolve on a *guest's* phone on the
+venue's network, the same distinction the HTTPS/camera work above had
+to solve for an unrelated reason. Selecting an event scopes the
+room-stats/aesthetic-map/quorum panels to it; leaving none selected
+merges every event, which is the only view this console ever had
+before the feature existed.
+
+**Verified live**, not just by `test_events.py`: created two events
+from the operator console against a real running 3-node cluster (one
+with a single zone, one with two), joined each from a separate browser
+tab via its real `/join/{slug}?k=` QR link, confirmed the single-zone
+event shows no zone picker on the capture screen while the two-zone
+event shows one labelled "PART OF THE DAY", posted a photo into the
+two-zone event directly against the backend, and confirmed it appeared
+in that event's room feed with the correct zone and event name stamped
+on the strip, while the other event's room feed stayed at zero — on a
+live cluster carrying real pre-existing demo data the whole time.
+
 ## Suggested pacing (8 weeks, solo, from here)
 
 | Week | Phase |

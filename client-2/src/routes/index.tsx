@@ -1,10 +1,19 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
-import { events } from "@/guest/data";
 import { PerfRail } from "@/guest/ui";
 import { CLUSTER_SIZE, getHealth, getPhotos, NODES } from "@/lib/api";
+import { useCurrentEvent } from "@/lib/event";
 
-/** APP A — Guest App. No auth, no system internals, one thumb, low light. */
+/** APP A — Guest App. No auth, no system internals, one thumb, low light.
+ *
+ * There is no room DIRECTORY here any more: the cluster hosts several
+ * events at once (main.py's "hosted events"), and this app deliberately
+ * has no way to list them (see main.py's gated GET /events) -- a guest
+ * arrives at exactly one, by scanning that event's own QR, which routes
+ * through /join/$slug and stores the result in lib/event.ts. This page is
+ * what a guest sees if they land on the bare domain without having
+ * scanned anything yet: whichever event this phone joined last, or the
+ * single-event demo room if it never joined one at all. */
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
@@ -12,24 +21,20 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "Pick the event you're standing in. Your phone starts shooting, keeps its own opinion of the room, and shares it with everyone else's.",
+          "Scan the card on your table. Your phone starts shooting, keeps its own opinion of the room, and shares it with everyone else's.",
       },
       { property: "og:title", content: "SwarmLens — walk into tonight's room" },
       {
         property: "og:description",
-        content: "Live events shooting on SwarmLens right now. Enter the one you're in.",
+        content: "Scan the QR at your event to walk in and start shooting.",
       },
     ],
   }),
-  validateSearch: (s: Record<string, unknown>) =>
-    typeof s["venue"] === "string" ? { venue: s["venue"] } : {},
   component: Landing,
 });
 
 function Landing() {
-  const { venue } = Route.useSearch();
-  const event = events[0]!;
-  const arrived = venue === event.slug ? event : undefined;
+  const event = useCurrentEvent();
 
   const [guests, setGuests] = useState<number | null>(null);
   const [frames, setFrames] = useState<number | null>(null);
@@ -44,7 +49,7 @@ function Landing() {
       if (!cancelled) setNodesUp(up);
       if (!reachable) return;
       try {
-        const photos = await getPhotos(reachable);
+        const photos = await getPhotos(reachable, event.event_id);
         if (cancelled) return;
         setFrames(photos.length);
         setGuests(new Set(photos.map((p) => p.guest_id)).size);
@@ -58,7 +63,7 @@ function Landing() {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [event.event_id]);
 
   const live = (nodesUp ?? 0) > 0;
 
@@ -82,35 +87,14 @@ function Landing() {
         </p>
       </header>
 
-      {arrived && (
-        <section className="film-edge border-b border-border bg-emulsion-lift px-5 py-7">
-          <p className="label-mono">Door · scanned at the entrance</p>
-          <h2 className="mt-2 text-2xl font-bold">{arrived.name}</h2>
-          <p className="mt-1 text-sm text-muted-foreground">{arrived.venue}</p>
-          <Link
-            to="/capture"
-            className="mt-5 inline-flex items-center gap-3 rounded-sm bg-fixer px-5 py-3 text-sm font-semibold text-emulsion"
-          >
-            Walk in and start shooting
-            <span className="font-mono text-xs">→</span>
-          </Link>
-        </section>
-      )}
-
       <section className="px-5 py-7">
         <div className="flex items-baseline justify-between">
-          <h2 className="text-lg font-bold">Rooms open now</h2>
+          <h2 className="text-lg font-bold">Your room</h2>
           <p className="label-mono">
             {nodesUp === null ? "connecting…" : `${nodesUp}/${CLUSTER_SIZE} nodes up`}
           </p>
         </div>
 
-        {/*
-          Core layout: a CONTACT SHEET. This backend has one continuously
-          running cluster, not a directory of events, so there is exactly
-          one real frame on the strip -- independently exposed, with real
-          edge annotations, not averaged into a fake hero.
-        */}
         <ul className="mt-4 space-y-4">
           <li>
             <Link
@@ -118,15 +102,7 @@ function Landing() {
               params={{ slug: event.slug }}
               className="group block overflow-hidden rounded-sm border border-border bg-card"
             >
-              <div className="relative aspect-[16/10] overflow-hidden">
-                <img
-                  src={event.hero}
-                  alt={`Frame from ${event.name} at ${event.venue}`}
-                  width={1024}
-                  height={1280}
-                  loading="lazy"
-                  className="h-full w-full object-cover opacity-80 transition group-hover:opacity-100"
-                />
+              <div className="relative aspect-[16/10] overflow-hidden bg-emulsion-lift">
                 <div className="absolute inset-x-0 bottom-0 flex items-end justify-between bg-gradient-to-t from-emulsion to-transparent p-3">
                   <span className="font-mono text-[0.65rem] tracking-widest text-fixer-dim">
                     SWARMLENS CLUSTER
@@ -156,6 +132,14 @@ function Landing() {
             </Link>
           </li>
         </ul>
+
+        <Link
+          to="/capture"
+          className="mt-5 inline-flex items-center gap-3 rounded-sm bg-fixer px-5 py-3 text-sm font-semibold text-emulsion"
+        >
+          Walk in and start shooting
+          <span className="font-mono text-xs">→</span>
+        </Link>
       </section>
 
       <footer className="px-5 pb-10 text-xs leading-relaxed text-stale">

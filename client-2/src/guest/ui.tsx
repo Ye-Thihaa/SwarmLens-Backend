@@ -1,4 +1,5 @@
 import { Link } from "@tanstack/react-router";
+import { useCurrentEvent } from "@/lib/event";
 
 /**
  * Signature motif, guest side: the perf rail.
@@ -30,6 +31,10 @@ export function PerfRail({
 }
 
 export function GuestTabs({ active }: { active: "capture" | "mine" | "room" | "public" }) {
+  // The room link's slug is whichever event this phone actually joined
+  // (lib/event.ts), not a hardcoded room -- the same tab bar now has to
+  // work for every hosted event, not just the one this app shipped with.
+  const event = useCurrentEvent();
   const tabs = [
     { key: "capture", to: "/capture", label: "Camera" },
     { key: "mine", to: "/mine", label: "My roll" },
@@ -44,7 +49,7 @@ export function GuestTabs({ active }: { active: "capture" | "mine" | "room" | "p
           <Link
             key={t.key}
             to={t.to}
-            {...(t.key === "room" ? { params: { slug: "hollis-marchetti" } } : {})}
+            {...(t.key === "room" ? { params: { slug: event.slug } } : {})}
             className={`flex-1 py-3.5 text-center text-[0.8rem] font-medium tracking-wide ${
               active === t.key
                 ? "text-fixer [box-shadow:inset_0_2px_0_0_var(--drifting)]"

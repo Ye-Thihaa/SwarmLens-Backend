@@ -2,6 +2,7 @@ import asyncio
 import base64
 import os
 import random
+import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -13,7 +14,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 import ai_engine
-from store import Store
+from store import DEFAULT_EVENT_ID, Store
 from gossip import Gossip
 from worker import Worker
 from raft import Raft
@@ -25,7 +26,10 @@ QUORUM_EVENT_KINDS = ("photo", "like", "aesthetic_score", "photo_delete")
 # gallery (GET /photos/public) at once -- a deliberate curation cap, not a
 # technical one. Enforced server-side in POST /photos/public so it holds
 # regardless of which node a guest's toggle happens to land on.
-PUBLIC_LIMIT_PER_GUEST = 25
+# Env-overridable so test_events.py can drive the cap to its edge in a few
+# requests instead of uploading 26 photos twice. The default is the real
+# number and is mirrored by hand in client-2/src/lib/api.ts.
+PUBLIC_LIMIT_PER_GUEST = int(os.getenv("PUBLIC_LIMIT_PER_GUEST", "25"))
 
 NODE_ID = os.getenv("NODE_ID", "node1")
 DB_PATH = os.getenv("DB_PATH", f"./{NODE_ID}.db")
@@ -73,16 +77,35 @@ def cluster_members() -> list[str]:
     return sorted({SELF_ID, *gossip.alive_peers()})
 
 
-async def _zone_scores_local() -> dict[str, dict]:
+def ring_key(zone: str, event_id: str | None) -> str:
+    """What the consistent-hash ring actually hashes for a zone.
+
+    Two events hosted on the same cluster will both have a zone called
+    "main" (or "entrance", or "dance_floor") -- distinct corners of
+    distinct rooms that happen to share a label. Hashing the bare zone
+    name maps both to one owning node and, worse, makes /zones proxy the
+    wedding's "main" score from a node computing the donation's "main",
+    so the two events silently share one number. Namespacing by event is
+    what keeps them separate on the ring.
+
+    event_id=None keeps the pre-multi-event key exactly as it was, so a
+    single-event cluster's ring assignment doesn't move (and neither do
+    test_hashing.py's expectations)."""
+    return zone if event_id is None else f"{event_id}/{zone}"
+
+
+async def _zone_scores_local(event_id: str | None = None) -> dict[str, dict]:
     """Derived read: photos + CRDT like counts (store.photos()) plus the
     average aesthetic_score per zone (store.aesthetic_scores()) for
     whichever photos have been through /analyze so far -- None for a zone
     with no scored photos yet, not 0, so it's distinguishable from 'scored
-    and bad'."""
+    and bad'. Scoped to one event when event_id is given; None merges
+    every event, which is what callers predating multi-event hosting
+    still ask for."""
     aesthetic = await store.aesthetic_scores()
     zones: dict[str, dict] = {}
     scored: dict[str, list] = {}
-    for p in await store.photos():
+    for p in await store.photos(event_id):
         z = zones.setdefault(p["zone"], {"zone": p["zone"], "photos": 0, "likes": 0})
         z["photos"] += 1
         z["likes"] += p["likes"]
@@ -99,10 +122,19 @@ def _rank(zones) -> list[dict]:
     return sorted(zones, key=lambda z: -(z["likes"] * 2 + z["photos"]))
 
 
-def _zone_scores_from_events(events) -> dict[str, dict]:
+def _zone_scores_from_events(events, event_id: str | None = None) -> dict[str, dict]:
     """Same derivation as _zone_scores_local, but over an arbitrary merged
     event set instead of this node's own DB -- what /zones/quorum uses to
-    recompute from the union of several nodes' partial views."""
+    recompute from the union of several nodes' partial views.
+
+    Event filtering happens here, after the merge, rather than on the wire
+    in /zones/events. A node can hold a like whose photo it hasn't
+    received yet; dropping that like at the source because the sending
+    node can't tell which event it belongs to would lose a count the
+    merged view could have resolved. Only the photo carries an event_id,
+    so restricting photo_zone below is enough -- likes, scores and
+    tombstones for photos outside this event are simply never looked
+    up."""
     photo_zone: dict[str, str] = {}
     like_guests: dict[str, set] = {}
     aesthetic: dict[str, float] = {}
@@ -110,6 +142,8 @@ def _zone_scores_from_events(events) -> dict[str, dict]:
     for e in sorted(events, key=lambda e: e["created_at"]):
         p = e["payload"]
         if e["kind"] == "photo":
+            if event_id is not None and p.get("event_id", DEFAULT_EVENT_ID) != event_id:
+                continue
             photo_zone[p["photo_id"]] = p["zone"]
         elif e["kind"] == "like":
             like_guests.setdefault(p["photo_id"], set()).add(p["guest_id"])
@@ -155,6 +189,130 @@ app.add_middleware(
 )
 
 
+async def require_operator_token(x_operator_token: str = Header(default="")):
+    """Gate for the chaos and event-management endpoints.
+    secrets.compare_digest avoids a timing side-channel that would
+    otherwise let an attacker guess the token one byte at a time. No-op
+    (open) when OPERATOR_TOKEN isn't configured on this node -- see the
+    constant's own comment for why."""
+    if not OPERATOR_TOKEN:
+        return
+    if not secrets.compare_digest(x_operator_token, OPERATOR_TOKEN):
+        raise HTTPException(401, "invalid or missing X-Operator-Token")
+
+
+# ---------------------------- hosted events ----------------------------
+
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,48}$")
+
+
+class EventIn(BaseModel):
+    slug: str
+    name: str
+    venue: str = ""
+    when: str = ""
+    # The corners of this room a guest may tag a frame with. One zone (or
+    # none, which becomes ["main"]) means the guest app shows no zone
+    # picker at all -- most events are a single location and asking
+    # someone to declare where they're standing is a question they
+    # shouldn't have to answer. Several means the host has genuinely
+    # divided the day (ceremony / reception), and the picker returns.
+    zones: list[str] = []
+    # Blank on create -> the server mints both. Passing an existing
+    # event_id back is how an edit works: another event_created append,
+    # last write wins (store.events_catalog).
+    event_id: str = ""
+    join_token: str = ""
+
+
+@app.post("/events")
+async def create_event(body: EventIn, _: None = Depends(require_operator_token)):
+    """Register (or edit) a hosted event. Appends an event_created event
+    -- gossiped, merged and replayed exactly like a photo, no new table
+    and no new distributed mechanism.
+
+    Slug uniqueness is checked against this node's replica only, and that
+    is genuinely all it can be: two operators creating the same slug on
+    two nodes during a partition will both succeed, and no amount of
+    checking here changes that. What makes it safe is that resolution is
+    deterministic -- GET /events/{slug} below picks the earliest-created
+    match, which every node computes identically once gossip converges,
+    so the losing event keeps its own event_id and its photos rather than
+    being silently merged into the winner's."""
+    slug = body.slug.strip().lower()
+    if not SLUG_RE.match(slug):
+        raise HTTPException(400, "slug must be lowercase letters, digits and dashes")
+    if not body.name.strip():
+        raise HTTPException(400, "an event needs a name")
+
+    catalog = await store.events_catalog()
+    event_id = body.event_id or f"ev_{uuid.uuid4().hex[:8]}"
+    clash = next(
+        (e for e in catalog.values() if e["slug"] == slug and e["event_id"] != event_id), None
+    )
+    if clash:
+        raise HTTPException(409, f"slug '{slug}' already belongs to {clash['event_id']}")
+
+    existing = catalog.get(event_id)
+    payload = {
+        "event_id": event_id,
+        "slug": slug,
+        "name": body.name.strip(),
+        "venue": body.venue.strip(),
+        "when": body.when.strip(),
+        "zones": [z.strip() for z in body.zones if z.strip()] or ["main"],
+        # Kept across edits: rotating it on every rename would silently
+        # invalidate every QR already printed and sitting on the tables.
+        "join_token": body.join_token
+        or (existing or {}).get("join_token")
+        or secrets.token_urlsafe(8),
+        "created_by": NODE_ID,
+    }
+    await store.append_local("event_created", payload)
+    return {"ok": True, **payload}
+
+
+@app.get("/events")
+async def list_events(_: None = Depends(require_operator_token)):
+    """Every event this node knows about, join tokens included -- the
+    operator console's list. Gated because a public directory of every
+    event on the cluster is the thing multi-tenant hosting is supposed to
+    prevent: a wedding's guests have no business enumerating the funeral
+    booked the same weekend. Guests resolve exactly one event, by slug
+    plus token, through the endpoint below."""
+    catalog = await store.events_catalog()
+    return {
+        "node": NODE_ID,
+        "events": sorted(catalog.values(), key=lambda e: e["slug"]),
+    }
+
+
+@app.get("/events/{slug}")
+async def resolve_event(slug: str, k: str = ""):
+    """What a scanned QR lands on: slug -> the event_id every subsequent
+    guest call carries.
+
+    `k` is NOT authentication and isn't presented as any: anyone holding
+    the URL is in, exactly like GET /photos/public. It stops a guest who
+    guesses or mistypes a slug from wandering into someone else's event,
+    which is a real failure mode at a venue hosting three parties in one
+    weekend -- nothing more. The token is never echoed back, so a
+    successful resolve doesn't hand out a shareable credential the
+    scanner didn't already have.
+
+    Earliest-created match wins when two events somehow share a slug --
+    see POST /events for why that's the honest resolution rule."""
+    matches = [e for e in (await store.events_catalog()).values() if e["slug"] == slug.lower()]
+    if not matches:
+        raise HTTPException(404, "no such event")
+    # event_id breaks a created_at tie so every node picks the same winner
+    # even when two clocks read identically.
+    event = min(matches, key=lambda e: (e["created_at"], e["event_id"]))
+    if event.get("join_token") and not secrets.compare_digest(k, event["join_token"]):
+        raise HTTPException(404, "no such event")
+    return {"node": NODE_ID, "event": {kk: v for kk, v in event.items() if kk != "join_token"}}
+
+
 # ---------------------------- client API ----------------------------
 
 class PhotoIn(BaseModel):
@@ -164,6 +322,14 @@ class PhotoIn(BaseModel):
     composition_score: int = 0
     vclock: dict[str, int] = {}
     image_base64: str | None = None
+    # Which hosted event this frame belongs to. Deliberately the ONLY
+    # request model that carries one: a like, an aesthetic score, a public
+    # mark and a delete tombstone all name a globally-unique photo_id and
+    # inherit that photo's event, so event membership is recorded in
+    # exactly one place. Putting it on all five would create four more
+    # copies that can disagree with the photo -- and a client that got one
+    # wrong could push a like into an event its photo isn't in.
+    event_id: str = DEFAULT_EVENT_ID
 
 
 class LikeIn(BaseModel):
@@ -187,6 +353,14 @@ class PhotoDeleteIn(BaseModel):
 
 @app.post("/photos")
 async def upload_photo(body: PhotoIn):
+    """Accepts any event_id without checking it exists. That looks lax and
+    isn't: event_created reaches this node by gossip like everything else,
+    so a guest who scans a QR and shoots within the first second can
+    legitimately hit a node that hasn't learned the event yet. Rejecting
+    would turn a normal replication lag into a lost photo -- exactly the
+    failure this whole system is built to avoid. An unknown event_id costs
+    nothing: the photo is simply invisible until a matching event exists,
+    and visible the moment one does."""
     payload = body.model_dump(exclude={"vclock"})
     payload["photo_id"] = f"ph_{uuid.uuid4().hex[:8]}"
     event = await store.append_local("photo", payload, vclock=body.vclock)
@@ -216,15 +390,20 @@ def _concurrent(a: dict, b: dict) -> bool:
 
 
 @app.get("/photos")
-async def list_photos():
+async def list_photos(event_id: str | None = None):
     """Gallery as this node currently sees it. Each photo carries its own
     vclock (empty if the guest client didn't attach one) plus
     concurrent_with: other photo_ids whose vclock is concurrent with this
     one -- neither happened before the other -- so a gallery UI can
     render them side by side instead of implying a false total order
     from arrival time. O(n^2) over this node's photos; fine at demo
-    scale, same tradeoff /zones already makes."""
-    photos = await store.photos()
+    scale, same tradeoff /zones already makes.
+
+    event_id scopes this to one hosted event. concurrent_with is computed
+    *after* that filter on purpose: telling a wedding guest their frame
+    was shot at the same moment as one from a donation ceremony they'll
+    never see is noise, not causality they can act on."""
+    photos = await store.photos(event_id)
     for p in photos:
         p["concurrent_with"] = [
             q["photo_id"] for q in photos
@@ -272,8 +451,17 @@ async def mark_photo_public(body: PublicMarkIn):
         state = await store.public_state()
         already_public = state.get(body.photo_id, {}).get("public", False)
         if not already_public:
+            # The cap is per guest PER EVENT, and the event comes from the
+            # photo's own record, not from anything the caller sent. A
+            # guest who shoots at three weddings gets 25 public frames at
+            # each -- counting across all of them would silently spend
+            # tonight's quota on last month's.
+            event_id = photo.get("event_id", DEFAULT_EVENT_ID)
+            in_event = {p["photo_id"] for p in await store.photos(event_id)}
             count = sum(
-                1 for v in state.values() if v["public"] and v["guest_id"] == body.guest_id
+                1
+                for pid, v in state.items()
+                if v["public"] and v["guest_id"] == body.guest_id and pid in in_event
             )
             if count >= PUBLIC_LIMIT_PER_GUEST:
                 raise HTTPException(
@@ -284,7 +472,7 @@ async def mark_photo_public(body: PublicMarkIn):
 
 
 @app.get("/photos/public")
-async def public_photos():
+async def public_photos(event_id: str | None = None):
     """The cross-guest public gallery: every photo whose own guest has
     opted it in via POST /photos/public above, latest toggle wins --
     derived from the log the same way every other read here is, no
@@ -293,7 +481,7 @@ async def public_photos():
     likes, taken_at, zone); this just filters that down to the public
     subset instead of introducing a parallel shape."""
     state = await store.public_state()
-    photos = await store.photos()
+    photos = await store.photos(event_id)
     public = [p for p in photos if state.get(p["photo_id"], {}).get("public")]
     return {"node": NODE_ID, "photos": public}
 
@@ -434,13 +622,18 @@ async def analyze_preview(body: AnalyzePreviewIn):
 
 
 @app.get("/zones")
-async def zone_scores():
+async def zone_scores(event_id: str | None = None):
     """The emergent aesthetic map. Each zone's authoritative score comes
     from whichever node owns it on the consistent-hash ring -- proxied
     live if that's a peer, computed directly if it's us. If the owner is
     unreachable, falls back to this node's own (possibly lagging) replica
-    with stale: true rather than failing the request."""
-    local = await _zone_scores_local()
+    with stale: true rather than failing the request.
+
+    Ownership is per (event, zone) -- see ring_key. The proxied call
+    carries event_id through, so the owner recomputes the same event's
+    score rather than answering with its merged view of every event it
+    happens to hold."""
+    local = await _zone_scores_local(event_id)
     ring = ring_for(cluster_members())
 
     out = []
@@ -449,12 +642,13 @@ async def zone_scores():
     # proxy would otherwise break this.
     async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
         for zone, mine in local.items():
-            owner = owner_of(zone, ring)
+            owner = owner_of(ring_key(zone, event_id), ring)
             if owner == SELF_ID:
                 out.append({**mine, "owner": owner, "stale": False})
                 continue
             try:
-                r = await client.get(f"{owner}/zones/local")
+                params = {"event_id": event_id} if event_id is not None else None
+                r = await client.get(f"{owner}/zones/local", params=params)
                 r.raise_for_status()
                 remote = {z["zone"]: z for z in r.json()["zones"]}
                 if zone in remote:
@@ -468,24 +662,26 @@ async def zone_scores():
 
 
 @app.get("/zones/local")
-async def zones_local():
+async def zones_local(event_id: str | None = None):
     """This node's own replica, every zone, no ownership filtering. Not
     for clients -- this is what peers call when proxying a zone they
     don't own, and what a node falls back to reading from itself when the
     owner is unreachable."""
-    scores = await _zone_scores_local()
+    scores = await _zone_scores_local(event_id)
     return {"node": NODE_ID, "zones": _rank(list(scores.values()))}
 
 
 @app.get("/zones/ring")
-async def zones_ring():
+async def zones_ring(event_id: str | None = None):
     """Debug: current membership and the zone -> owner mapping it implies.
-    Useful for demoing how few zones move when a node joins or leaves."""
+    Useful for demoing how few zones move when a node joins or leaves --
+    and, with event_id, for showing that two events' identically-named
+    zones land on different owners rather than colliding."""
     members = cluster_members()
     ring = ring_for(members)
-    scores = await _zone_scores_local()
-    owners = {zone: owner_of(zone, ring) for zone in scores}
-    return {"node": NODE_ID, "members": members, "owners": owners}
+    scores = await _zone_scores_local(event_id)
+    owners = {zone: owner_of(ring_key(zone, event_id), ring) for zone in scores}
+    return {"node": NODE_ID, "event_id": event_id, "members": members, "owners": owners}
 
 
 @app.get("/zones/events")
@@ -498,7 +694,7 @@ async def zones_events():
 
 
 @app.get("/zones/quorum")
-async def zones_quorum(R: int = 2, W: int = 2):
+async def zones_quorum(R: int = 2, W: int = 2, event_id: str | None = None):
     """Quorum read: sample R of N nodes (this node is just one candidate
     among them, not privileged), union their raw photo/like events --
     deduped on (origin, seq), the same idempotence key gossip relies on
@@ -542,9 +738,10 @@ async def zones_quorum(R: int = 2, W: int = 2):
             for e in events:
                 merged[(e["origin"], e["seq"])] = e
 
-    scores = _zone_scores_from_events(merged.values())
+    scores = _zone_scores_from_events(merged.values(), event_id)
     return {
         "node": NODE_ID,
+        "event_id": event_id,
         "N": N,
         "R": R,
         "W": W,
@@ -640,17 +837,6 @@ async def cloud_sync_status():
 
 
 # ---------------------------- ops & chaos ----------------------------
-
-async def require_operator_token(x_operator_token: str = Header(default="")):
-    """Gate for the chaos endpoints. secrets.compare_digest avoids a
-    timing side-channel that would otherwise let an attacker guess the
-    token one byte at a time. No-op (open) when OPERATOR_TOKEN isn't
-    configured on this node -- see the constant's own comment for why."""
-    if not OPERATOR_TOKEN:
-        return
-    if not secrets.compare_digest(x_operator_token, OPERATOR_TOKEN):
-        raise HTTPException(401, "invalid or missing X-Operator-Token")
-
 
 @app.get("/jobs/{photo_id}")
 async def job_status(photo_id: str):
