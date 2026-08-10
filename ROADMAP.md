@@ -615,8 +615,8 @@ ever sees it.
    compatibility" error. Moved to `server.ts`, the genuinely
    server-only Nitro entry point.
 3. Vite's own internal `.env` loading (`dotenv-expand`) treats `$` as
-   variable-interpolation syntax and silently mangled
-   `CONSOLE_PASSWORD=c0n$ol3` down to `"c0n"` (`$ol3` resolved as a
+   variable-interpolation syntax and silently mangled a
+   `CONSOLE_PASSWORD=s3cret$val` down to `"s3cret"` (`$val` resolved as a
    reference to an undefined env var and expanded to nothing) before
    the app's own loader ran — and that loader's "only set if not
    already present" guard then kept the mangled value. Fixed by making

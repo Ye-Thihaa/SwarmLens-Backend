@@ -908,9 +908,9 @@ move it.
   `client-2`'s own `.env` loader — never `start.ts`.
 - **Vite's own `.env` loading treats `$` as variable-interpolation
   syntax (`dotenv-expand`), even for non-`VITE_`-prefixed keys your own
-  code never asked it to touch.** `client-2/.env`'s
-  `CONSOLE_PASSWORD=c0n$ol3` silently became `"c0n"` server-side —
-  `$ol3` was read as a reference to an undefined env var `ol3` and
+  code never asked it to touch.** A `client-2/.env` value of the shape
+  `CONSOLE_PASSWORD=s3cret$val` silently became `"s3cret"` server-side —
+  `$val` was read as a reference to an undefined env var `val` and
   expanded to nothing — before `client-2/src/server.ts`'s own loader
   (which does zero interpolation) ever ran. A guarded "only set if not
   already present" write kept that mangled value; the fix was making
