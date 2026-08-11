@@ -1,4 +1,5 @@
 import asyncio
+import os
 import random
 import time
 import httpx
@@ -10,15 +11,34 @@ import httpx
 # heartbeat << election timeout. Kept the specified 150-300ms election
 # timeout as-is; dropped the heartbeat cadence to 50ms so a stable leader
 # actually stays elected between timeouts.
-ELECTION_TIMEOUT_RANGE = (0.150, 0.300)
-HEARTBEAT_INTERVAL = 0.05
+#
+# These defaults assume LAN/loopback, where an RPC is sub-millisecond, and
+# every number in ROADMAP.md's Phase 8 section was measured with them. They
+# are env-overridable for one specific deployment shape: nodes separated by
+# the public internet (three Render services, say), where a single RPC is
+# 20-200ms and the 50ms budgets below cannot be met by a healthy peer. Left
+# unchanged there, every RPC times out, every election round stalls, and
+# the cluster churns leaders forever -- the exact livelock the RPC_TIMEOUT
+# comment describes, triggered by latency instead of a dead peer.
+#
+# Keep the ratios, not just the values: heartbeat << election timeout, and
+# RPC timeout well under election timeout. A workable internet-latency set
+# is RAFT_HEARTBEAT=1.0, RAFT_ELECTION_MIN=3.0, RAFT_ELECTION_MAX=6.0,
+# RAFT_RPC_TIMEOUT=1.0 -- 20x slower failover, which is the honest price of
+# running a 50ms-tuned protocol across regions. Don't quietly retune these
+# for a local run: Phase 8's numbers stop describing the system if you do.
+ELECTION_TIMEOUT_RANGE = (
+    float(os.getenv("RAFT_ELECTION_MIN", "0.150")),
+    float(os.getenv("RAFT_ELECTION_MAX", "0.300")),
+)
+HEARTBEAT_INTERVAL = float(os.getenv("RAFT_HEARTBEAT", "0.05"))
 # Must be well under the election timeout: asyncio.gather waits for every
 # peer, including dead ones, so a slow per-RPC timeout (e.g. httpx's 5s
 # default) makes every election round take that long end-to-end -- long
 # enough for a competing candidate's vote request to land and overwrite
 # this node's state before its own round even finishes. That produces a
 # permanent livelock between two candidates, never converging on a leader.
-RPC_TIMEOUT = 0.05
+RPC_TIMEOUT = float(os.getenv("RAFT_RPC_TIMEOUT", "0.05"))
 
 
 class Raft:

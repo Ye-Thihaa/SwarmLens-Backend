@@ -76,11 +76,42 @@ export type NodeHealth = {
  * entries reported by /health line up with URL_TO_ID below. */
 type ClusterNode = { id: string; url: string; peers: string[] };
 
-export const CLUSTER: ClusterNode[] = [
-  { id: "node1", url: "http://127.0.0.1:8001", peers: ["node2", "node3"] },
-  { id: "node2", url: "http://127.0.0.1:8002", peers: ["node1", "node3"] },
-  { id: "node3", url: "http://127.0.0.1:8003", peers: ["node1", "node2"] },
+const DEFAULT_CLUSTER_URLS = [
+  "http://127.0.0.1:8001",
+  "http://127.0.0.1:8002",
+  "http://127.0.0.1:8003",
 ];
+
+/** Builds the cluster from an ordered URL list. The ORDER is load-bearing
+ * beyond naming: each node's `peers` must line up with that node's own
+ * PEERS env var, because /chaos/partition/{i} indexes into it positionally
+ * (CLAUDE.md's chaos gotcha). Deriving both from one ordered list is what
+ * keeps them in step -- listing URLs in the same order the backends list
+ * each other is the only thing a deployer has to get right.
+ *
+ * VITE_CLUSTER_URLS exists for deployments where the nodes aren't on
+ * loopback (three Render services, say). It must be VITE_-prefixed and so
+ * is baked into the client bundle at build time -- that's acceptable
+ * because these are the same URLs the guest app already calls, not a
+ * secret. The operator TOKEN still never reaches the browser; it stays in
+ * the server functions (lib/operatorGateway.ts). */
+function buildCluster(urls: string[]): ClusterNode[] {
+  const ids = urls.map((_, i) => `node${i + 1}`);
+  return urls.map((url, i) => ({
+    id: ids[i]!,
+    url: url.replace(/\/+$/, ""), // a trailing slash would double up in every path
+    peers: ids.filter((_, j) => j !== i),
+  }));
+}
+
+const clusterUrlsFromEnv = (import.meta.env["VITE_CLUSTER_URLS"] as string | undefined)
+  ?.split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+export const CLUSTER: ClusterNode[] = buildCluster(
+  clusterUrlsFromEnv?.length ? clusterUrlsFromEnv : DEFAULT_CLUSTER_URLS,
+);
 
 function configuredNodeUrls(): string[] {
   const fromEnv = import.meta.env["VITE_NODE_URLS"] as string | undefined;
@@ -229,7 +260,25 @@ export async function createHostedEvent(
   return { ok: false, reason: "error" };
 }
 
-export async function pickNode(timeoutMs = 1500): Promise<string | null> {
+/** Races a cheap health check across every configured node and returns
+ * whichever answers first, or null when none do.
+ *
+ * The timeout is a worst-case bound, not a latency target: Promise.any
+ * settles the moment ANY node answers, so a healthy cluster resolves in
+ * milliseconds regardless of what this is set to. It only decides how
+ * long to wait before declaring the cluster unreachable.
+ *
+ * 1500ms was too tight, and produced a symptom that looked like the
+ * backend flapping. On a machine with a loopback-intercepting proxy (a
+ * VPN client, a corporate proxy -- see CLAUDE.md's proxy gotcha), a COLD
+ * connection was measured at ~2.1s against ~12ms once the proxy had a
+ * warm connection to reuse. So the first poll after an idle gap blew the
+ * budget on all three nodes at once and rendered "NO NODE REACHABLE",
+ * then the next poll succeeded instantly -- intermittent, with nothing
+ * wrong on the backend at all (containers never restarted; raft never
+ * lost its leader). The same shape shows up on a phone waking its radio,
+ * which is exactly when a guest opens the app. */
+export async function pickNode(timeoutMs = 4000): Promise<string | null> {
   const attempts = NODES.map(async (url) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);

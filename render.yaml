@@ -1,0 +1,175 @@
+# Render blueprint: three SwarmLens nodes, one Docker image, behaviour set
+# entirely by env vars -- the same shape docker-compose.yml runs locally.
+#
+# READ THIS BEFORE DEPLOYING. Two things differ from every local run and
+# both will bite silently if skipped.
+#
+# 1. RAFT TIMERS ARE RETUNED FOR INTERNET LATENCY, ON PURPOSE.
+#    The defaults in raft.py (50ms heartbeat, 150-300ms election timeout,
+#    50ms per-RPC timeout) assume loopback, where an RPC is sub-millisecond.
+#    Between three Render services an RPC is 20-200ms, so those budgets are
+#    unmeetable by a perfectly healthy peer: every RPC times out, every
+#    election round stalls, and the cluster churns leaders forever. The
+#    values below keep raft's required ratios (heartbeat << election
+#    timeout, RPC timeout well under election timeout) at ~20x the scale.
+#    The cost is failover speed: expect ~3-6s to elect a new leader instead
+#    of ~250ms. That is the honest price of running a LAN-tuned protocol
+#    across a network, not a bug to tune away.
+#
+# 2. PEER URLS MUST BE FILLED IN AFTER THE FIRST DEPLOY.
+#    A node's SELF_URL must be the address its peers reach it at, and PEERS
+#    must list the others in the SAME ORDER the console's VITE_CLUSTER_URLS
+#    lists them -- /chaos/partition/{i} indexes into PEERS positionally.
+#    Render only assigns hostnames once a service exists, so deploy once
+#    with the placeholders, then edit all three services' env and redeploy.
+#    Replace <n1>/<n2>/<n3> with the real onrender.com hostnames.
+#
+# Persistence: each node gets its own disk. SQLite holds the event log AND
+# photo blobs, and Render's filesystem is otherwise ephemeral -- without a
+# disk, every deploy wipes the event log. Note the cluster is partly
+# self-healing here: a node that comes back empty refills from its peers by
+# gossip, so a ROLLING deploy survives. Losing all three at once does not,
+# which is what the disks and the Supabase archive are for.
+
+services:
+  - type: web
+    name: swarmlens-node1
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter          # free instances sleep on idle, which kills gossip/raft
+    healthCheckPath: /health
+    disk:
+      name: node1-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ID
+        value: node1
+      - key: DB_PATH
+        value: /data/node1.db
+      - key: PORT
+        value: "8000"
+      - key: SELF_URL
+        value: https://<n1>.onrender.com
+      - key: PEERS
+        value: https://<n2>.onrender.com,https://<n3>.onrender.com
+      - key: GOSSIP_INTERVAL
+        value: "2.0"
+      - key: GOSSIP_RPC_TIMEOUT
+        value: "10.0"
+      - key: RAFT_HEARTBEAT
+        value: "1.0"
+      - key: RAFT_ELECTION_MIN
+        value: "3.0"
+      - key: RAFT_ELECTION_MAX
+        value: "6.0"
+      - key: RAFT_RPC_TIMEOUT
+        value: "1.0"
+      - key: BLOB_SYNC_INTERVAL
+        value: "5.0"
+      - key: BLOB_RPC_TIMEOUT
+        value: "30.0"
+      # Gates /chaos/*, /events, /recap/trigger, /blob_archive/trigger.
+      # Set the SAME value on all three nodes and on the frontend host.
+      - key: OPERATOR_TOKEN
+        sync: false
+      # Photo durability beyond the cluster (blob_archive.py). Leave unset
+      # and archiving simply never runs.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: recap-photos
+
+  - type: web
+    name: swarmlens-node2
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: node2-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ID
+        value: node2
+      - key: DB_PATH
+        value: /data/node2.db
+      - key: PORT
+        value: "8000"
+      - key: SELF_URL
+        value: https://<n2>.onrender.com
+      - key: PEERS
+        value: https://<n1>.onrender.com,https://<n3>.onrender.com
+      - key: GOSSIP_INTERVAL
+        value: "2.0"
+      - key: GOSSIP_RPC_TIMEOUT
+        value: "10.0"
+      - key: RAFT_HEARTBEAT
+        value: "1.0"
+      - key: RAFT_ELECTION_MIN
+        value: "3.0"
+      - key: RAFT_ELECTION_MAX
+        value: "6.0"
+      - key: RAFT_RPC_TIMEOUT
+        value: "1.0"
+      - key: BLOB_SYNC_INTERVAL
+        value: "5.0"
+      - key: BLOB_RPC_TIMEOUT
+        value: "30.0"
+      - key: OPERATOR_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: recap-photos
+
+  - type: web
+    name: swarmlens-node3
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: node3-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ID
+        value: node3
+      - key: DB_PATH
+        value: /data/node3.db
+      - key: PORT
+        value: "8000"
+      - key: SELF_URL
+        value: https://<n3>.onrender.com
+      - key: PEERS
+        value: https://<n1>.onrender.com,https://<n2>.onrender.com
+      - key: GOSSIP_INTERVAL
+        value: "2.0"
+      - key: GOSSIP_RPC_TIMEOUT
+        value: "10.0"
+      - key: RAFT_HEARTBEAT
+        value: "1.0"
+      - key: RAFT_ELECTION_MIN
+        value: "3.0"
+      - key: RAFT_ELECTION_MAX
+        value: "6.0"
+      - key: RAFT_RPC_TIMEOUT
+        value: "1.0"
+      - key: BLOB_SYNC_INTERVAL
+        value: "5.0"
+      - key: BLOB_RPC_TIMEOUT
+        value: "30.0"
+      - key: OPERATOR_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: recap-photos
