@@ -964,6 +964,30 @@ move it.
   `recap_sent` events themselves (`store.pinned_hashes`). This is the
   Conventions rule at the bottom of this file, and pinning is not a good
   place to make an exception to it.
+- **Raft's timers are tuned for loopback, and deploying the cluster across
+  a network breaks it in a way that looks like flapping nodes.** 50ms
+  heartbeat / 150-300ms election timeout / 50ms per-RPC timeout are
+  unmeetable by a *healthy* peer once an RPC costs 20-200ms (three Render
+  services, separate hosts, anything crossing a real network): every RPC
+  times out, every election round stalls, leaders churn forever. Same
+  livelock `raft.py`'s RPC_TIMEOUT comment describes, reached through
+  latency rather than a dead peer. The timers are env-overridable
+  (`RAFT_HEARTBEAT`, `RAFT_ELECTION_MIN`/`MAX`, `RAFT_RPC_TIMEOUT`,
+  `GOSSIP_RPC_TIMEOUT`) — keep the ratios, don't just raise one. Never
+  apply the slow values to a local run: ROADMAP.md's Phase 8 numbers were
+  measured with the defaults and stop describing the system otherwise.
+- **A client-side timeout tuned for loopback turns a proxy into "the
+  backend is down".** `pickNode()` used a 1500ms budget; a *cold*
+  connection through a loopback-intercepting proxy measured ~2.1s against
+  ~12ms once warm. So the first poll after an idle gap failed all three
+  nodes at once and rendered "NO NODE REACHABLE", the next poll succeeded
+  instantly, and it read as the backend flapping — with containers that
+  had never restarted and a raft term that never moved. Raised to 4000ms;
+  `Promise.any` still settles on the first answer, so a healthy cluster is
+  unaffected. A phone waking its radio has the same cold-connect profile,
+  which is exactly when a guest opens the app. When diagnosing this class
+  of bug, check `docker inspect --format '{{.RestartCount}}'` and whether
+  the raft term is actually moving *before* suspecting the backend.
 - **A dev server bound with `--host` on a port that's already taken
   silently moves to the next one, and the old process on the old port
   doesn't stop just because you meant to replace it.** Running

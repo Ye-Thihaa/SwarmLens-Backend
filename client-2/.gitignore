@@ -36,3 +36,6 @@ dist-ssr
 
 # Local dev TLS cert (see vite.config.ts) -- never commit
 certs/
+
+# Vercel build output (vite build with NITRO_PRESET=vercel)
+.vercel

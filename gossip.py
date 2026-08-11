@@ -1,7 +1,16 @@
 import asyncio
+import os
 import random
 import time
 import httpx
+
+# Per-round HTTP budget. 3s is generous on a LAN, where a round is a digest
+# exchange plus at most MAX_SYNC_BYTES of events. Env-overridable for the
+# cross-region case (nodes on separate hosts), where the same round pays
+# real RTT and TLS on top -- unlike raft's timers, nothing here is
+# correctness-critical, a slow round just delays convergence by one
+# interval. See raft.py's timing note for the deployment shape this is for.
+RPC_TIMEOUT = float(os.getenv("GOSSIP_RPC_TIMEOUT", "3.0"))
 
 
 class Gossip:
@@ -35,7 +44,7 @@ class Gossip:
         # with one configured routes loopback traffic through it too,
         # producing 502s / connection resets for purely local traffic
         # that was never meant to leave the machine.
-        async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=RPC_TIMEOUT, trust_env=False) as client:
             while self.running:
                 await asyncio.sleep(self.interval)
                 if not self.peers:

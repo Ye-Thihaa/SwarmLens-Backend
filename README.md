@@ -512,6 +512,94 @@ not a bug. Throughput scaling with N (81 -> 220 uploads/sec) is the
 direct upside of the same fact: each additional node is another fully
 independent writer.
 
+## Deploying (Render + Vercel)
+
+Three nodes on Render (Docker), the client on Vercel, photos archived to
+Supabase Storage. `render.yaml` is a working blueprint; read its header
+before deploying, because two things differ from every local run.
+
+### The part that actually breaks: raft timing
+
+`raft.py`'s defaults (50ms heartbeat, 150–300ms election timeout, 50ms
+per-RPC timeout) assume loopback, where an RPC is sub-millisecond. Between
+three Render services an RPC is 20–200ms, so **a perfectly healthy peer
+cannot meet those budgets** — every RPC times out, every election round
+stalls, and the cluster churns leaders forever. This is the livelock
+`raft.py`'s own RPC_TIMEOUT comment describes, triggered by latency rather
+than a dead peer.
+
+The timers are env-overridable for exactly this. Keep the *ratios*
+(heartbeat ≪ election timeout; RPC timeout well under election timeout):
+
+    RAFT_HEARTBEAT=1.0  RAFT_ELECTION_MIN=3.0  RAFT_ELECTION_MAX=6.0
+    RAFT_RPC_TIMEOUT=1.0  GOSSIP_INTERVAL=2.0  GOSSIP_RPC_TIMEOUT=10.0
+
+Failover becomes ~3–6s instead of ~250ms. That is the honest price of
+running a LAN-tuned protocol across a network. **Don't apply these
+locally** — ROADMAP.md's Phase 8 numbers stop describing the system.
+
+### Backend on Render
+
+1. Push the repo, then **New → Blueprint** and point it at `render.yaml`.
+2. Render assigns hostnames only after the services exist, so the first
+   deploy runs with placeholder peers and the nodes won't find each other.
+   Once all three are up, replace `<n1>`/`<n2>`/`<n3>` in every service's
+   `SELF_URL` and `PEERS` with the real `*.onrender.com` hostnames, then
+   redeploy all three.
+3. `PEERS` order must match the order used in `VITE_CLUSTER_URLS` below —
+   `/chaos/partition/{i}` indexes into `PEERS` positionally.
+4. Set `OPERATOR_TOKEN` to the same value on all three (marked
+   `sync: false`, so Render prompts rather than storing it in git).
+5. Set `SUPABASE_URL` / `SUPABASE_KEY` to enable the photo archive.
+
+**Do not use the free plan.** Free instances sleep when idle, and a
+sleeping node is a partitioned node: gossip stalls and raft re-elects
+around it every time it drops.
+
+Each node gets its own 1GB disk at `/data`, because SQLite holds the event
+log *and* photo blobs and Render's filesystem is otherwise wiped on every
+deploy. The cluster is partly self-healing here — a node that returns
+empty refills from its peers by gossip, so a **rolling** deploy survives —
+but losing all three at once does not, which is what the disks and the
+Supabase archive are for.
+
+### Frontend on Vercel
+
+The client is TanStack Start (SSR + server functions), so it needs a Node
+runtime — not a static host. `@lovable.dev/vite-tanstack-config` targets
+**Cloudflare** by default, so Vercel needs the preset switched:
+
+| Setting | Value |
+|---|---|
+| Root directory | `client-2` |
+| Build command | `NITRO_PRESET=vercel npm run build` |
+| Output directory | `.vercel/output` (Build Output API — auto-detected) |
+
+Environment variables:
+
+    NITRO_PRESET=vercel
+    VITE_CLUSTER_URLS=https://<n1>.onrender.com,https://<n2>.onrender.com,https://<n3>.onrender.com
+    CONSOLE_PASSWORD=<the console gate>
+    OPERATOR_TOKEN=<same value as the three nodes>
+
+`VITE_CLUSTER_URLS` replaces the hardcoded `127.0.0.1` cluster and feeds
+**both** the operator console and the guest app (`configuredNodeUrls`
+falls back to it), so it's the only URL setting to get right. It is baked
+into the client bundle at build time — fine, since these are the same URLs
+the guest app calls anyway. `OPERATOR_TOKEN` is *not* `VITE_`-prefixed and
+never reaches the browser; it stays in the server functions.
+
+**Leave `VITE_NODE_URLS` unset in production.** It exists only for the
+local `/n1,/n2,/n3` dev proxy (`vite.config.ts`), which does not exist in
+a built app — setting it would point the guest app at paths Vercel can't
+route.
+
+The nodes must be reachable over **HTTPS**: a Vercel page cannot call
+`http://` URLs (mixed content). Render terminates TLS for you, so this is
+automatic — but it's the reason `render.yaml` uses `https://` in `PEERS`
+and `SELF_URL` too. CORS is already open (`allow_origins=["*"]` in
+`main.py`).
+
 ## Guest client (client/)
 
 Phase 5's other half: a React + TypeScript PWA with an offline Dexie.js

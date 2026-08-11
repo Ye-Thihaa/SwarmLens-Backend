@@ -1,3 +1,14 @@
+# Three identical nodes, same image, behaviour set entirely by env vars.
+#
+# Data lives in ./data (NOT the ./node*.db files a manual `uvicorn` run
+# uses) -- the two are separate clusters with separate databases. Copy
+# node*.db into ./data/ if you want a docker run to start from the same
+# state a manual run left behind.
+#
+# ./models is mounted rather than baked into the image: .dockerignore
+# excludes it (~154MB of pretrained weights), so without this mount each
+# of the three containers would download its own copy on the first
+# /analyze call. Mounting shares one set and makes a cold start instant.
 services:
   node1:
     build: .
@@ -8,7 +19,7 @@ services:
       PEERS: http://node2:8000,http://node3:8000
       GOSSIP_INTERVAL: "1.0"
     ports: ["8001:8000"]
-    volumes: ["./data:/data"]
+    volumes: ["./data:/data", "./models:/app/models"]
 
   node2:
     build: .
@@ -19,7 +30,7 @@ services:
       PEERS: http://node1:8000,http://node3:8000
       GOSSIP_INTERVAL: "1.0"
     ports: ["8002:8000"]
-    volumes: ["./data:/data"]
+    volumes: ["./data:/data", "./models:/app/models"]
 
   node3:
     build: .
@@ -30,4 +41,4 @@ services:
       PEERS: http://node1:8000,http://node2:8000
       GOSSIP_INTERVAL: "1.0"
     ports: ["8003:8000"]
-    volumes: ["./data:/data"]
+    volumes: ["./data:/data", "./models:/app/models"]
