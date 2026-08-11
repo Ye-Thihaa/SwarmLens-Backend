@@ -538,6 +538,44 @@ Failover becomes ~3–6s instead of ~250ms. That is the honest price of
 running a LAN-tuned protocol across a network. **Don't apply these
 locally** — ROADMAP.md's Phase 8 numbers stop describing the system.
 
+### Option A — deploy a prebuilt image (recommended)
+
+`.github/workflows/docker-publish.yml` builds the node image on every push
+and publishes it to GitHub Container Registry. Three identical services
+then *pull* one image rather than each rebuilding the same Dockerfile,
+which is faster and — more usefully — guarantees all three nodes run
+identical bytes. A version skew between nodes in this system looks like a
+distributed-systems fault, not a stale build, so removing that possibility
+is worth more than the build minutes.
+
+After the first successful workflow run, make the package public
+(**GitHub → Packages → swarmlens-… → Package settings → Change
+visibility**). Otherwise Render needs registry credentials to pull it.
+
+Then in `render.yaml`, replace the two build lines on each service:
+
+```yaml
+    runtime: image
+    image:
+      url: ghcr.io/ye-thihaa/swarmlens-serverplusclient:latest
+```
+
+...in place of:
+
+```yaml
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+```
+
+Everything else (env vars, disks, health check) is unchanged. Pin to
+`:sha-<commit>` instead of `:latest` when you want a deploy you can roll
+back to exactly.
+
+### Option B — let Render build from the Dockerfile
+
+Leave `render.yaml` as committed. Simpler to start, but Render builds the
+same image once per service.
+
 ### Backend on Render
 
 1. Push the repo, then **New → Blueprint** and point it at `render.yaml`.
