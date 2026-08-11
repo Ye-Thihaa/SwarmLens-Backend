@@ -1,7 +1,14 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { filmStocks } from "@/guest/data";
-import { BOOTH_ZONE, getPhotos, photoImageUrl, pickNode, type RemotePhoto } from "@/lib/api";
+import {
+  BOOTH_ZONE,
+  getPhotos,
+  getPublicPhotos,
+  photoImageUrl,
+  pickNode,
+  type RemotePhoto,
+} from "@/lib/api";
 import { useCurrentEvent } from "@/lib/event";
 import { buildFilterCss, DEFAULT_PRESET, STOCK_PRESETS } from "@/lib/filmStock";
 import { currentGuestId, tick } from "@/lib/guest";
@@ -51,6 +58,82 @@ function gridCells(cols: number, rows: number): Cell[] {
   }
   return cells;
 }
+
+// -- Collage mode (source === "public"): an uneven layout built from
+// whatever photos got picked, not one of the fixed LAYOUTS above. A guest
+// browsing everyone's public picks isn't shooting a fixed-length roll of
+// her own, so there's no natural "this is a 4-photo strip" moment -- she
+// just keeps tapping favourites until she's happy, and the collage has to
+// accommodate any count from 2 to MAX_COLLAGE_PHOTOS.
+
+function hashStr(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+function seededRng(seed: number): () => number {
+  let s = seed || 1;
+  return () => {
+    s = (s * 1103515245 + 12345) & 0x7fffffff;
+    return s / 0x7fffffff;
+  };
+}
+
+/** Recursive guillotine split: cuts a rect roughly in half along its
+ * longer side (jittered so the seam doesn't land dead-center every time),
+ * recursing until there's exactly one leaf per photo. Splitting the
+ * *longer* side of the real target rect -- not a square unit space later
+ * stretched to fit -- is what keeps cells looking proportioned once the
+ * whole thing is rendered at photoAreaAspect; a square-space split would
+ * pick "balanced" cuts that read as balanced only before the stretch. */
+function splitRect(rect: Cell, count: number, rng: () => number): Cell[] {
+  if (count <= 1) return [rect];
+  const leftCount = Math.ceil(count / 2);
+  const rightCount = count - leftCount;
+  const t = Math.min(0.7, Math.max(0.3, leftCount / count + (rng() - 0.5) * 0.2));
+  if (rect.w >= rect.h) {
+    const leftW = rect.w * t;
+    return [
+      ...splitRect({ x: rect.x, y: rect.y, w: leftW, h: rect.h }, leftCount, rng),
+      ...splitRect({ x: rect.x + leftW, y: rect.y, w: rect.w - leftW, h: rect.h }, rightCount, rng),
+    ];
+  }
+  const topH = rect.h * t;
+  return [
+    ...splitRect({ x: rect.x, y: rect.y, w: rect.w, h: topH }, leftCount, rng),
+    ...splitRect({ x: rect.x, y: rect.y + topH, w: rect.w, h: rect.h - topH }, rightCount, rng),
+  ];
+}
+
+/** Builds a collage that exactly fills `photoAreaAspect` with no gaps and
+ * no overflow, for however many photo_ids are passed -- this is the
+ * "layout changes to fill the ratio" behaviour: pick a target shape once,
+ * and the collage always tiles it completely regardless of count. The
+ * split runs in a rect of width=photoAreaAspect, height=1 (so "longer
+ * side" in splitRect means the *real* longer side), then gets normalized
+ * back to the 0..1 cell fractions renderStrip already expects. Seeded on
+ * the exact ordered selection, so re-rendering the same picks in the same
+ * order is stable, but swapping one photo reshuffles the whole collage --
+ * same "deterministic per input, not per mount" idea as public.tsx's wall. */
+function buildCollageLayout(photoIds: string[], photoAreaAspect: number): Cell[] {
+  const seed = hashStr(photoIds.join("|"));
+  const rng = seededRng(seed);
+  const raw = splitRect({ x: 0, y: 0, w: photoAreaAspect, h: 1 }, photoIds.length, rng);
+  return raw.map((c) => ({ x: c.x / photoAreaAspect, y: c.y, w: c.w / photoAreaAspect, h: c.h }));
+}
+
+const RATIO_PRESETS = [
+  { key: "portrait", label: "Portrait", aspect: 4 / 5 },
+  { key: "square", label: "Square", aspect: 1 },
+  { key: "story", label: "Story", aspect: 9 / 16 },
+  { key: "wide", label: "Wide", aspect: 16 / 9 },
+] as const;
+const MIN_COLLAGE_PHOTOS = 2;
+const MAX_COLLAGE_PHOTOS = 12;
 
 // Spans every count from 1 to 10 across a mix of classic photo-booth strips,
 // plain grids, and a few asymmetric collages -- real variety without
@@ -250,6 +333,12 @@ async function renderStrip(
   eventDate: string,
   message: string,
   fontStyleKey: FontStyleKey,
+  /** guest_id per cell, same index as `images` -- only set for a photo
+   * that isn't this device's own (see PickablePhoto.by). Undefined cells
+   * (a "mine"-source strip, or any cell with no photo yet) get no tag,
+   * which is what keeps a solo roll's strip looking exactly as it always
+   * did instead of sprouting a "by you" caption nobody asked for. */
+  attributions: (string | undefined)[] = [],
 ): Promise<HTMLCanvasElement> {
   // Canvas text uses whatever's currently loaded for this page; without
   // this the very first strip a guest develops can silently fall back to
@@ -302,8 +391,24 @@ async function renderStrip(
     const sy = (img.height - sh) / 2;
     ctx.filter = stockFilter ?? "none";
     ctx.drawImage(img, sx, sy, sw, sh, x, y, w, h);
+    ctx.filter = "none";
+
+    // Credit tag: baked into the exported image itself, not just the
+    // in-app picker -- a downloaded/printed collage from THE ROOM or
+    // PUBLIC should still say whose frame each one was once it's off
+    // this app. Skipped on a cell too small to hold it legibly rather
+    // than shrinking the text past reading.
+    const by = attributions[i];
+    if (by && w > 64 && h > 36) {
+      const tagH = Math.max(16, Math.min(26, h * 0.16));
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.fillRect(x, y + h - tagH, w, tagH);
+      ctx.fillStyle = "#EDE6D6";
+      ctx.textAlign = "left";
+      ctx.font = `italic 400 ${Math.round(tagH * 0.62)}px 'Great Vibes', cursive`;
+      ctx.fillText(`by ${by}`, x + 6, y + h - tagH * 0.28, w - 12);
+    }
   });
-  ctx.filter = "none";
 
   ctx.fillStyle = frameText;
   ctx.textAlign = "center";
@@ -385,14 +490,17 @@ function Album() {
     [outbox, event.event_id],
   );
 
-  // THE ROOM: everyone's photos, not just this phone's. GET /photos + a
-  // node URL is all main.py already exposes -- no backend change needed to
-  // let a strip pull from photos this device never shot itself.
-  const [source, setSource] = useState<"mine" | "room">("mine");
+  // THE ROOM: everyone's photos, not just this phone's. PUBLIC: everyone's
+  // *hand-picked* photos -- GET /photos/public, the same event-scoped read
+  // routes/public.tsx's wall uses. Both are just GET calls main.py already
+  // exposes -- no backend change needed to let a strip pull from photos
+  // this device never shot itself.
+  const [source, setSource] = useState<"mine" | "room" | "public">("mine");
   const [node, setNode] = useState<string | null>(null);
   const [roomPhotos, setRoomPhotos] = useState<RemotePhoto[]>([]);
+  const [publicPhotos, setPublicPhotos] = useState<RemotePhoto[]>([]);
   useEffect(() => {
-    if (source !== "room") return;
+    if (source !== "room" && source !== "public") return;
     let cancelled = false;
     async function poll() {
       const n = await pickNode();
@@ -400,8 +508,13 @@ function Album() {
       setNode(n);
       if (!n) return;
       try {
-        const ps = await getPhotos(n, event.event_id);
-        if (!cancelled) setRoomPhotos(ps);
+        if (source === "room") {
+          const ps = await getPhotos(n, event.event_id);
+          if (!cancelled) setRoomPhotos(ps);
+        } else {
+          const ps = await getPublicPhotos(n, event.event_id);
+          if (!cancelled) setPublicPhotos(ps);
+        }
       } catch {
         // stay on the last known-good read
       }
@@ -422,23 +535,50 @@ function Album() {
       }));
     }
     if (!node) return [];
-    return roomPhotos.map((p) => ({
+    const list = source === "public" ? publicPhotos : roomPhotos;
+    return list.map((p) => ({
       id: p.photo_id,
       src: photoImageUrl(node, p.photo_id),
       by: p.guest_id,
     }));
-  }, [source, myRoll, roomPhotos, node]);
+  }, [source, myRoll, roomPhotos, publicPhotos, node]);
+
+  // PUBLIC swaps the fixed-template picker for a ratio + collage: there's
+  // no natural "this is a 4-photo strip" moment when browsing everyone's
+  // picks, so the layout is generated from however many photos got tapped
+  // instead of picked upfront. MY ROLL / THE ROOM keep the classic templates.
+  const isCollage = source === "public";
+  const [ratioKey, setRatioKey] = useState<(typeof RATIO_PRESETS)[number]["key"]>("portrait");
+  const ratio = RATIO_PRESETS.find((r) => r.key === ratioKey)!.aspect;
 
   const [layoutId, setLayoutId] = useState(LAYOUTS[5]!.id); // classic strip -- the archetype
-  const layout = LAYOUTS.find((l) => l.id === layoutId)!;
+  const classicLayout = LAYOUTS.find((l) => l.id === layoutId)!;
 
-  // Selection order IS strip order: the first photo tapped fills cell 0, and
-  // so on. Re-tapping a selected photo removes it and every later photo
-  // shifts up a slot, same as it would sliding a print out of a stack.
+  // Selection order IS strip/collage order: the first photo tapped fills
+  // cell 0, and so on. Re-tapping a selected photo removes it and every
+  // later photo shifts up a slot, same as it would sliding a print out of
+  // a stack. selectionCap is the classic layout's fixed count, or an open
+  // range (MIN..MAX) for the collage.
   const [selected, setSelected] = useState<string[]>([]);
+  const selectionCap = isCollage ? MAX_COLLAGE_PHOTOS : classicLayout.count;
+
+  const collageLayout: Layout | null = useMemo(() => {
+    if (!isCollage || selected.length < MIN_COLLAGE_PHOTOS) return null;
+    return {
+      id: "collage",
+      label: "Collage",
+      count: selected.length,
+      cells: buildCollageLayout(selected, ratio),
+      photoAreaAspect: ratio,
+    };
+  }, [isCollage, selected, ratio]);
+  const layout: Layout = isCollage
+    ? (collageLayout ?? { id: "collage-empty", label: "Collage", count: 0, cells: [], photoAreaAspect: ratio })
+    : classicLayout;
+
   useEffect(() => {
-    setSelected((s) => s.slice(0, layout.count));
-  }, [layout.count]);
+    setSelected((s) => s.slice(0, selectionCap));
+  }, [selectionCap]);
   useEffect(() => {
     setSelected([]);
     setPreviewUrl(null);
@@ -483,12 +623,12 @@ function Album() {
   function toggleSelect(id: string) {
     setSelected((s) => {
       if (s.includes(id)) return s.filter((x) => x !== id);
-      if (s.length >= layout.count) return s;
+      if (s.length >= selectionCap) return s;
       return [...s, id];
     });
   }
 
-  const ready = selected.length === layout.count;
+  const ready = isCollage ? selected.length >= MIN_COLLAGE_PHOTOS : selected.length === classicLayout.count;
 
   async function resolveImages(chosen: PickablePhoto[]): Promise<(HTMLImageElement | null)[]> {
     return Promise.all(
@@ -531,6 +671,7 @@ function Album() {
         eventDate.trim(),
         message.trim(),
         fontStyleKey,
+        chosen.map((p) => p.by),
       );
       if (cancelled) return;
       canvasRef.current = canvas;
@@ -585,8 +726,9 @@ function Album() {
         </Link>
         <h1 className="mt-2 text-3xl font-extrabold">Make a strip</h1>
         <p className="mt-2 max-w-sm text-sm leading-relaxed text-muted-foreground">
-          A layout, your own photos (or anyone's in the room) in the order you pick them, a frame, a
-          filter, and a few words — then save it, print it, or post it for everyone to see.
+          A layout, your own photos (or anyone's in the room, or everyone's public picks) in the
+          order you pick them, a frame, a filter, and a few words — then save it, print it, or post
+          it for everyone to see.
         </p>
       </header>
 
@@ -611,46 +753,73 @@ function Album() {
       </div>
 
       <section className="px-5 py-5">
-        <p className="label-mono mb-2">1. LAYOUT</p>
-        <div className="flex gap-2.5 overflow-x-auto pb-2 [scrollbar-width:none]">
-          {LAYOUTS.map((l) => (
-            <button
-              key={l.id}
-              onClick={() => pickLayout(l.id)}
-              className={`shrink-0 rounded-sm border p-2 text-center ${
-                l.id === layoutId ? "border-drifting bg-drifting/15" : "border-border bg-card"
-              }`}
-            >
-              <div
-                className="relative overflow-hidden rounded-[3px] bg-fixer-dim/25"
-                style={{ width: "3.6rem", aspectRatio: l.photoAreaAspect }}
-              >
-                {l.cells.map((c, i) => (
+        <p className="label-mono mb-2">1. {isCollage ? "RATIO" : "LAYOUT"}</p>
+        {isCollage ? (
+          <>
+            <div className="flex gap-2.5">
+              {RATIO_PRESETS.map((r) => (
+                <button
+                  key={r.key}
+                  onClick={() => setRatioKey(r.key)}
+                  className={`flex-1 rounded-sm border p-2 text-center ${
+                    r.key === ratioKey ? "border-drifting bg-drifting/15" : "border-border bg-card"
+                  }`}
+                >
                   <div
-                    key={i}
-                    className="absolute rounded-[1px] bg-fixer-dim"
-                    style={{
-                      left: `${c.x * 100 + 3}%`,
-                      top: `${c.y * 100 + 3}%`,
-                      width: `${c.w * 100 - 6}%`,
-                      height: `${c.h * 100 - 6}%`,
-                    }}
+                    className="mx-auto rounded-[3px] bg-fixer-dim/40"
+                    style={{ width: "2.2rem", aspectRatio: r.aspect }}
                   />
-                ))}
-              </div>
-              <p className="mt-1.5 w-16 font-mono text-[0.48rem] tracking-widest text-fixer-dim">
-                {l.label}
-              </p>
-            </button>
-          ))}
-        </div>
+                  <p className="mt-1.5 font-mono text-[0.48rem] tracking-widest text-fixer-dim">
+                    {r.label}
+                  </p>
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 font-mono text-[0.5rem] tracking-widest text-stale">
+              THE COLLAGE BELOW RESHUFFLES TO FILL THIS RATIO AS YOU ADD OR REMOVE PHOTOS.
+            </p>
+          </>
+        ) : (
+          <div className="flex gap-2.5 overflow-x-auto pb-2 [scrollbar-width:none]">
+            {LAYOUTS.map((l) => (
+              <button
+                key={l.id}
+                onClick={() => pickLayout(l.id)}
+                className={`shrink-0 rounded-sm border p-2 text-center ${
+                  l.id === layoutId ? "border-drifting bg-drifting/15" : "border-border bg-card"
+                }`}
+              >
+                <div
+                  className="relative overflow-hidden rounded-[3px] bg-fixer-dim/25"
+                  style={{ width: "3.6rem", aspectRatio: l.photoAreaAspect }}
+                >
+                  {l.cells.map((c, i) => (
+                    <div
+                      key={i}
+                      className="absolute rounded-[1px] bg-fixer-dim"
+                      style={{
+                        left: `${c.x * 100 + 3}%`,
+                        top: `${c.y * 100 + 3}%`,
+                        width: `${c.w * 100 - 6}%`,
+                        height: `${c.h * 100 - 6}%`,
+                      }}
+                    />
+                  ))}
+                </div>
+                <p className="mt-1.5 w-16 font-mono text-[0.48rem] tracking-widest text-fixer-dim">
+                  {l.label}
+                </p>
+              </button>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="px-5 pb-5">
         <div className="mb-2 flex items-baseline justify-between">
           <p className="label-mono">2. PHOTOS</p>
           <p className="font-mono text-[0.6rem] tracking-widest text-fixer-dim">
-            {selected.length} / {layout.count}
+            {isCollage ? `${selected.length} PICKED (MIN ${MIN_COLLAGE_PHOTOS})` : `${selected.length} / ${classicLayout.count}`}
             {selected.length > 0 && (
               <button onClick={() => setSelected([])} className="ml-2 text-safelight underline">
                 clear
@@ -680,22 +849,36 @@ function Album() {
           >
             THE ROOM
           </button>
+          <button
+            onClick={() => setSource("public")}
+            className={`flex-1 rounded-sm border py-2 font-mono text-[0.6rem] tracking-widest ${
+              source === "public"
+                ? "border-drifting bg-drifting/15 text-drifting"
+                : "border-border text-fixer-dim"
+            }`}
+          >
+            PUBLIC
+          </button>
         </div>
 
         {pickable.length === 0 ? (
           <p className="rounded-sm border border-drifting/40 bg-drifting/10 px-3 py-2 text-sm text-drifting">
             {source === "mine"
               ? "Nothing on your roll yet — shoot a few frames first."
-              : node
-                ? "Nobody's shot a frame yet."
-                : "Waiting for a node to answer…"}
+              : source === "public"
+                ? node
+                  ? "Nobody's published a public pick yet."
+                  : "Waiting for a node to answer…"
+                : node
+                  ? "Nobody's shot a frame yet."
+                  : "Waiting for a node to answer…"}
           </p>
         ) : (
           <div className="grid grid-cols-4 gap-1.5">
             {pickable.map((p) => {
               const idx = selected.indexOf(p.id);
               const isSelected = idx >= 0;
-              const full = !isSelected && selected.length >= layout.count;
+              const full = !isSelected && selected.length >= selectionCap;
               return (
                 <button
                   key={p.id}
@@ -862,9 +1045,13 @@ function Album() {
 
         {!ready ? (
           <p className="mt-4 rounded-sm border border-drifting/40 bg-drifting/10 px-3 py-2 text-center text-sm text-drifting">
-            Pick {layout.count - selected.length} more photo
-            {layout.count - selected.length === 1 ? "" : "s"} to finish this layout — the preview
-            above already shows how it's shaping up.
+            {isCollage
+              ? `Pick at least ${MIN_COLLAGE_PHOTOS - selected.length} more photo${
+                  MIN_COLLAGE_PHOTOS - selected.length === 1 ? "" : "s"
+                } to build the collage — you can keep adding up to ${MAX_COLLAGE_PHOTOS}.`
+              : `Pick ${classicLayout.count - selected.length} more photo${
+                  classicLayout.count - selected.length === 1 ? "" : "s"
+                } to finish this layout — the preview above already shows how it's shaping up.`}
           </p>
         ) : (
           <>
