@@ -964,6 +964,20 @@ move it.
   `recap_sent` events themselves (`store.pinned_hashes`). This is the
   Conventions rule at the bottom of this file, and pinning is not a good
   place to make an exception to it.
+- **`--host ::` is IPv6-ONLY under uvicorn, not dual-stack, whatever
+  `bindv6only` says.** Fly.io's private network between machines (6PN) is
+  IPv6-only, so the app must bind `::` there or every peer's gossip and
+  raft RPC is refused while the *public* health check still passes —
+  three healthy-looking nodes that never form a cluster. But the fix has
+  a second edge: the container reports `bindv6only=0`, which implies a
+  `::` socket accepts IPv4 too, and it does not. Uvicorn creates the
+  socket with `IPV6_V6ONLY` set, so from inside a `HOST=::` container
+  `::1` connects and `127.0.0.1` is refused. That makes such a container
+  unreachable through docker's IPv4 port mapping — don't set `HOST=::`
+  for a local run and conclude the image is broken. Verified working on
+  an IPv6-only docker network (peers reachable, leader elected, events
+  gossiped, blob bytes replicated). `Dockerfile` defaults `HOST` to
+  `0.0.0.0`; only `fly/*.toml` sets `::`.
 - **Raft's timers are tuned for loopback, and deploying the cluster across
   a network breaks it in a way that looks like flapping nodes.** 50ms
   heartbeat / 150-300ms election timeout / 50ms per-RPC timeout are
