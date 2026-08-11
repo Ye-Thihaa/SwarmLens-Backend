@@ -538,6 +538,52 @@ Failover becomes ~3–6s instead of ~250ms. That is the honest price of
 running a LAN-tuned protocol across a network. **Don't apply these
 locally** — ROADMAP.md's Phase 8 numbers stop describing the system.
 
+### Deploying to Fly.io (recommended for the 3-node cluster)
+
+Fly suits this system better than a public-URL PaaS for one concrete
+reason: machines in the same region talk over a private network (6PN) at
+~1ms, so raft's timers barely need relaxing. Render forces every heartbeat
+out through the edge and back, which is why `render.yaml` has to detune
+failover to 3–6s; on Fly it's ~1s. Volumes are also available without
+jumping to a paid instance tier.
+
+`fly/node1.toml`, `fly/node2.toml`, `fly/node3.toml` — one app per node, so
+each gets its own volume and its own stable `.internal` address.
+
+    fly auth login
+
+    for n in node1 node2 node3; do
+      fly apps create swarmlens-$n
+      fly volumes create data --size 1 --app swarmlens-$n --region sin
+      fly secrets set OPERATOR_TOKEN=<same value on all three> --app swarmlens-$n
+      fly deploy -c fly/$n.toml --app swarmlens-$n
+    done
+
+Set `primary_region` and the volume region to the same place, and keep all
+three there. Spread across regions and the private network stops being
+~1ms, at which point these timers no longer hold and you need Render's
+slower set.
+
+Unlike Render, **the peer URLs need no second pass** — `.internal` names
+are known before the apps exist, so `SELF_URL`/`PEERS` are already correct
+in the toml files.
+
+Three things in those files are load-bearing:
+
+- **`HOST=::`** — 6PN is IPv6-only. Bound to `0.0.0.0` the process listens
+  on IPv4 only, so its *public* health check passes while every peer's
+  gossip and raft RPC is refused. That presents as three healthy nodes that
+  never form a cluster.
+- **Peers use `.internal`, not `.fly.dev`** — public addressing would push
+  every heartbeat through the edge proxy, paying TLS and internet latency
+  for traffic that never needed to leave the region. `SELF_URL` must match
+  how peers address the node (it's the ring identity), so it's internal too.
+- **`auto_stop_machines = false`** — a sleeping node is a partitioned node.
+
+For the guest app and console, use the public hostnames
+(`https://swarmlens-node1.fly.dev`, …) in `VITE_CLUSTER_URLS`. Only
+node-to-node traffic uses `.internal`.
+
 ### Option A — deploy a prebuilt image (recommended)
 
 `.github/workflows/docker-publish.yml` builds the node image on every push

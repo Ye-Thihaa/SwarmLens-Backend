@@ -23,9 +23,18 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
-# Shell form so ${PORT} expands at runtime. Render (and most PaaS) assign a
-# port through $PORT and expect the process to bind it; a hardcoded 8000
-# gets the service marked unhealthy and cycled forever. Defaults to 8000 so
-# docker-compose.yml -- which maps 8001:8000 and sets no PORT -- is
-# unaffected.
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Shell form so ${PORT} and ${HOST} expand at runtime. Render (and most
+# PaaS) assign a port through $PORT and expect the process to bind it; a
+# hardcoded 8000 gets the service marked unhealthy and cycled forever.
+# Defaults to 8000 so docker-compose.yml -- which maps 8001:8000 and sets
+# no PORT -- is unaffected.
+#
+# HOST exists for Fly.io, whose private network between machines (6PN) is
+# IPv6-only. A process bound to 0.0.0.0 listens on IPv4 only, so its public
+# health check passes while every peer's gossip and raft RPC is refused --
+# which reads as three healthy nodes that will not form a cluster. Set
+# HOST=:: there; on Linux a dual-stack :: socket accepts IPv4 too, so it is
+# strictly more permissive. Left at 0.0.0.0 by default because a container
+# with IPv6 disabled cannot bind :: at all, and that failure would be a
+# worse default than the one it fixes.
+CMD uvicorn main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000}
