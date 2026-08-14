@@ -221,34 +221,49 @@ try {
         -RedirectStandardOutput $webLog -RedirectStandardError (Join-Path $log "web.err")
     $procs += $web
 
-    # Read the port Vite ACTUALLY bound, rather than trust $WebPort. A dev
-    # server bound with --host on a port already taken silently moves to
-    # the next one instead of failing (documented in this repo's own
-    # CLAUDE.md gotchas) -- hit live while testing this script: a stale
-    # server from an earlier session was still holding 8080, Vite quietly
-    # served on 8081, and the tunnel below would have forwarded to a port
-    # nothing was listening on. Vite's own "Local: http://localhost:PORT/"
-    # banner is the one source of truth for what actually happened.
+    # Detect the bound port by CONNECTING to it, not by reading Vite's own
+    # "Local: http://localhost:PORT/" banner out of the redirected log
+    # file. Measured live, twice, with two different fixes in between:
+    # the banner sat in the file -- correct, unchanged -- for well over
+    # 45s after the server was already accepting real connections. That
+    # is a buffering artifact, not a startup delay: Windows appears to
+    # give a redirected-to-FILE child process's stdout a much less eager
+    # flush than a redirected-to-PIPE one (a known libuv distinction), so
+    # parsing the file for readiness was chasing the wrong signal
+    # entirely. A bare TCP connect has no such lag -- confirmed against
+    # the exact process this script spawns, mid-incident, before rewriting
+    # around it.
     #
-    # 45s is generous cold-start headroom, not a workaround for a restart:
-    # earlier versions wrote VITE_CLUSTER_URLS to client-2/.env.local, and
-    # Vite's own file watcher treated that write as a live change once the
-    # watcher attached a beat after boot, restarting the dev server with a
-    # delay that grew with how slow that particular cold start was (~28s
-    # one run, still not enough inside a 60s window on a slower one). Now
-    # exported as a real process env var (see step 3) instead of a file,
-    # so there is nothing for a watcher to notice and no restart to wait
-    # out -- this deadline only needs to cover a plain cold start.
+    # Vite can also silently move to the next free port instead of failing
+    # when the one requested is already taken (documented in this repo's
+    # own CLAUDE.md gotchas) -- hit live earlier in this exact debugging
+    # session. Handled by trying $WebPort first, then scanning a few ports
+    # above it, rather than by trusting either the value asked for or a
+    # log line.
+    function Test-PortOpen([int] $Port) {
+        try {
+            $c = New-Object System.Net.Sockets.TcpClient
+            $iar = $c.BeginConnect("127.0.0.1", $Port, $null, $null)
+            $ok = $iar.AsyncWaitHandle.WaitOne(400) -and $c.Connected
+            $c.Close()
+            return $ok
+        } catch { return $false }
+    }
+
     $realPort = $null
     $deadline = (Get-Date).AddSeconds(45)
     while (-not $realPort -and (Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
-        $m = Get-Content $webLog -ErrorAction SilentlyContinue |
-             Select-String -Pattern "Local:\s+https?://localhost:(\d+)"
-        if ($m) { $realPort = [int]$m.Matches[0].Groups[1].Value }
-        if ($web.HasExited) { Fail "npm exited before Vite reported a port. See $webLog" }
+        foreach ($candidate in @($WebPort) + @(($WebPort + 1)..($WebPort + 5))) {
+            if (Test-PortOpen $candidate) { $realPort = $candidate; break }
+        }
+        if (-not $realPort) {
+            Start-Sleep -Milliseconds 500
+            if ($web.HasExited) { Fail "npm exited before it ever bound a port. See $webLog" }
+        }
     }
-    if (-not $realPort) { Fail "Vite never printed its bound port within 45s. See $webLog" }
+    if (-not $realPort) {
+        Fail "no port in $WebPort..$($WebPort + 5) ever accepted a connection within 45s. See $webLog"
+    }
     if ($realPort -ne $WebPort) {
         Write-Host "  :$WebPort was already taken -- Vite moved to :$realPort instead" -ForegroundColor Yellow
     }
