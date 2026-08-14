@@ -218,8 +218,18 @@ try {
     # served on 8081, and the tunnel below would have forwarded to a port
     # nothing was listening on. Vite's own "Local: http://localhost:PORT/"
     # banner is the one source of truth for what actually happened.
+    #
+    # 60s, not 30s: Vite's own file watcher restarts the dev server when
+    # .env.local changes -- and it can treat the file THIS SCRIPT just
+    # wrote (moments before npm even started) as a fresh change once the
+    # watcher attaches a beat after boot. Measured live: the restart fired
+    # ~28s after the initial "ready" banner, which left a 30s deadline no
+    # margin at all and failed outright on one run. The port itself is
+    # identical before and after the restart (only the scheme flips
+    # http->https once certs reappear), so taking the FIRST match here is
+    # correct either way -- this is purely about not giving up too early.
     $realPort = $null
-    $deadline = (Get-Date).AddSeconds(30)
+    $deadline = (Get-Date).AddSeconds(60)
     while (-not $realPort -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
         $m = Get-Content $webLog -ErrorAction SilentlyContinue |
