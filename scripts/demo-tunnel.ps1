@@ -173,6 +173,15 @@ try {
     Write-Host "`n[2/5] opening a tunnel per node" -ForegroundColor Cyan
     $nodeUrls = @()
     for ($i = 0; $i -lt $NodePorts.Count; $i++) {
+        # Spacing, not just retry backoff between whole script runs. Hit
+        # live: opening node1 and node2 back-to-back was enough on its own
+        # to trip serveo's "Too many tunnel starts from this client" on the
+        # very next one (node3), inside a SINGLE run, no repeated runs
+        # involved. Whatever their limit is measuring, it counts requests
+        # this close together as one burst. 4s between opens (this script
+        # opens 4 tunnels total) has not been proven sufficient by a full
+        # clean run yet -- see the module docstring's rate-limit note.
+        if ($i -gt 0) { Start-Sleep -Seconds 4 }
         $u = Start-ServeoTunnel $NodePorts[$i] "node$($i+1)"
         $nodeUrls += $u
         Write-Host "  node$($i+1) -> $u"
