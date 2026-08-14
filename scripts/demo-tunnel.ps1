@@ -190,9 +190,20 @@ try {
     # Order is load-bearing: it must match each backend's own PEERS order,
     # because /chaos/partition/{i} indexes into that list positionally.
     Write-Host "`n[3/5] pointing the web app at those tunnels" -ForegroundColor Cyan
-    $envLocal = Join-Path $repo "client-2\.env.local"
-    "VITE_CLUSTER_URLS=$($nodeUrls -join ',')" | Set-Content $envLocal -Encoding utf8
-    Write-Host "  wrote client-2/.env.local"
+    # A real process environment variable, NOT a written .env.local file.
+    # Earlier versions wrote the file, and Vite's own file watcher treated
+    # it as a live change once the watcher attached a beat after boot --
+    # even though this script writes it before npm ever starts -- and
+    # restarted the dev server. That restart's delay was measured at ~28s
+    # on one run and needed a 60s detection window on another, growing
+    # with how slow Vite's cold start happened to be that time; chasing it
+    # with an ever-larger timeout was fixing the symptom, not the cause.
+    # $env: set here is inherited by Start-Process's child by default (no
+    # extra flag needed), so npm/vite see VITE_CLUSTER_URLS from the
+    # moment the process is created -- there is no file, so there is
+    # nothing for a watcher to notice, so there is no restart to wait out.
+    $env:VITE_CLUSTER_URLS = ($nodeUrls -join ',')
+    Write-Host "  exported VITE_CLUSTER_URLS to the environment (no file written)"
 
     Write-Host "`n[4/5] starting the web app (requesting :$WebPort)" -ForegroundColor Cyan
     # `npm` resolves to npm.ps1 (a PowerShell script) on a stock Windows
@@ -219,17 +230,17 @@ try {
     # nothing was listening on. Vite's own "Local: http://localhost:PORT/"
     # banner is the one source of truth for what actually happened.
     #
-    # 60s, not 30s: Vite's own file watcher restarts the dev server when
-    # .env.local changes -- and it can treat the file THIS SCRIPT just
-    # wrote (moments before npm even started) as a fresh change once the
-    # watcher attaches a beat after boot. Measured live: the restart fired
-    # ~28s after the initial "ready" banner, which left a 30s deadline no
-    # margin at all and failed outright on one run. The port itself is
-    # identical before and after the restart (only the scheme flips
-    # http->https once certs reappear), so taking the FIRST match here is
-    # correct either way -- this is purely about not giving up too early.
+    # 45s is generous cold-start headroom, not a workaround for a restart:
+    # earlier versions wrote VITE_CLUSTER_URLS to client-2/.env.local, and
+    # Vite's own file watcher treated that write as a live change once the
+    # watcher attached a beat after boot, restarting the dev server with a
+    # delay that grew with how slow that particular cold start was (~28s
+    # one run, still not enough inside a 60s window on a slower one). Now
+    # exported as a real process env var (see step 3) instead of a file,
+    # so there is nothing for a watcher to notice and no restart to wait
+    # out -- this deadline only needs to cover a plain cold start.
     $realPort = $null
-    $deadline = (Get-Date).AddSeconds(60)
+    $deadline = (Get-Date).AddSeconds(45)
     while (-not $realPort -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
         $m = Get-Content $webLog -ErrorAction SilentlyContinue |
@@ -237,7 +248,7 @@ try {
         if ($m) { $realPort = [int]$m.Matches[0].Groups[1].Value }
         if ($web.HasExited) { Fail "npm exited before Vite reported a port. See $webLog" }
     }
-    if (-not $realPort) { Fail "Vite never printed its bound port within 30s. See $webLog" }
+    if (-not $realPort) { Fail "Vite never printed its bound port within 45s. See $webLog" }
     if ($realPort -ne $WebPort) {
         Write-Host "  :$WebPort was already taken -- Vite moved to :$realPort instead" -ForegroundColor Yellow
     }
@@ -290,8 +301,11 @@ finally {
         if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
     }
     # Leave no stale VITE_CLUSTER_URLS behind: the tunnel URLs it names are
-    # dead now, and a later local run would silently use them.
-    Remove-Item (Join-Path $repo "client-2\.env.local") -ErrorAction SilentlyContinue
+    # dead now, and a later command in THIS SAME TERMINAL would silently
+    # inherit them otherwise. $env: assignments are real process
+    # environment, not scoped to this script the way a normal PowerShell
+    # variable would be -- they outlive the script unless removed here.
+    Remove-Item Env:\VITE_CLUSTER_URLS -ErrorAction SilentlyContinue
     $certs = Join-Path $repo "client-2\certs"
     if (Test-Path "$certs.bak") { Move-Item "$certs.bak" $certs -Force }
     Write-Host "done.`n" -ForegroundColor DarkGray
