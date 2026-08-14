@@ -40,7 +40,11 @@ $log  = Join-Path $env:TEMP "swarmlens-tunnels"
 New-Item -ItemType Directory -Force -Path $log | Out-Null
 $procs = @()
 
-function Fail($msg) { Write-Host "  ! $msg" -ForegroundColor Red; throw $msg }
+# Throws only. The message is printed once by the catch at the bottom --
+# printing here as well produced the message twice plus a stack trace,
+# which buried a plain "install this first" under noise that looked like a
+# crash.
+function Fail($msg) { throw $msg }
 
 # cloudflared writes the assigned URL to stderr as a banner, so the only way
 # to learn it is to watch the log it produces.
@@ -71,15 +75,37 @@ try {
     }
 
     Write-Host "`n[1/5] checking the local cluster" -ForegroundColor Cyan
+
+    # Distinguish "Docker Desktop isn't running" from "the cluster isn't
+    # started". An earlier version reported only the latter, which sent you
+    # to `docker compose up -d` -- a command that cannot work while the
+    # daemon is down, and whose own error is a wall of npipe text.
+    docker info --format '{{.ServerVersion}}' 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Docker Desktop is not running. Start it from the Start menu, wait for the whale icon to settle, then re-run this script."
+    }
+
+    # Bring the cluster up rather than telling you to. If it is already
+    # running this is a no-op, so it costs nothing to just do it.
+    $running = (docker compose ps --status running --format '{{.Name}}' 2>$null | Measure-Object -Line).Lines
+    if ($running -lt $NodePorts.Count) {
+        Write-Host "  starting the cluster (docker compose up -d)..." -ForegroundColor DarkGray
+        docker compose up -d 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    }
+
     foreach ($p in $NodePorts) {
-        try {
-            # -NoProxy matters: a loopback-intercepting proxy (Outline etc.)
-            # makes a perfectly healthy node look unreachable.
-            $h = Invoke-RestMethod "http://127.0.0.1:$p/health" -TimeoutSec 8 -NoProxy
-            Write-Host "  :$p $($h.node) events=$($h.events) raft=$($h.raft.role)"
-        } catch {
-            Fail ":$p is not answering. Start the cluster first: docker compose up -d"
+        $ok = $false
+        $deadline = (Get-Date).AddSeconds(45)   # containers need a moment after a cold start
+        while (-not $ok -and (Get-Date) -lt $deadline) {
+            try {
+                # -NoProxy matters: a loopback-intercepting proxy (Outline etc.)
+                # makes a perfectly healthy node look unreachable.
+                $h = Invoke-RestMethod "http://127.0.0.1:$p/health" -TimeoutSec 8 -NoProxy
+                Write-Host "  :$p $($h.node) events=$($h.events) raft=$($h.raft.role)"
+                $ok = $true
+            } catch { Start-Sleep -Milliseconds 1500 }
         }
+        if (-not $ok) { Fail ":$p never answered. Check: docker compose logs --tail 30" }
     }
 
     # HTTPS locally would force cloudflared to talk TLS to a self-signed
@@ -133,6 +159,11 @@ try {
     Write-Host "`n Ctrl+C to stop everything.`n" -ForegroundColor DarkGray
 
     while ($true) { Start-Sleep -Seconds 5 }
+}
+catch {
+    # One clear line instead of PowerShell's exception spew. These are
+    # nearly always "a prerequisite isn't ready", not a crash.
+    Write-Host "`n  ! $($_.Exception.Message)`n" -ForegroundColor Red
 }
 finally {
     Write-Host "`nshutting down..." -ForegroundColor DarkGray
