@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { NodeState } from "@/operator/cluster";
+import { NetworkGraph } from "@/operator/NetworkGraph";
 import {
   CLUSTER,
   URL_TO_ID,
@@ -775,11 +776,22 @@ function Console() {
             ))}
           </section>
 
-          {/* the mesh, drawn as a contact sheet of nodes */}
+          {/* the mesh: a live graph up top (one pulse per real gossip
+              round-trip / raft heartbeat sample this console actually
+              observed -- see NetworkGraph's own docstring for exactly
+              which /health field each pulse is derived from), the exact
+              per-node numbers as a contact sheet below it. */}
           <section className="rounded-sm border border-border bg-card p-4">
             <div className="flex items-baseline justify-between">
               <h2 className="text-lg font-bold">Mesh</h2>
               <p className="label-mono">gossip ~every 1s</p>
+            </div>
+            <div className="mt-3 rounded-sm border border-border bg-emulsion/40 p-2">
+              <NetworkGraph health={health} />
+              <p className="mt-1 text-center font-mono text-[0.55rem] tracking-widest text-fixer-dim">
+                <span className="text-converged">●</span> GOSSIP ROUND-TRIP &nbsp;
+                <span className="text-drifting">●</span> LEADER HEARTBEAT (sampled once per poll)
+              </p>
             </div>
             <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-3">
               {CLUSTER.map((n) => {
